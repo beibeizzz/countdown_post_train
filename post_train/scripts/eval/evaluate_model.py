@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -23,22 +24,57 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a Countdown model.")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--model-path", required=True)
+    parser.add_argument(
+        "--base-model-path",
+        default=None,
+        help="Base model path for PEFT/LoRA adapter checkpoints.",
+    )
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--limit", type=int, default=None)
     return parser.parse_args()
 
 
-def load_model_and_tokenizer(model_path: Path):
+def load_model_and_tokenizer(model_path: Path, base_model_path: Path | None = None):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", trust_remote_code=True)
+    adapter_config_path = model_path / "adapter_config.json"
+    is_lora_adapter = adapter_config_path.exists()
+    tokenizer_path = model_path
+
+    if is_lora_adapter:
+        resolved_base_model_path = base_model_path or _base_model_path_from_adapter_config(adapter_config_path)
+        if resolved_base_model_path is None:
+            raise ValueError(
+                "LoRA adapter checkpoint detected. Pass --base-model-path or set "
+                "base_model_name_or_path in adapter_config.json."
+            )
+        from peft import PeftModel
+
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+        base_model = AutoModelForCausalLM.from_pretrained(
+            resolved_base_model_path,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        model = PeftModel.from_pretrained(base_model, model_path)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", trust_remote_code=True)
+
     model.eval()
 
     if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
     return tokenizer, model
+
+
+def _base_model_path_from_adapter_config(adapter_config_path: Path) -> str | None:
+    payload = json.loads(adapter_config_path.read_text(encoding="utf-8"))
+    value = payload.get("base_model_name_or_path")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value
 
 
 def generation_kwargs(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -136,13 +172,14 @@ def main() -> None:
     cfg = load_yaml_config(cfg_path)
     eval_subset_path = resolve_path(cfg["eval_subset"], REPO_ROOT)
     model_path = resolve_path(args.model_path, REPO_ROOT)
+    base_model_path = resolve_path(args.base_model_path, REPO_ROOT) if args.base_model_path else None
     output_dir = resolve_path(args.output_dir, REPO_ROOT)
 
     rows = read_jsonl(eval_subset_path)
     if args.limit is not None:
         rows = rows[: args.limit]
 
-    tokenizer, model = load_model_and_tokenizer(model_path)
+    tokenizer, model = load_model_and_tokenizer(model_path, base_model_path=base_model_path)
     scored_rows = evaluate_rows(rows, tokenizer, model, cfg)
     metrics = aggregate_eval_rows(scored_rows)
 
