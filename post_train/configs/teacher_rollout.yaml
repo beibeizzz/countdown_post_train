@@ -1,0 +1,8 @@
+model_path: post_train/model/qwen/qwen3-8b
+backend: vllm
+batch_size: 64
+max_new_tokens: 256
+temperature: 0.2
+top_p: 0.95
+enable_thinking: false
+stop_after_accepted: 20000

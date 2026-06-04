@@ -1,0 +1,9 @@
+seed: 42
+train_input: datasets/raw_train.parquet
+test_input: datasets/raw_test.json
+output_dir: post_train/data/processed
+val_size: 200
+eval_subset_size: 50
+accepted_pool_target: 20000
+sft_train_target: 8000
+grpo_train_target: 4000

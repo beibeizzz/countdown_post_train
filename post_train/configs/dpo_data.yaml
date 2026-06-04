@@ -1,0 +1,14 @@
+model_path: post_train/model/qwen/qwen3-8b
+chosen_data: post_train/data/sft/sft_train_8k.jsonl
+output_dir: post_train/data/dpo
+target_pairs: 6000
+forced_wrong_fraction: 0.5
+high_temp_fraction: 0.5
+max_new_tokens: 256
+forced_wrong_temperature: 0.3
+high_temp_temperature: 1.0
+top_p: 0.95
+batch_size: 64
+enable_thinking: false
+malformed_cap_fraction: 0.10
+preferred_wrong_value_min_fraction: 0.70
