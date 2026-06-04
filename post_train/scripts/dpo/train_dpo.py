@@ -18,6 +18,7 @@ from post_train.scripts.sft.train_full import (
 )
 from post_train.src.countdown.config import load_yaml_config, resolve_path
 from post_train.src.countdown.io import read_jsonl
+from post_train.src.countdown.wandb_utils import configure_wandb_env, formatted_run_name, trainer_report_to
 
 
 DEFAULT_CONFIG = "post_train/configs/dpo_train.yaml"
@@ -96,6 +97,7 @@ def build_dpo_training_arguments(cfg: dict[str, Any], output_dir: Path, max_step
 
         arguments_class = TrainingArguments
 
+    configure_wandb_env(cfg)
     kwargs = {
         "output_dir": str(output_dir),
         "overwrite_output_dir": False,
@@ -112,8 +114,9 @@ def build_dpo_training_arguments(cfg: dict[str, Any], output_dir: Path, max_step
         "save_strategy": "steps",
         "save_steps": int(cfg["save_every_steps"]),
         "eval_steps": int(cfg["eval_every_steps"]),
-        "logging_steps": 10,
-        "report_to": [],
+        "logging_steps": int(cfg.get("logging_steps", 10)),
+        "report_to": trainer_report_to(cfg),
+        "run_name": formatted_run_name(cfg, default_name=output_dir.name),
         "remove_unused_columns": False,
         "beta": float(cfg["beta"]),
         "max_length": int(cfg["max_seq_len"]),

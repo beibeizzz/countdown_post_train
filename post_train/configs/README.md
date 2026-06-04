@@ -10,3 +10,16 @@ Main files:
 - `dpo_data.yaml`, `dpo_train.yaml`: DPO data and training settings.
 - `grpo.yaml`: GRPO rollout/training settings.
 - `eval.yaml`: fixed validation evaluation settings.
+
+Training configs include disabled-by-default wandb fields:
+
+- `report_to`: set to `wandb` to enable.
+- `wandb_project`: default project name.
+- `wandb_entity`: optional team/user.
+- `wandb_group`: optional run grouping.
+- `wandb_tags`: optional tags.
+- `run_name`: run display name.
+- `run_name_auto_suffix`: append a timestamp to avoid duplicate run names.
+- `logging_steps`: Trainer logging cadence. GRPO writes local metrics every step and logs training metrics to wandb every step when enabled.
+
+The standalone evaluator config does not upload metrics to wandb.

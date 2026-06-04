@@ -18,3 +18,13 @@ train:
   gradient_accumulation_steps: 4
   bf16: true
   gradient_checkpointing: true
+  report_to: null
+  wandb_project: countdown-post-train
+  wandb_entity: null
+  wandb_group: null
+  wandb_tags:
+    - sft
+    - rft
+  run_name: rft
+  run_name_auto_suffix: true
+  logging_steps: 10

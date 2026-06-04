@@ -652,6 +652,7 @@ Generation scripts must support resume behavior:
 - Manifest files use the shared `countdown.post_train.manifest.v1` envelope with `manifest_version`, `schema`, `name`, `stage`, and `created_at`, plus stage-specific counts and settings.
 - GRPO KL is intentionally fixed to `kl_coeff: 0.0`; nonzero KL fails fast because reference-KL training is not implemented in the first minimal GRPO script.
 - GRPO vLLM synchronization is implemented as checkpoint save plus reload attempt. Live in-memory vLLM weight synchronization remains environment-dependent and must be validated in the target Ubuntu/vLLM runtime.
+- wandb monitoring is optional and config-driven. Trainer-based SFT, LoRA, RFT, and DPO use `report_to`; GRPO logs metric rows manually. Run names support timestamp suffixes through `run_name_auto_suffix`. The standalone evaluator remains local-only and does not upload to wandb.
 
 ## Open Decisions
 

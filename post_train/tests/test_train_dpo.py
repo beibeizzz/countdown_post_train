@@ -1,6 +1,10 @@
 import pytest
 
-from post_train.scripts.dpo.train_dpo import format_dpo_record_for_trl, prepare_dpo_records
+from post_train.scripts.dpo.train_dpo import (
+    build_dpo_training_arguments,
+    format_dpo_record_for_trl,
+    prepare_dpo_records,
+)
 
 
 class FakeTokenizer:
@@ -69,3 +73,44 @@ def test_format_dpo_record_for_trl_supports_legacy_chat_templates():
         "chosen": "c",
         "rejected": "r",
     }
+
+
+def test_build_dpo_training_arguments_uses_wandb_config(monkeypatch, tmp_path):
+    import sys
+
+    captured = {}
+
+    class FakeDPOConfig:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setitem(sys.modules, "trl", type("FakeTRL", (), {"DPOConfig": FakeDPOConfig}))
+    monkeypatch.setattr("post_train.src.countdown.wandb_utils.current_timestamp_suffix", lambda: "20260604_171234")
+
+    build_dpo_training_arguments(
+        {
+            "epochs": 1,
+            "per_device_train_batch_size": 1,
+            "gradient_accumulation_steps": 1,
+            "learning_rate": 5e-7,
+            "weight_decay": 0.0,
+            "warmup_ratio": 0.03,
+            "scheduler": "cosine",
+            "bf16": False,
+            "gradient_checkpointing": False,
+            "save_every_steps": 100,
+            "eval_every_steps": 100,
+            "beta": 0.05,
+            "max_seq_len": 256,
+            "report_to": "wandb",
+            "run_name": "dpo",
+            "run_name_auto_suffix": True,
+            "logging_steps": 8,
+        },
+        tmp_path,
+        max_steps=2,
+    )
+
+    assert captured["report_to"] == ["wandb"]
+    assert captured["run_name"] == "dpo_20260604_171234"
+    assert captured["logging_steps"] == 8

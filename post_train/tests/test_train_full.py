@@ -1,6 +1,12 @@
 import pytest
 
-from post_train.scripts.sft.train_full import DataCollatorForCausalSFT, encode_prompt_response, normalize_sft_config
+from post_train.scripts.sft.train_full import (
+    DataCollatorForCausalSFT,
+    build_eval_wandb_metrics,
+    build_training_arguments,
+    encode_prompt_response,
+    normalize_sft_config,
+)
 
 
 class FakeTokenizer:
@@ -129,3 +135,81 @@ def test_normalize_sft_config_maps_rft_train_section_to_full_sft_config():
     assert cfg["eval_every_steps"] == 100
     assert cfg["save_every_steps"] == 100
     assert cfg["epochs"] == 2
+
+
+def test_normalize_sft_config_preserves_rft_wandb_train_fields():
+    cfg = normalize_sft_config(
+        {
+            "accepted_output": "post_train/data/sft/rft_accepted.jsonl",
+            "output_dir": "post_train/outputs/sft/rft",
+            "train": {
+                "max_seq_len": 256,
+                "learning_rate": 1e-5,
+                "warmup_ratio": 0.03,
+                "scheduler": "cosine",
+                "epochs": 2,
+                "per_device_train_batch_size": 4,
+                "gradient_accumulation_steps": 4,
+                "bf16": True,
+                "gradient_checkpointing": True,
+                "report_to": "wandb",
+                "wandb_project": "countdown-post-train",
+                "run_name": "rft",
+                "logging_steps": 5,
+            },
+        }
+    )
+
+    assert cfg["report_to"] == "wandb"
+    assert cfg["wandb_project"] == "countdown-post-train"
+    assert cfg["run_name"] == "rft"
+    assert cfg["logging_steps"] == 5
+
+
+def test_build_training_arguments_uses_wandb_config(monkeypatch, tmp_path):
+    import sys
+
+    captured = {}
+
+    class FakeTrainingArguments:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        type("FakeTransformers", (), {"TrainingArguments": FakeTrainingArguments}),
+    )
+    monkeypatch.setattr("post_train.src.countdown.wandb_utils.current_timestamp_suffix", lambda: "20260604_171234")
+
+    build_training_arguments(
+        {
+            "epochs": 1,
+            "per_device_train_batch_size": 1,
+            "gradient_accumulation_steps": 1,
+            "learning_rate": 1e-5,
+            "weight_decay": 0.0,
+            "warmup_ratio": 0.03,
+            "scheduler": "cosine",
+            "bf16": False,
+            "gradient_checkpointing": False,
+            "save_every_steps": 100,
+            "report_to": "wandb",
+            "run_name": "sft_full",
+            "run_name_auto_suffix": True,
+            "logging_steps": 7,
+        },
+        tmp_path,
+        max_steps=2,
+    )
+
+    assert captured["report_to"] == ["wandb"]
+    assert captured["run_name"] == "sft_full_20260604_171234"
+    assert captured["logging_steps"] == 7
+
+
+def test_build_eval_wandb_metrics_prefixes_numeric_values():
+    assert build_eval_wandb_metrics({"accuracy": 0.4, "note": "skip", "truncated_count": 1}) == {
+        "eval/accuracy": 0.4,
+        "eval/truncated_count": 1,
+    }

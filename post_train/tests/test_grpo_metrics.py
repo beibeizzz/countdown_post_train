@@ -1,4 +1,6 @@
 from post_train.scripts.grpo.train_grpo import (
+    build_grpo_eval_wandb_metrics,
+    build_grpo_wandb_metrics,
     build_metric_row,
     compute_rewards,
     ensure_policy_examples_available,
@@ -143,3 +145,36 @@ def test_ensure_policy_examples_available_returns_nonempty_examples():
     examples = [({"input_ids": [1], "labels": [1], "attention_mask": [1]}, 0.25)]
 
     assert ensure_policy_examples_available(examples, rollout_count=1) is examples
+
+
+def test_build_grpo_wandb_metrics_prefixes_training_metric_row():
+    metric = {
+        "step": 3,
+        "loss": 0.5,
+        "mean_reward": 0.2,
+        "entropy": None,
+        "note": "skip",
+        "format_rate": 1.0,
+    }
+
+    assert build_grpo_wandb_metrics(metric) == {
+        "train/loss": 0.5,
+        "train/mean_reward": 0.2,
+        "train/format_rate": 1.0,
+    }
+
+
+def test_build_grpo_eval_wandb_metrics_prefixes_eval_metrics():
+    assert build_grpo_eval_wandb_metrics({"accuracy": 1.0, "truncated_count": 0}) == {
+        "eval/accuracy": 1.0,
+        "eval/truncated_count": 0,
+    }
+
+
+def test_build_grpo_wandb_metrics_is_available_for_every_step_logging():
+    metric = {"step": 1, "loss": 0.25, "mean_reward": 0.5}
+
+    assert build_grpo_wandb_metrics(metric) == {
+        "train/loss": 0.25,
+        "train/mean_reward": 0.5,
+    }

@@ -45,3 +45,35 @@ def test_write_manifest_adds_standard_envelope(tmp_path: Path):
     assert manifest["stage"] == "stage_name"
     assert manifest["created_at"]
     assert manifest["num_records"] == 3
+
+
+def test_training_configs_include_disabled_wandb_defaults():
+    config_paths = [
+        Path("post_train/configs/sft_full.yaml"),
+        Path("post_train/configs/sft_lora.yaml"),
+        Path("post_train/configs/dpo_train.yaml"),
+        Path("post_train/configs/grpo.yaml"),
+    ]
+
+    for path in config_paths:
+        cfg = load_yaml_config(path)
+        assert "report_to" in cfg
+        assert cfg["report_to"] is None
+        assert cfg["wandb_project"] == "countdown-post-train"
+        assert cfg["wandb_entity"] is None
+        assert cfg["wandb_group"] is None
+        assert isinstance(cfg["wandb_tags"], list)
+        assert isinstance(cfg["run_name"], str)
+        assert cfg["run_name_auto_suffix"] is True
+        assert int(cfg["logging_steps"]) > 0
+
+    rft_cfg = load_yaml_config("post_train/configs/rft.yaml")
+    train_cfg = rft_cfg["train"]
+    assert train_cfg["report_to"] is None
+    assert train_cfg["wandb_project"] == "countdown-post-train"
+    assert train_cfg["wandb_entity"] is None
+    assert train_cfg["wandb_group"] is None
+    assert isinstance(train_cfg["wandb_tags"], list)
+    assert train_cfg["run_name"] == "rft"
+    assert train_cfg["run_name_auto_suffix"] is True
+    assert int(train_cfg["logging_steps"]) > 0

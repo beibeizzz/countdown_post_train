@@ -51,6 +51,32 @@ python post_train/scripts/grpo/train_grpo.py --config post_train/configs/grpo.ya
 python post_train/scripts/eval/evaluate_model.py --config post_train/configs/eval.yaml --model-path post_train/outputs/sft/full/final --output-dir post_train/data/eval/sft_full
 ```
 
+## Optional wandb Monitoring
+
+Training scripts support optional wandb logging. It is disabled by default with `report_to: null`.
+
+Enable it in the relevant training config:
+
+```yaml
+report_to: wandb
+wandb_project: countdown-post-train
+run_name: sft_full
+run_name_auto_suffix: true
+```
+
+On the training machine:
+
+```bash
+pip install wandb
+wandb login
+```
+
+The offline evaluator does not upload to wandb:
+
+```bash
+python post_train/scripts/eval/evaluate_model.py --config post_train/configs/eval.yaml --model-path post_train/outputs/sft/full/final --output-dir post_train/data/eval/sft_full
+```
+
 ## Manifest Convention
 
 Generated manifests use the shared `countdown.post_train.manifest.v1` envelope:

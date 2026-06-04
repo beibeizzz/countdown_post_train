@@ -18,3 +18,13 @@ lora_dropout: 0.05
 lora_target_modules: auto
 eval_every_steps: 100
 save_every_steps: 100
+report_to: null
+wandb_project: countdown-post-train
+wandb_entity: null
+wandb_group: null
+wandb_tags:
+  - sft
+  - lora
+run_name: sft_lora
+run_name_auto_suffix: true
+logging_steps: 10

@@ -13,6 +13,13 @@ if str(REPO_ROOT) not in sys.path:
 from post_train.src.countdown.config import load_yaml_config, resolve_path
 from post_train.src.countdown.generation import _supports_enable_thinking
 from post_train.src.countdown.io import read_jsonl, write_json, write_jsonl
+from post_train.src.countdown.wandb_utils import (
+    configure_wandb_env,
+    formatted_run_name,
+    is_wandb_enabled,
+    prefixed_metrics,
+    trainer_report_to,
+)
 
 
 DEFAULT_CONFIG = "post_train/configs/sft_full.yaml"
@@ -45,6 +52,10 @@ def normalize_sft_config(raw_cfg: dict[str, Any]) -> dict[str, Any]:
     }
     merged.update(train_cfg)
     return merged
+
+
+def build_eval_wandb_metrics(metrics: dict[str, Any]) -> dict[str, float | int]:
+    return prefixed_metrics("eval", metrics)
 
 
 def apply_chat_template_compat(tokenizer, messages: list[dict[str, str]], enable_thinking: bool, **kwargs) -> str:
@@ -146,7 +157,12 @@ def tokenize_rows(
     return examples
 
 
-def build_eval_callback(output_dir: Path, eval_every_steps: int, eval_cfg: dict[str, Any]):
+def build_eval_callback(
+    output_dir: Path,
+    eval_every_steps: int,
+    eval_cfg: dict[str, Any],
+    wandb_enabled: bool = False,
+):
     from transformers import TrainerCallback
 
     from post_train.scripts.eval.evaluate_model import evaluate_rows
@@ -175,6 +191,13 @@ def build_eval_callback(output_dir: Path, eval_every_steps: int, eval_cfg: dict[
             step_dir = output_dir / "eval" / f"step_{state.global_step}"
             write_jsonl(step_dir / "eval_samples.jsonl", scored_rows)
             write_json(step_dir / "eval_metrics.json", metrics)
+            if wandb_enabled:
+                try:
+                    import wandb
+                except ImportError:
+                    wandb = None
+                if wandb is not None and getattr(wandb, "run", None) is not None:
+                    wandb.log(build_eval_wandb_metrics(metrics), step=int(state.global_step))
 
             if was_training:
                 model.train()
@@ -201,6 +224,7 @@ def load_model_and_tokenizer(model_path: Path, gradient_checkpointing: bool):
 def build_training_arguments(cfg: dict[str, Any], output_dir: Path, max_steps: int | None):
     from transformers import TrainingArguments
 
+    configure_wandb_env(cfg)
     return TrainingArguments(
         output_dir=str(output_dir),
         overwrite_output_dir=False,
@@ -216,8 +240,9 @@ def build_training_arguments(cfg: dict[str, Any], output_dir: Path, max_steps: i
         gradient_checkpointing=bool(cfg.get("gradient_checkpointing", False)),
         save_strategy="steps",
         save_steps=int(cfg["save_every_steps"]),
-        logging_steps=10,
-        report_to=[],
+        logging_steps=int(cfg.get("logging_steps", 10)),
+        report_to=trainer_report_to(cfg),
+        run_name=formatted_run_name(cfg, default_name=output_dir.name),
         remove_unused_columns=False,
     )
 
@@ -268,7 +293,14 @@ def run_sft_training(cfg: dict[str, Any], max_steps: int | None = None) -> None:
         eval_cfg = load_yaml_config(eval_cfg_path)
         if "val_data" in cfg:
             eval_cfg["val_data"] = cfg["val_data"]
-        callbacks.append(build_eval_callback(output_dir, eval_every_steps, eval_cfg))
+        callbacks.append(
+            build_eval_callback(
+                output_dir,
+                eval_every_steps,
+                eval_cfg,
+                wandb_enabled=is_wandb_enabled(cfg),
+            )
+        )
 
     trainer = build_trainer(model, training_args, train_dataset, collator, tokenizer, callbacks)
     trainer.train()

@@ -18,6 +18,12 @@ from post_train.src.countdown.config import load_yaml_config, resolve_path
 from post_train.src.countdown.generation import GenerationConfig, VLLMGenerator
 from post_train.src.countdown.io import read_jsonl, write_json, write_jsonl
 from post_train.src.countdown.validation import extract_answer_text, validate_countdown_response
+from post_train.src.countdown.wandb_utils import (
+    finish_wandb,
+    init_wandb_if_enabled,
+    log_wandb_metrics,
+    prefixed_metrics,
+)
 
 
 DEFAULT_CONFIG = "post_train/configs/grpo.yaml"
@@ -315,6 +321,17 @@ def write_metric(output_dir: Path, metric: dict[str, Any]) -> None:
         handle.write(json.dumps(metric, sort_keys=True) + "\n")
 
 
+def build_grpo_wandb_metrics(metric: dict[str, Any]) -> dict[str, float | int]:
+    return prefixed_metrics(
+        "train",
+        {key: value for key, value in metric.items() if key != "step"},
+    )
+
+
+def build_grpo_eval_wandb_metrics(metrics: dict[str, Any]) -> dict[str, float | int]:
+    return prefixed_metrics("eval", metrics)
+
+
 def run_fixed_eval(
     model,
     tokenizer,
@@ -322,6 +339,7 @@ def run_fixed_eval(
     step: int,
     eval_rows: list[dict[str, Any]],
     eval_cfg: dict[str, Any],
+    wandb_run=None,
 ) -> None:
     from post_train.scripts.eval.evaluate_model import evaluate_rows
     from post_train.src.countdown.eval import aggregate_eval_rows
@@ -333,6 +351,7 @@ def run_fixed_eval(
     step_dir = output_dir / "eval" / f"step_{step}"
     write_jsonl(step_dir / "eval_samples.jsonl", scored_rows)
     write_json(step_dir / "eval_metrics.json", metrics)
+    log_wandb_metrics(wandb_run, build_grpo_eval_wandb_metrics(metrics), step=step)
     if was_training:
         model.train()
 
@@ -360,6 +379,7 @@ def train_grpo(cfg: dict[str, Any], max_steps: int, model_path: Path, output_dir
 
     validate_supported_grpo_config(cfg, effective_max_steps=max_steps)
     output_dir.mkdir(parents=True, exist_ok=True)
+    wandb_run = init_wandb_if_enabled(cfg, default_name="grpo")
     model, tokenizer = load_model_and_tokenizer(
         model_path,
         gradient_checkpointing=bool(cfg.get("gradient_checkpointing", False)),
@@ -398,80 +418,96 @@ def train_grpo(cfg: dict[str, Any], max_steps: int, model_path: Path, output_dir
             eval_cfg = load_yaml_config(eval_cfg_path)
             eval_rows = read_jsonl(resolve_path(eval_cfg["eval_subset"], REPO_ROOT))
 
-    while global_step < max_steps:
-        source_rows = [next(row_iter) for _ in range(batch_size)]
-        rewarded_rows = rollout_batch(rollout_generator, source_rows, generation_config, cfg)
-        rewards = [float(row["reward"]) for row in rewarded_rows]
-        advantages = group_relative_advantages(rewards, group_size, float(cfg["clip_eps"]))
+    try:
+        while global_step < max_steps:
+            source_rows = [next(row_iter) for _ in range(batch_size)]
+            rewarded_rows = rollout_batch(rollout_generator, source_rows, generation_config, cfg)
+            rewards = [float(row["reward"]) for row in rewarded_rows]
+            advantages = group_relative_advantages(rewards, group_size, float(cfg["clip_eps"]))
 
-        examples_with_advantages = []
-        for row, advantage in zip(rewarded_rows, advantages, strict=True):
-            encoded = encode_policy_example(
-                tokenizer,
-                str(row["prompt"]),
-                str(row["completion"]),
-                max_prompt_len=int(cfg["max_prompt_len"]),
-                max_new_tokens=int(cfg["max_new_tokens"]),
-                enable_thinking=enable_thinking,
-            )
-            if encoded is not None:
-                examples_with_advantages.append((encoded, advantage))
-        examples_with_advantages = ensure_policy_examples_available(
-            examples_with_advantages,
-            rollout_count=len(rewarded_rows),
-        )
-
-        loss_value = 0.0
-        entropy_value = None if compute_entropy else 0.0
-        for _ in range(updates_per_rollout):
-            if global_step >= max_steps:
-                break
-            optimizer.zero_grad(set_to_none=True)
-            batch = collate_policy_examples(
-                [example for example, _ in examples_with_advantages],
-                pad_token_id=int(tokenizer.pad_token_id),
-            )
-            batch = {key: value.to(model.device) for key, value in batch.items()}
-            batch_advantages = [advantage for _, advantage in examples_with_advantages]
-            loss, entropy = sequence_policy_loss(model, batch, batch_advantages, compute_entropy)
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-            global_step += 1
-            loss_value = float(loss.detach().float().cpu().item())
-            if entropy is not None:
-                entropy_value = float(entropy.float().cpu().item())
-
-            metric = build_metric_row(
-                loss=loss_value,
-                rewarded_rows=rewarded_rows,
-                group_size=group_size,
-                approx_kl=0.0,
-                entropy=entropy_value,
-                learning_rate=scheduler.get_last_lr()[0],
-            )
-            metric["step"] = global_step
-            write_metric(output_dir, metric)
-
-            if save_every_steps > 0 and global_step % save_every_steps == 0:
-                save_checkpoint(model, tokenizer, output_dir, global_step)
-            if eval_cfg is not None and eval_every_steps > 0 and global_step % eval_every_steps == 0:
-                run_fixed_eval(model, tokenizer, output_dir, global_step, eval_rows, eval_cfg)
-            if sync_every_steps > 0 and global_step % sync_every_steps == 0:
-                rollout_generator = sync_rollout_model(
-                    rollout_generator,
-                    model,
+            examples_with_advantages = []
+            for row, advantage in zip(rewarded_rows, advantages, strict=True):
+                encoded = encode_policy_example(
                     tokenizer,
-                    output_dir,
-                    global_step,
-                    tensor_parallel_size=int(cfg.get("tensor_parallel_size", 1)),
+                    str(row["prompt"]),
+                    str(row["completion"]),
+                    max_prompt_len=int(cfg["max_prompt_len"]),
+                    max_new_tokens=int(cfg["max_new_tokens"]),
+                    enable_thinking=enable_thinking,
+                )
+                if encoded is not None:
+                    examples_with_advantages.append((encoded, advantage))
+            examples_with_advantages = ensure_policy_examples_available(
+                examples_with_advantages,
+                rollout_count=len(rewarded_rows),
+            )
+
+            loss_value = 0.0
+            entropy_value = None if compute_entropy else 0.0
+            for _ in range(updates_per_rollout):
+                if global_step >= max_steps:
+                    break
+                optimizer.zero_grad(set_to_none=True)
+                batch = collate_policy_examples(
+                    [example for example, _ in examples_with_advantages],
+                    pad_token_id=int(tokenizer.pad_token_id),
+                )
+                batch = {key: value.to(model.device) for key, value in batch.items()}
+                batch_advantages = [advantage for _, advantage in examples_with_advantages]
+                loss, entropy = sequence_policy_loss(model, batch, batch_advantages, compute_entropy)
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+
+                global_step += 1
+                loss_value = float(loss.detach().float().cpu().item())
+                if entropy is not None:
+                    entropy_value = float(entropy.float().cpu().item())
+
+                metric = build_metric_row(
+                    loss=loss_value,
+                    rewarded_rows=rewarded_rows,
+                    group_size=group_size,
+                    approx_kl=0.0,
+                    entropy=entropy_value,
+                    learning_rate=scheduler.get_last_lr()[0],
+                )
+                metric["step"] = global_step
+                write_metric(output_dir, metric)
+                log_wandb_metrics(
+                    wandb_run,
+                    build_grpo_wandb_metrics(metric),
+                    step=global_step,
                 )
 
-    final_dir = output_dir / "final"
-    final_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(final_dir)
-    tokenizer.save_pretrained(final_dir)
+                if save_every_steps > 0 and global_step % save_every_steps == 0:
+                    save_checkpoint(model, tokenizer, output_dir, global_step)
+                if eval_cfg is not None and eval_every_steps > 0 and global_step % eval_every_steps == 0:
+                    run_fixed_eval(
+                        model,
+                        tokenizer,
+                        output_dir,
+                        global_step,
+                        eval_rows,
+                        eval_cfg,
+                        wandb_run=wandb_run,
+                    )
+                if sync_every_steps > 0 and global_step % sync_every_steps == 0:
+                    rollout_generator = sync_rollout_model(
+                        rollout_generator,
+                        model,
+                        tokenizer,
+                        output_dir,
+                        global_step,
+                        tensor_parallel_size=int(cfg.get("tensor_parallel_size", 1)),
+                    )
+
+        final_dir = output_dir / "final"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(final_dir)
+        tokenizer.save_pretrained(final_dir)
+    finally:
+        finish_wandb(wandb_run)
 
 
 def main() -> None:
