@@ -1,0 +1,29 @@
+# Use with constraints-verl071-vllm017-cu128.txt.
+verl==0.7.1
+transformers==4.57.6
+trl==0.27.0
+peft==0.19.1
+accelerate==1.13.0
+datasets==4.8.5
+tokenizers==0.22.2
+safetensors==0.7.0
+numpy==1.26.4
+ray[default,cgraph]==2.48.0
+tensordict==0.10.0
+pyarrow==19.0.1
+hydra-core==1.3.2
+torchdata==0.11.0
+wandb
+tensorboard
+codetiming
+dill
+pandas
+packaging>=20.0
+pybind11
+pylatexenc
+opencv-python-headless==4.11.0.86
+
+# Torch is installed from the official cu128 index.
+# vLLM is resolved from the downloaded local cu128 wheel declared in
+# pyproject.toml.
+# Flash Attention is built into a local wheel after the runtime is complete.
