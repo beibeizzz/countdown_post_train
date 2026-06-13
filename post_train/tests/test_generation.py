@@ -105,6 +105,55 @@ class FakeSamplingParams:
         self.max_tokens = max_tokens
 
 
+def test_vllm_generator_uses_exact_legacy_llm_kwargs(monkeypatch):
+    calls = []
+
+    class RecordingLLM:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setitem(sys.modules, "vllm", types.SimpleNamespace(LLM=RecordingLLM))
+
+    VLLMGenerator("/model")
+
+    assert calls == [
+        {
+            "model": "/model",
+            "tensor_parallel_size": 1,
+            "trust_remote_code": True,
+        }
+    ]
+
+
+def test_vllm_generator_forwards_all_configured_optional_llm_kwargs(monkeypatch):
+    calls = []
+
+    class RecordingLLM:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setitem(sys.modules, "vllm", types.SimpleNamespace(LLM=RecordingLLM))
+
+    VLLMGenerator(
+        "/model",
+        tensor_parallel_size=2,
+        gpu_memory_utilization=0.75,
+        max_model_len=4096,
+        seed=0,
+    )
+
+    assert calls == [
+        {
+            "model": "/model",
+            "tensor_parallel_size": 2,
+            "trust_remote_code": True,
+            "gpu_memory_utilization": 0.75,
+            "max_model_len": 4096,
+            "seed": 0,
+        }
+    ]
+
+
 def test_vllm_generate_with_metadata_extracts_finish_reason_and_token_count(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm", types.SimpleNamespace(SamplingParams=FakeSamplingParams))
     generator = VLLMGenerator.__new__(VLLMGenerator)

@@ -44,10 +44,28 @@ def _supports_enable_thinking(apply_chat_template) -> bool:
 
 
 class VLLMGenerator:
-    def __init__(self, model_path: str, tensor_parallel_size: int = 1):
+    def __init__(
+        self,
+        model_path: str,
+        tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float | None = None,
+        max_model_len: int | None = None,
+        seed: int | None = None,
+    ):
         from vllm import LLM
 
-        self.llm = LLM(model=model_path, tensor_parallel_size=tensor_parallel_size, trust_remote_code=True)
+        kwargs = {
+            "model": model_path,
+            "tensor_parallel_size": tensor_parallel_size,
+            "trust_remote_code": True,
+        }
+        if gpu_memory_utilization is not None:
+            kwargs["gpu_memory_utilization"] = gpu_memory_utilization
+        if max_model_len is not None:
+            kwargs["max_model_len"] = max_model_len
+        if seed is not None:
+            kwargs["seed"] = seed
+        self.llm = LLM(**kwargs)
 
     def generate(self, prompts: list[str], config: GenerationConfig) -> list[str]:
         return [str(record["text"]) for record in self.generate_with_metadata(prompts, config)]
