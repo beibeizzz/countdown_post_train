@@ -13,3 +13,9 @@ writes.
 Local unit tests use injected fake generators, queues, and processes. Real
 vLLM initialization and two-GPU behavior are verified only by the remote GPU
 smoke gate.
+
+Run the local orchestration suite with:
+
+```text
+python -m pytest -q post_train_v2/tests/generation/test_parallel_vllm.py
+```
