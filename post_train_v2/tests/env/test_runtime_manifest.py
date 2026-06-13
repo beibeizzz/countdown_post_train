@@ -237,6 +237,13 @@ def test_pyproject_allows_only_base_verl_060() -> None:
     assert dependencies["verl"] == (frozenset(), "0.6.0")
 
 
+def test_pyproject_limits_uv_resolution_to_linux_x86_64() -> None:
+    uv_config = load_pyproject()["tool"]["uv"]
+    assert uv_config["environments"] == [
+        "sys_platform == 'linux' and platform_machine == 'x86_64'"
+    ]
+
+
 def test_constraints_match_all_manifest_pins() -> None:
     manifest = load_manifest()
     constraints = read_requirement_file(CONSTRAINTS_PATH)

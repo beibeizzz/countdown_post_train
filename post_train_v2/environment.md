@@ -39,6 +39,10 @@ The target allocation is:
 - one process namespace exposing both devices;
 - Ray and NCCL permitted.
 
+The uv project resolution is restricted to Linux x86_64. The generated
+`uv.lock` is a deployment lock for this training platform, not a
+cross-platform development lock.
+
 The driver may advertise CUDA 13.0 while the selected binary runtime is CUDA
 12.8. That is valid driver backward compatibility. The CUDA 12.4 `nvcc`
 available in the old Conda environment is not part of this runtime.

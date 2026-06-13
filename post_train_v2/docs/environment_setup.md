@@ -81,6 +81,10 @@ Python must report `3.11.15`, and the executable must be inside
 
 ## 5. Resolve and Install
 
+The project limits uv resolution to Linux x86_64 through
+`tool.uv.environments`. This matches the CUDA wheel platform and prevents uv
+from solving unrelated macOS or Windows dependency branches.
+
 ```bash
 uv lock
 uv sync --frozen
