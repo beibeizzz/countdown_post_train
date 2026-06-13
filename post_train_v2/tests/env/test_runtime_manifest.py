@@ -147,6 +147,7 @@ def test_manifest_locks_all_direct_and_dev_packages() -> None:
     assert data["packages"]["flash-attn"] == "2.7.4.post1"
     assert data["packages"]["vllm"] == "0.9.1"
     assert data["packages"]["verl"] == "0.6.0"
+    assert data["packages"]["packaging"] == "25.0"
     assert data["dev_packages"] == {"pytest": "8.3.5"}
     assert all(version for version in data["packages"].values())
 

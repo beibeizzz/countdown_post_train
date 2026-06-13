@@ -45,7 +45,7 @@ project that supports:
 | pandas | 2.2.3 |
 | pybind11 | 2.13.6 |
 | pylatexenc | 2.10 |
-| packaging | 24.2 |
+| packaging | 25.0 |
 | safetensors | 0.5.3 |
 | pytest (development) | 8.3.5 |
 

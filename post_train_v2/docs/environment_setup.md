@@ -88,12 +88,18 @@ from solving unrelated macOS or Windows dependency branches.
 ```bash
 uv lock
 uv sync --frozen
-uv pip check
+uv pip check --python .venv/bin/python
+uv run --frozen python -V
+uv run --frozen python -c "import sys; print(sys.executable)"
 ```
 
 The project uses the configured TUNA mirror for ordinary packages, the
 official PyTorch `cu128` index for the Torch family, and repository-local
 official wheels for vLLM and Flash Attention.
+
+The final Python commands must report Python 3.11.15 and the
+`post_train_v2/.venv/bin/python` executable. Do not accept a `uv pip check`
+result that names an inherited Conda environment.
 
 Do not:
 
