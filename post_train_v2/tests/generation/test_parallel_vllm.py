@@ -220,6 +220,36 @@ def test_merge_worker_results_rejects_worker_error_with_unknown_worker() -> None
         )
 
 
+@pytest.mark.parametrize("worker_index", (False, 0.0))
+def test_merge_worker_results_rejects_non_exact_result_worker_index(
+    worker_index,
+) -> None:
+    with pytest.raises(ValueError, match="worker index"):
+        merge_worker_results(
+            batch_id=9,
+            expected_positions=[0, 1],
+            messages=[
+                WorkerResult(worker_index, 9, ((0, "r0"),)),
+                WorkerResult(1, 9, ((1, "r1"),)),
+            ],
+        )
+
+
+@pytest.mark.parametrize("worker_index", (False, 0.0))
+def test_merge_worker_results_rejects_non_exact_error_worker_index(
+    worker_index,
+) -> None:
+    with pytest.raises(ValueError, match="worker index"):
+        merge_worker_results(
+            batch_id=9,
+            expected_positions=[0, 1],
+            messages=[
+                WorkerResult(0, 9, ((0, "r0"),)),
+                WorkerError(worker_index, 9, "bad", "trace"),
+            ],
+        )
+
+
 class RecordingGenerator:
     def __init__(self, responses: list[str] | None = None, error: Exception | None = None):
         self.responses = responses
@@ -654,6 +684,8 @@ def test_start_waits_for_two_unique_ready_messages_in_any_order() -> None:
     (
         ([WorkerReady(0), WorkerReady(0)], "duplicate"),
         ([WorkerReady(0), WorkerReady(4)], "worker index"),
+        ([WorkerReady(False)], "worker index"),
+        ([WorkerReady(0.0)], "worker index"),
         ([WorkerReady(0), "bad"], "malformed"),
         ([None], "malformed"),
         ([WorkerError(1, None, "init failed", "trace")], "init failed"),
@@ -824,7 +856,11 @@ def test_generate_raises_worker_error_and_closes_workers() -> None:
         ([WorkerReady(0)], "malformed"),
         ([WorkerResult(0, 8, ())], "batch"),
         ([WorkerResult(3, 9, ())], "worker index"),
+        ([WorkerResult(False, 9, ())], "worker index"),
+        ([WorkerResult(0.0, 9, ())], "worker index"),
         ([WorkerError(3, 9, "bad", "trace")], "worker index"),
+        ([WorkerError(False, 9, "bad", "trace")], "worker index"),
+        ([WorkerError(0.0, 9, "bad", "trace")], "worker index"),
     ),
 )
 def test_generate_rejects_malformed_wrong_batch_and_unknown_worker(
@@ -1095,6 +1131,12 @@ def test_constructor_requires_exactly_two_ordered_worker_specs() -> None:
             timeout_seconds=1.0,
             context=context,
         )
+
+
+@pytest.mark.parametrize("worker_index", (False, True, 0.0, 1.0))
+def test_worker_spec_rejects_non_exact_worker_index(worker_index) -> None:
+    with pytest.raises(ValueError, match="worker index"):
+        WorkerSpec(worker_index, 0, "/cache/gpu0")
 
 
 @pytest.mark.parametrize(

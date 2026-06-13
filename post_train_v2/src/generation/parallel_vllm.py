@@ -22,6 +22,9 @@ class WorkerSpec:
     device: int
     cache_root: str
 
+    def __post_init__(self) -> None:
+        _validate_worker_index(self.worker_index)
+
 
 @dataclass(frozen=True)
 class WorkerRequest:
@@ -369,11 +372,7 @@ class ParallelVLLMEngine:
                     raise RuntimeError(_format_worker_error(message))
                 if not isinstance(message, WorkerReady):
                     raise ValueError(f"malformed worker startup message: {message!r}")
-                if message.worker_index not in (0, 1):
-                    raise ValueError(
-                        f"unknown worker index in ready message: "
-                        f"{message.worker_index}"
-                    )
+                _validate_worker_index(message.worker_index)
                 if message.worker_index in ready_workers:
                     raise ValueError(
                         f"duplicate ready message from worker "
