@@ -500,13 +500,29 @@ def test_v2_resume_allows_operational_timeout_and_cache_changes(tmp_path: Path) 
     assert state.processed_count == 1
 
 
+def test_v2_resume_allows_current_device_change(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    store, _ = materialize_v2_state(
+        config,
+        [accepted_row("a", [1, 2], 3)],
+        [],
+    )
+
+    state = store.load_resume_state(
+        source_rows(),
+        replace(config, devices=(2, 3)),
+        adopt_legacy_state=False,
+    )
+
+    assert state.processed_count == 1
+
+
 @pytest.mark.parametrize(
     ("field", "value", "match"),
     (
         ("max_worker_batch_size", 31, "max_worker_batch_size"),
         ("devices", [0], "devices"),
         ("devices", [0, False], "devices"),
-        ("devices", [1, 0], "devices"),
         ("worker_timeout_seconds", 0, "worker_timeout_seconds"),
         ("worker_timeout_seconds", float("nan"), "worker_timeout_seconds"),
         ("worker_timeout_seconds", float("inf"), "worker_timeout_seconds"),
@@ -1070,6 +1086,98 @@ def test_commit_preserves_created_at_from_previous_manifest(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize(
+    "changed_config",
+    (
+        {"schema_version": 2},
+        {"topology": "dual_tp1_changed"},
+        {"batch_size": 32},
+        {"max_model_len": 1024},
+        {"max_new_tokens": 128},
+        {"temperature": 0.7},
+        {"top_p": 0.8},
+        {"seed": 9},
+    ),
+)
+def test_commit_rejects_immutable_generation_transition_before_journal(
+    tmp_path: Path,
+    changed_config: dict,
+) -> None:
+    config = make_config(tmp_path)
+    store = TeacherStateStore(config.output_dir)
+    old_manifest = commit_rows(
+        store,
+        config,
+        batch_id=0,
+        start=0,
+        accepted=[],
+        rejected=[],
+    )
+    next_config = replace(config, **changed_config)
+    next_manifest = manifest_for_rows(
+        next_config,
+        [accepted_row("a", [1, 2], 3)],
+        [],
+        created_at=old_manifest["created_at"],
+        updated_at="2026-06-13T02:00:00+00:00",
+    )
+
+    with pytest.raises(ValueError, match="immutable"):
+        store.commit(
+            batch_id=1,
+            submitted_start=0,
+            submitted_stop=1,
+            accepted=[accepted_row("a", [1, 2], 3)],
+            rejected=[],
+            manifest=next_manifest,
+        )
+
+    assert not store.transaction_path.exists()
+
+
+def test_commit_rejects_immutable_model_and_source_path_transition(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    store = TeacherStateStore(config.output_dir)
+    old_manifest = commit_rows(
+        store,
+        config,
+        batch_id=0,
+        start=0,
+        accepted=[],
+        rejected=[],
+    )
+    new_model = tmp_path / "new-model"
+    new_model.mkdir()
+    new_source = tmp_path / "new-source.jsonl"
+    write_jsonl(new_source, source_rows())
+    next_config = replace(
+        config,
+        model_path=new_model,
+        input_path=new_source,
+    )
+    next_manifest = manifest_for_rows(
+        next_config,
+        [accepted_row("a", [1, 2], 3)],
+        [],
+        created_at=old_manifest["created_at"],
+        updated_at="2026-06-13T02:00:00+00:00",
+    )
+
+    with pytest.raises(ValueError, match="immutable"):
+        store.commit(
+            batch_id=1,
+            submitted_start=0,
+            submitted_stop=1,
+            accepted=[accepted_row("a", [1, 2], 3)],
+            rejected=[],
+            manifest=next_manifest,
+        )
+
+    assert not store.transaction_path.exists()
+
+
+@pytest.mark.parametrize(
     ("mutation", "match"),
     (
         ({"processed_count": 0}, "processed_count"),
@@ -1220,6 +1328,17 @@ class FailNthCall:
             raise OSError(errno.EIO, self.message)
 
 
+class FailCalls:
+    def __init__(self, failures: dict[int, str]) -> None:
+        self.failures = failures
+        self.calls = 0
+
+    def __call__(self, path: Path) -> None:
+        self.calls += 1
+        if self.calls in self.failures:
+            raise OSError(errno.EIO, self.failures[self.calls])
+
+
 def test_commit_file_fsync_failure_preserves_journal_for_recovery(
     tmp_path: Path,
 ) -> None:
@@ -1302,3 +1421,62 @@ def test_recovery_final_directory_fsync_failure_restores_journal(
     assert recovering_store.transaction_path.read_bytes() == journal_bytes
     TeacherStateStore(store.output_dir).recover_transaction()
     assert not store.transaction_path.exists()
+
+
+def test_commit_reports_final_and_marker_directory_fsync_failures(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    old_store = TeacherStateStore(config.output_dir)
+    old_manifest = commit_rows(
+        old_store,
+        config,
+        batch_id=0,
+        start=0,
+        accepted=[],
+        rejected=[],
+    )
+    failures = FailCalls(
+        {
+            5: "final directory fsync failed",
+            6: "marker directory fsync failed",
+        }
+    )
+    store = TeacherStateStore(config.output_dir, fsync_directory=failures)
+
+    with pytest.raises(BaseException) as exc_info:
+        commit_rows(
+            store,
+            config,
+            batch_id=1,
+            start=0,
+            accepted=[accepted_row("a", [1, 2], 3)],
+            rejected=[],
+            created_at=old_manifest["created_at"],
+        )
+
+    text = str(exc_info.value)
+    assert "final directory fsync failed" in text
+    assert "marker directory fsync failed" in text
+    assert store.transaction_path.exists()
+
+
+def test_recovery_reports_final_and_marker_directory_fsync_failures(
+    tmp_path: Path,
+) -> None:
+    _, store, _ = leave_failed_transaction(tmp_path)
+    failures = FailCalls(
+        {
+            4: "recovery directory fsync failed",
+            5: "marker directory fsync failed",
+        }
+    )
+    recovering = TeacherStateStore(store.output_dir, fsync_directory=failures)
+
+    with pytest.raises(BaseException) as exc_info:
+        recovering.recover_transaction()
+
+    text = str(exc_info.value)
+    assert "recovery directory fsync failed" in text
+    assert "marker directory fsync failed" in text
+    assert recovering.transaction_path.exists()

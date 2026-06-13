@@ -767,7 +767,7 @@ class TeacherStateStore:
         assert manifest is not None
         _validate_manifest_self_consistency(
             manifest,
-            expected_devices=config.devices,
+            expected_devices=None,
         )
         state = derive_resume_state(
             source_rows,
@@ -885,6 +885,7 @@ class TeacherStateStore:
                 accepted_snapshot=accepted_pre,
                 rejected_snapshot=rejected_pre,
             )
+            self._validate_immutable_transition(manifest_pre, manifest)
             previous_count = (
                 accepted_pre["row_count"] + rejected_pre["row_count"]
             )
@@ -976,7 +977,14 @@ class TeacherStateStore:
             try:
                 self._fsync_directory(self.output_dir)
             except OSError as exc:
-                self._restore_removed_journal(journal_bytes, owner, exc)
+                marker_error = self._restore_removed_journal(
+                    journal_bytes, owner
+                )
+                if marker_error is not None:
+                    raise RuntimeError(
+                        f"{exc}; recovery marker durability failed: "
+                        f"{marker_error}"
+                    ) from exc
                 raise
         finally:
             for temp_path in temp_paths:
@@ -1071,7 +1079,14 @@ class TeacherStateStore:
             try:
                 self._fsync_directory(self.output_dir)
             except OSError as exc:
-                self._restore_removed_journal(journal_bytes, owner, exc)
+                marker_error = self._restore_removed_journal(
+                    journal_bytes, owner
+                )
+                if marker_error is not None:
+                    raise RuntimeError(
+                        f"{exc}; recovery marker durability failed: "
+                        f"{marker_error}"
+                    ) from exc
                 raise
         finally:
             for temp_path in temp_paths:
@@ -1236,8 +1251,7 @@ class TeacherStateStore:
         self,
         journal_bytes: bytes,
         owner: str,
-        original_error: OSError,
-    ) -> None:
+    ) -> OSError | None:
         temp_path: Path | None = None
         try:
             temp_path = self._write_temp(
@@ -1248,16 +1262,48 @@ class TeacherStateStore:
             os.replace(temp_path, self.transaction_path)
             temp_path = None
             self._fsync_file(self.transaction_path)
+            self._fsync_directory(self.output_dir)
+            return None
         except OSError as restore_error:
-            original_error.add_note(
-                f"failed to restore transaction journal: {restore_error}"
-            )
+            return restore_error
         finally:
             if temp_path is not None:
                 try:
                     temp_path.unlink()
                 except FileNotFoundError:
                     pass
+
+    def _validate_immutable_transition(
+        self,
+        previous: dict[str, Any],
+        current: dict[str, Any],
+    ) -> None:
+        immutable_fields = (
+            "generation_contract",
+            "generation_contract_fingerprint",
+            "source_sha256",
+            "model_path",
+            "source_path",
+            "schema_version",
+            "topology",
+            "batch_size",
+            "max_model_len",
+            "max_new_tokens",
+            "temperature",
+            "top_p",
+            "seed",
+            "enable_thinking",
+        )
+        changed = [
+            field
+            for field in immutable_fields
+            if current[field] != previous[field]
+        ]
+        if changed:
+            raise ValueError(
+                "immutable generation transition rejected: "
+                + ", ".join(changed)
+            )
 
     def _validate_journal(self, journal: dict[str, Any]) -> None:
         if set(journal) != JOURNAL_KEYS:
