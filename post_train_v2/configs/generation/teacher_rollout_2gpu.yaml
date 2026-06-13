@@ -1,0 +1,17 @@
+model_path: post_train/model/qwen/qwen3-8b
+input_path: post_train/data/processed/train_pool.jsonl
+output_dir: post_train/data/teacher_rollouts
+devices: [0, 1]
+topology: dual_tp1
+batch_size: 64
+worker_timeout_seconds: 600
+gpu_memory_utilization: 0.8
+max_model_len: 512
+max_new_tokens: 256
+temperature: 0.2
+top_p: 0.95
+seed: 0
+enable_thinking: false
+stop_after_accepted: 20000
+cache_root: /tmp/countdown_teacher_vllm
+schema_version: 1
