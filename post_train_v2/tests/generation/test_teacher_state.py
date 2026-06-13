@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from dataclasses import FrozenInstanceError, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -621,8 +622,13 @@ def commit_rows(
     accepted: list[dict],
     rejected: list[dict],
     created_at: str = "2026-06-13T00:00:00+00:00",
-    updated_at: str = "2026-06-13T01:00:00+00:00",
+    updated_at: str | None = None,
 ) -> dict:
+    if updated_at is None:
+        updated_at = (
+            datetime(2026, 6, 13, 1, tzinfo=timezone.utc)
+            + timedelta(seconds=batch_id)
+        ).isoformat()
     manifest = manifest_for_rows(
         config,
         accepted,
@@ -674,6 +680,30 @@ def test_initial_empty_commit_materializes_exact_files_and_hashes(
     }
     assert store.manifest_path.read_bytes().endswith(b"\n")
     assert not store.transaction_path.exists()
+
+
+def test_initial_commit_allows_updated_at_equal_created_at(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    store = TeacherStateStore(config.output_dir)
+    timestamp = "2026-06-13T00:00:00+00:00"
+    manifest = manifest_for_rows(
+        config,
+        [],
+        [],
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+
+    store.commit(
+        batch_id=0,
+        submitted_start=0,
+        submitted_stop=0,
+        accepted=[],
+        rejected=[],
+        manifest=manifest,
+    )
+
+    assert read_json(store.manifest_path)["updated_at"] == timestamp
 
 
 class FailAfterDestination:
@@ -1083,6 +1113,71 @@ def test_commit_preserves_created_at_from_previous_manifest(tmp_path: Path) -> N
 
     assert read_json(store.manifest_path) == old_manifest
     assert not store.transaction_path.exists()
+
+
+@pytest.mark.parametrize(
+    "updated_at",
+    (
+        "2026-06-13T01:00:00+00:00",
+        "2026-06-13T00:59:59+00:00",
+    ),
+)
+def test_non_initial_commit_requires_updated_at_strictly_later(
+    tmp_path: Path,
+    updated_at: str,
+) -> None:
+    config = make_config(tmp_path)
+    store = TeacherStateStore(config.output_dir)
+    old_manifest = commit_rows(
+        store,
+        config,
+        batch_id=0,
+        start=0,
+        accepted=[],
+        rejected=[],
+    )
+
+    with pytest.raises(ValueError, match="updated_at.*strictly later"):
+        commit_rows(
+            store,
+            config,
+            batch_id=1,
+            start=0,
+            accepted=[accepted_row("a", [1, 2], 3)],
+            rejected=[],
+            created_at=old_manifest["created_at"],
+            updated_at=updated_at,
+        )
+
+    assert not store.transaction_path.exists()
+
+
+def test_non_initial_commit_accepts_strictly_later_updated_at(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    store = TeacherStateStore(config.output_dir)
+    old_manifest = commit_rows(
+        store,
+        config,
+        batch_id=0,
+        start=0,
+        accepted=[],
+        rejected=[],
+    )
+
+    committed = commit_rows(
+        store,
+        config,
+        batch_id=1,
+        start=0,
+        accepted=[accepted_row("a", [1, 2], 3)],
+        rejected=[],
+        created_at=old_manifest["created_at"],
+        updated_at="2026-06-13T01:00:01+00:00",
+    )
+
+    assert committed["updated_at"] == "2026-06-13T01:00:01+00:00"
 
 
 @pytest.mark.parametrize(

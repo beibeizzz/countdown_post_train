@@ -899,6 +899,20 @@ class TeacherStateStore:
             and manifest["created_at"] != manifest_pre["created_at"]
         ):
             raise ValueError("manifest created_at must be preserved")
+        if manifest_pre is not None:
+            previous_updated_at = _parse_utc_timestamp(
+                "updated_at",
+                manifest_pre["updated_at"],
+            )
+            current_updated_at = _parse_utc_timestamp(
+                "updated_at",
+                manifest["updated_at"],
+            )
+            if current_updated_at <= previous_updated_at:
+                raise ValueError(
+                    "manifest updated_at must be strictly later "
+                    "than prior updated_at"
+                )
 
         accepted_bytes = self._build_snapshot_bytes(
             self.accepted_path,
