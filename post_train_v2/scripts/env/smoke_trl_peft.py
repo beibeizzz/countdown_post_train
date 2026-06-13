@@ -16,13 +16,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_model(model_path: str, torch_module):
+def load_model(model_path: str, torch_module, device: str):
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch_module.bfloat16,
         attn_implementation="flash_attention_2",
+        device_map={"": device},
         trust_remote_code=True,
     )
     model.config.use_cache = False
@@ -65,11 +66,8 @@ def main() -> int:
         target_modules=["q_proj", "v_proj"],
     )
 
-    base_model = load_model(args.model_path, torch).to(args.device)
-    lora_model = get_peft_model(base_model, lora_config).to(
-        device=args.device,
-        dtype=torch.bfloat16,
-    )
+    base_model = load_model(args.model_path, torch, args.device)
+    lora_model = get_peft_model(base_model, lora_config)
     lora_model.save_pretrained(adapter_dir)
     tokenizer.save_pretrained(adapter_dir)
     if not (adapter_dir / "adapter_config.json").is_file():
@@ -79,7 +77,7 @@ def main() -> int:
     del lora_model, base_model
     torch.cuda.empty_cache()
 
-    reload_base = load_model(args.model_path, torch).to(args.device)
+    reload_base = load_model(args.model_path, torch, args.device)
     reloaded = PeftModel.from_pretrained(reload_base, adapter_dir)
     merged_model = reloaded.merge_and_unload()
     if merged_model.config._attn_implementation != "flash_attention_2":
@@ -106,7 +104,10 @@ def main() -> int:
         max_length=64,
         dataset_text_field="text",
         per_device_train_batch_size=1,
+        max_steps=1,
         bf16=True,
+        save_strategy="no",
+        logging_strategy="no",
         report_to="none",
     )
     sft_trainer = SFTTrainer(
@@ -117,7 +118,9 @@ def main() -> int:
     )
     if sft_trainer.train_dataset is None:
         raise RuntimeError("SFTTrainer did not retain the training dataset")
-    del sft_trainer
+    sft_trainer.train()
+    del sft_trainer, merged_model, reloaded, reload_base
+    torch.cuda.empty_cache()
 
     preference_dataset = Dataset.from_dict(
         {
@@ -141,11 +144,15 @@ def main() -> int:
         max_prompt_length=32,
         max_completion_length=32,
         per_device_train_batch_size=1,
+        max_steps=1,
         bf16=True,
+        save_strategy="no",
+        logging_strategy="no",
         report_to="none",
     )
+    dpo_base_model = load_model(args.model_path, torch, args.device)
     dpo_trainer = DPOTrainer(
-        model=merged_model,
+        model=dpo_base_model,
         ref_model=None,
         args=dpo_config,
         train_dataset=preference_dataset,
@@ -154,10 +161,11 @@ def main() -> int:
     )
     if dpo_trainer.train_dataset is None:
         raise RuntimeError("DPOTrainer did not retain the training dataset")
+    dpo_trainer.train()
 
     print(
         "OK: PEFT adapter save/reload/merge and TRL 0.19.1 "
-        "SFT/DPO trainer construction completed"
+        "single-step SFT/DPO training completed"
     )
     return 0
 

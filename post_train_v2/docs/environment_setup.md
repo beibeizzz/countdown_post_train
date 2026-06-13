@@ -191,6 +191,10 @@ python scripts/env/smoke_teacher_dual_engine.py \
   --timeout-seconds 600
 ```
 
+The teacher smoke test maps each isolated child back to a physical GPU using
+the CUDA Driver API (`libcuda.so.1`) plus `nvidia-smi`. It does not query UUIDs
+from `libcudart`.
+
 TRL/PEFT constructors and adapter round-trip:
 
 ```bash
@@ -198,6 +202,10 @@ python scripts/env/smoke_trl_peft.py \
   --model-path ../post_train/model/qwen/qwen3-0.6b \
   --work-dir /tmp/post_train_v2_trl_peft_smoke
 ```
+
+This smoke test performs one real SFT optimizer step and one real DPO
+optimizer step. The DPO phase reloads a clean base model before TRL applies
+its LoRA configuration.
 
 Full-model evaluation loader:
 

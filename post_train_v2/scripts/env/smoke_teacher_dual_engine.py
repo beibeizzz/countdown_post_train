@@ -94,11 +94,11 @@ def query_physical_gpus(
     return parse_nvidia_smi_output(result.stdout)
 
 
-def load_libcudart():
+def load_cuda_driver():
     candidates = [
-        ctypes.util.find_library("cudart"),
-        "libcudart.so",
-        "libcudart.so.12",
+        ctypes.util.find_library("cuda"),
+        "libcuda.so.1",
+        "libcuda.so",
     ]
     errors: list[str] = []
     for candidate in candidates:
@@ -108,7 +108,7 @@ def load_libcudart():
             return ctypes.CDLL(candidate)
         except OSError as exc:
             errors.append(f"{candidate}: {exc}")
-    raise OSError("; ".join(errors) or "libcudart was not found")
+    raise OSError("; ".join(errors) or "libcuda was not found")
 
 
 def format_cuda_uuid(raw: bytes) -> str:
@@ -126,37 +126,56 @@ def format_cuda_uuid(raw: bytes) -> str:
 
 def query_cuda_identity(
     device: int = 0,
-    cudart_loader=load_libcudart,
+    driver_loader=load_cuda_driver,
 ) -> dict[str, str]:
     try:
-        cudart = cudart_loader()
+        driver = driver_loader()
     except OSError as exc:
-        raise RuntimeError(f"failed to load libcudart: {exc}") from exc
+        raise RuntimeError(f"failed to load libcuda: {exc}") from exc
 
     uuid = CudaUuid()
     pci_buffer = ctypes.create_string_buffer(32)
     try:
-        get_uuid = cudart.cudaDeviceGetUuid
-        get_pci = cudart.cudaDeviceGetPCIBusId
+        initialize = driver.cuInit
+        get_device = driver.cuDeviceGet
+        get_uuid = getattr(driver, "cuDeviceGetUuid_v2", None)
+        if get_uuid is None:
+            get_uuid = driver.cuDeviceGetUuid
+        get_pci = driver.cuDeviceGetPCIBusId
+        cuda_device = ctypes.c_int()
+        if hasattr(initialize, "argtypes"):
+            initialize.argtypes = [ctypes.c_uint]
+            initialize.restype = ctypes.c_int
+        if hasattr(get_device, "argtypes"):
+            get_device.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+            get_device.restype = ctypes.c_int
         if hasattr(get_uuid, "argtypes"):
             get_uuid.argtypes = [ctypes.POINTER(CudaUuid), ctypes.c_int]
             get_uuid.restype = ctypes.c_int
         if hasattr(get_pci, "argtypes"):
             get_pci.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
             get_pci.restype = ctypes.c_int
-        uuid_status = get_uuid(ctypes.byref(uuid), device)
-        pci_status = get_pci(pci_buffer, len(pci_buffer), device)
+        init_status = initialize(0)
+        device_status = get_device(ctypes.byref(cuda_device), device)
+        uuid_status = get_uuid(ctypes.byref(uuid), cuda_device.value)
+        pci_status = get_pci(pci_buffer, len(pci_buffer), cuda_device.value)
     except (AttributeError, TypeError) as exc:
-        raise RuntimeError(f"libcudart identity API is unavailable: {exc}") from exc
-    if uuid_status != 0 or pci_status != 0:
+        raise RuntimeError(f"libcuda identity API is unavailable: {exc}") from exc
+    if any(status != 0 for status in (
+        init_status,
+        device_status,
+        uuid_status,
+        pci_status,
+    )):
         raise RuntimeError(
-            "libcudart failed to query CUDA identity: "
-            f"cudaDeviceGetUuid={uuid_status}, cudaDeviceGetPCIBusId={pci_status}"
+            "libcuda failed to query CUDA identity: "
+            f"cuInit={init_status}, cuDeviceGet={device_status}, "
+            f"cuDeviceGetUuid={uuid_status}, cuDeviceGetPCIBusId={pci_status}"
         )
 
     pci_bus_id = pci_buffer.value.decode("ascii", errors="strict").strip()
     if not pci_bus_id:
-        raise RuntimeError("libcudart returned an empty CUDA PCI bus ID")
+        raise RuntimeError("libcuda returned an empty CUDA PCI bus ID")
     return {
         "cuda_uuid": format_cuda_uuid(bytes(uuid.bytes)),
         "cuda_pci_bus_id": pci_bus_id,

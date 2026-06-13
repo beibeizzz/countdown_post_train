@@ -640,6 +640,50 @@ def test_trl_peft_smoke_saves_tokenizer_with_adapter() -> None:
     assert matching_calls[0].args[0].id == "adapter_dir"
 
 
+def test_trl_peft_smoke_runs_one_sft_and_one_dpo_training_step() -> None:
+    tree = script_tree("smoke_trl_peft.py")
+    train_receivers = [
+        node.func.value.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "train"
+        and isinstance(node.func.value, ast.Name)
+    ]
+
+    assert train_receivers.count("sft_trainer") == 1
+    assert train_receivers.count("dpo_trainer") == 1
+
+    configs = call_nodes("smoke_trl_peft.py", "SFTConfig") + call_nodes(
+        "smoke_trl_peft.py", "DPOConfig"
+    )
+    assert len(configs) == 2
+    for config in configs:
+        keywords = {item.arg: item.value for item in config.keywords if item.arg}
+        assert isinstance(keywords.get("max_steps"), ast.Constant)
+        assert keywords["max_steps"].value == 1
+
+
+def test_trl_peft_dpo_uses_fresh_base_model() -> None:
+    tree = script_tree("smoke_trl_peft.py")
+    assignments = {
+        target.id: node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert "dpo_base_model" in assignments
+    assert isinstance(assignments["dpo_base_model"], ast.Call)
+    assert call_name(assignments["dpo_base_model"]) == "load_model"
+
+    trainer = call_nodes("smoke_trl_peft.py", "DPOTrainer")
+    assert len(trainer) == 1
+    keywords = {item.arg: item.value for item in trainer[0].keywords if item.arg}
+    assert isinstance(keywords["model"], ast.Name)
+    assert keywords["model"].id == "dpo_base_model"
+
+
 def test_legacy_loader_smoke_uses_real_shared_loader_and_checks_fa2() -> None:
     tree = script_tree("smoke_legacy_loader.py")
 

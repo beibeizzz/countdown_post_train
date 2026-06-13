@@ -177,45 +177,59 @@ def test_child_report_schema_rejects_missing_unknown_and_bool_pseudo_ints(
         )
 
 
-def test_cuda_identity_comes_from_logical_device_zero_via_libcudart() -> None:
+def test_cuda_identity_comes_from_logical_device_zero_via_cuda_driver() -> None:
     import ctypes
 
     module = load_script()
     calls: list[tuple[str, int]] = []
     uuid_bytes = bytes.fromhex("00112233445566778899aabbccddeeff")
 
-    class FakeCudaRuntime:
-        def cudaDeviceGetUuid(self, uuid_pointer, device):
+    class FakeCudaDriver:
+        def cuInit(self, flags):
+            calls.append(("init", flags))
+            return 0
+
+        def cuDeviceGet(self, device_pointer, ordinal):
+            calls.append(("device", ordinal))
+            device_pointer._obj.value = 7
+            return 0
+
+        def cuDeviceGetUuid(self, uuid_pointer, device):
             calls.append(("uuid", device))
             for index, value in enumerate(uuid_bytes):
                 uuid_pointer._obj.bytes[index] = value
             return 0
 
-        def cudaDeviceGetPCIBusId(self, buffer, length, device):
+        def cuDeviceGetPCIBusId(self, buffer, length, device):
             calls.append(("pci", device))
             ctypes.memmove(buffer, b"0000:8e:00.0\0", 13)
             return 0
 
     identity = module.query_cuda_identity(
         device=0,
-        cudart_loader=lambda: FakeCudaRuntime(),
+        driver_loader=lambda: FakeCudaDriver(),
     )
 
     assert identity == {
         "cuda_uuid": UUIDS[0],
         "cuda_pci_bus_id": PCI_IDS[0],
     }
-    assert calls == [("uuid", 0), ("pci", 0)]
+    assert calls == [
+        ("init", 0),
+        ("device", 0),
+        ("uuid", 7),
+        ("pci", 7),
+    ]
 
 
 def test_cuda_identity_loader_failure_is_hard_error() -> None:
     module = load_script()
 
     def fail_loader():
-        raise OSError("libcudart missing")
+        raise OSError("libcuda missing")
 
-    with pytest.raises(RuntimeError, match="libcudart"):
-        module.query_cuda_identity(device=0, cudart_loader=fail_loader)
+    with pytest.raises(RuntimeError, match="libcuda"):
+        module.query_cuda_identity(device=0, driver_loader=fail_loader)
 
 
 def test_child_identity_must_map_to_same_nvidia_smi_record() -> None:

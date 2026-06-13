@@ -16,7 +16,7 @@ Run `python <script> --help` for arguments.
 | `smoke_nccl.py` | Run a two-rank NCCL all-reduce under `torchrun`. |
 | `smoke_vllm.py` | Run vLLM chat generation with TP1 or TP2 and thinking disabled. |
 | `smoke_teacher_dual_engine.py` | Launch two isolated concurrent one-GPU Qwen3-8B teacher engines. |
-| `smoke_trl_peft.py` | Validate PEFT save/reload/merge and TRL SFT/DPO trainer construction. |
+| `smoke_trl_peft.py` | Validate PEFT save/reload/merge and run one SFT and one DPO training step. |
 
 The complete command order and acceptance criteria are in
 `../../docs/environment_setup.md`.
