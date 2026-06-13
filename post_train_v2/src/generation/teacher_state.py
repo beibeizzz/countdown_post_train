@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import math
 import os
 import uuid
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -90,7 +92,10 @@ def _require_positive_int(name: str, value: object) -> None:
 def _require_number(name: str, value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be numeric")
-    return float(value)
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite")
+    return number
 
 
 @dataclass(frozen=True)
@@ -304,8 +309,8 @@ def build_manifest(
         "seed": config.seed,
         "enable_thinking": config.enable_thinking,
         "cache_roots": [
-            str(config.cache_root / "gpu0"),
-            str(config.cache_root / "gpu1"),
+            str((config.cache_root / "gpu0").resolve()),
+            str((config.cache_root / "gpu1").resolve()),
         ],
         "processed_count": processed_count,
         "accepted_count": accepted_count,
@@ -337,14 +342,30 @@ def _fsync_file_path(path: Path) -> None:
 def _fsync_directory_path(path: Path) -> None:
     try:
         descriptor = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
+    except OSError as exc:
+        if _windows_directory_fsync_unavailable(exc):
+            return
+        raise
     try:
-        os.fsync(descriptor)
-    except OSError:
-        pass
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            if not _windows_directory_fsync_unavailable(exc):
+                raise
     finally:
         os.close(descriptor)
+
+
+def _windows_directory_fsync_unavailable(exc: OSError) -> bool:
+    unavailable_errnos = {
+        errno.EACCES,
+        errno.EBADF,
+        errno.EINVAL,
+        errno.EPERM,
+    }
+    if hasattr(errno, "ENOTSUP"):
+        unavailable_errnos.add(errno.ENOTSUP)
+    return os.name == "nt" and exc.errno in unavailable_errnos
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -449,6 +470,208 @@ def _validate_exact_nonnegative_int(name: str, value: object) -> int:
     return value
 
 
+def _parse_utc_timestamp(name: str, value: object) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"manifest {name} must be a nonempty UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"manifest {name} must be a parseable UTC timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError(f"manifest {name} must be timezone-aware UTC")
+    return parsed
+
+
+def _validate_cache_roots(value: object) -> None:
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError("manifest cache_roots must contain exactly two paths")
+    paths: list[Path] = []
+    for item in value:
+        if not isinstance(item, str) or not item:
+            raise ValueError("manifest cache_roots must be nonempty strings")
+        path = Path(item)
+        if not path.is_absolute():
+            raise ValueError("manifest cache_roots must be absolute paths")
+        paths.append(path)
+    if paths[0].name != "gpu0" or paths[1].name != "gpu1":
+        raise ValueError("manifest cache_roots must map logical gpu0 and gpu1")
+    if paths[0].parent != paths[1].parent:
+        raise ValueError("manifest cache_roots must share one cache root")
+
+
+def _validate_operational_manifest(
+    manifest: dict[str, Any],
+    *,
+    expected_devices: tuple[int, int] | None,
+) -> None:
+    batch_size = manifest["batch_size"]
+    _require_positive_int("manifest batch_size", batch_size)
+    expected_worker_batch = (batch_size + 1) // 2
+    if (
+        not _is_exact_int(manifest["max_worker_batch_size"])
+        or manifest["max_worker_batch_size"] != expected_worker_batch
+    ):
+        raise ValueError("manifest max_worker_batch_size is incoherent")
+
+    devices = manifest["devices"]
+    if (
+        not isinstance(devices, list)
+        or len(devices) != 2
+        or any(not _is_exact_int(device) for device in devices)
+        or any(device < 0 for device in devices)
+        or devices[0] == devices[1]
+    ):
+        raise ValueError("manifest devices must be two distinct nonnegative exact integers")
+    if expected_devices is not None and devices != list(expected_devices):
+        raise ValueError("manifest devices do not match configured devices")
+
+    timeout = _require_number(
+        "manifest worker_timeout_seconds",
+        manifest["worker_timeout_seconds"],
+    )
+    if timeout <= 0:
+        raise ValueError("manifest worker_timeout_seconds must be positive")
+    utilization = _require_number(
+        "manifest gpu_memory_utilization",
+        manifest["gpu_memory_utilization"],
+    )
+    if not 0 < utilization <= 1:
+        raise ValueError("manifest gpu_memory_utilization must be in (0, 1]")
+    _validate_cache_roots(manifest["cache_roots"])
+
+    created_at = _parse_utc_timestamp("created_at", manifest["created_at"])
+    updated_at = _parse_utc_timestamp("updated_at", manifest["updated_at"])
+    if updated_at < created_at:
+        raise ValueError("manifest updated_at must be at or after created_at")
+
+
+def _validate_manifest_self_consistency(
+    manifest: dict[str, Any],
+    *,
+    expected_devices: tuple[int, int] | None,
+) -> None:
+    if set(manifest) != MANIFEST_KEYS:
+        missing = sorted(MANIFEST_KEYS - set(manifest))
+        extra = sorted(set(manifest) - MANIFEST_KEYS)
+        raise ValueError(
+            f"manifest keys mismatch; missing={missing}, extra={extra}"
+        )
+    _validate_operational_manifest(
+        manifest,
+        expected_devices=expected_devices,
+    )
+    if manifest["stage"] != STAGE:
+        raise ValueError(f"manifest stage must be {STAGE}")
+
+    contract = manifest["generation_contract"]
+    if not isinstance(contract, dict) or set(contract) != CONTRACT_KEYS:
+        raise ValueError("generation contract keys mismatch")
+    if manifest["generation_contract_fingerprint"] != fingerprint_contract(
+        contract
+    ):
+        raise ValueError("generation contract fingerprint mismatch")
+    if manifest["source_sha256"] != contract["source_sha256"]:
+        raise ValueError("manifest source_sha256 disagrees with contract")
+    if manifest["model_path"] != contract["model_path"]:
+        raise ValueError("manifest model_path disagrees with generation contract")
+    for field in (
+        "schema_version",
+        "topology",
+        "batch_size",
+        "max_model_len",
+        "max_new_tokens",
+        "temperature",
+        "top_p",
+        "seed",
+        "enable_thinking",
+    ):
+        if manifest[field] != contract[field]:
+            raise ValueError(
+                f"manifest {field} disagrees with generation contract"
+            )
+
+    source_path = Path(manifest["source_path"])
+    if (
+        not source_path.is_absolute()
+        or not source_path.exists()
+        or sha256_file(source_path) != manifest["source_sha256"]
+    ):
+        raise ValueError(
+            "manifest source_path/source_sha256 do not match source file"
+        )
+
+    for field in (
+        "processed_count",
+        "accepted_count",
+        "rejected_count",
+        "target_accepted_count",
+    ):
+        if not _is_exact_int(manifest[field]):
+            raise ValueError(f"manifest {field} must be an exact integer")
+    if manifest["processed_count"] < 0:
+        raise ValueError("manifest processed_count must be nonnegative")
+    if manifest["accepted_count"] < 0:
+        raise ValueError("manifest accepted_count must be nonnegative")
+    if manifest["rejected_count"] < 0:
+        raise ValueError("manifest rejected_count must be nonnegative")
+    _require_positive_int(
+        "manifest target_accepted_count",
+        manifest["target_accepted_count"],
+    )
+    if (
+        manifest["processed_count"]
+        != manifest["accepted_count"] + manifest["rejected_count"]
+    ):
+        raise ValueError(
+            "manifest processed_count does not equal "
+            "accepted_count + rejected_count"
+        )
+    expected_last_position = (
+        manifest["processed_count"] - 1
+        if manifest["processed_count"]
+        else None
+    )
+    if manifest["last_committed_position"] != expected_last_position:
+        raise ValueError("manifest last_committed_position is incoherent")
+    if type(manifest["completed"]) is not bool:
+        raise ValueError("manifest completed must be a boolean")
+    if manifest["accepted_count"] > manifest["target_accepted_count"]:
+        raise ValueError("manifest accepted_count exceeds target")
+    if manifest["completed"] != (
+        manifest["accepted_count"] == manifest["target_accepted_count"]
+    ):
+        raise ValueError("manifest completed is incoherent")
+
+
+def _validate_prior_committed_state(
+    manifest: dict[str, Any],
+    *,
+    accepted_snapshot: dict[str, Any],
+    rejected_snapshot: dict[str, Any],
+) -> None:
+    _validate_manifest_self_consistency(
+        manifest,
+        expected_devices=None,
+    )
+    if not accepted_snapshot["existed"] or not rejected_snapshot["existed"]:
+        raise ValueError("prior V2 manifest requires both output snapshots")
+    checks = {
+        "processed_count": (
+            accepted_snapshot["row_count"] + rejected_snapshot["row_count"]
+        ),
+        "accepted_count": accepted_snapshot["row_count"],
+        "rejected_count": rejected_snapshot["row_count"],
+        "accepted_sha256": accepted_snapshot["sha256"],
+        "rejected_sha256": rejected_snapshot["sha256"],
+    }
+    for field, expected in checks.items():
+        if manifest[field] != expected:
+            raise ValueError(
+                f"prior manifest {field} mismatch: "
+                f"expected {expected!r}, got {manifest[field]!r}"
+            )
+
+
 class TeacherStateStore:
     def __init__(
         self,
@@ -476,6 +699,15 @@ class TeacherStateStore:
         adopt_legacy_state: bool = False,
     ) -> ResumeState:
         config.validate()
+        if self.output_dir.resolve() != config.output_dir.resolve():
+            raise ValueError(
+                "TeacherStateStore output_dir does not match config.output_dir"
+            )
+        configured_source_rows = read_jsonl(config.input_path)
+        if source_rows != configured_source_rows:
+            raise ValueError(
+                "supplied source_rows do not equal rows parsed from config.input_path"
+            )
         self.recover_transaction()
         accepted = read_jsonl(self.accepted_path) if self.accepted_path.exists() else []
         rejected = read_jsonl(self.rejected_path) if self.rejected_path.exists() else []
@@ -484,6 +716,14 @@ class TeacherStateStore:
         is_v2 = bool(
             manifest
             and manifest.get("generation_contract_fingerprint") is not None
+        )
+        v2_looking_manifest = bool(
+            manifest
+            and (
+                manifest.get("stage") == STAGE
+                or "generation_contract" in manifest
+                or set(manifest) == MANIFEST_KEYS
+            )
         )
 
         if has_rows and not is_v2:
@@ -513,6 +753,10 @@ class TeacherStateStore:
             )
 
         if not is_v2:
+            if v2_looking_manifest:
+                raise ValueError(
+                    "corrupt V2-looking manifest lacks generation contract fingerprint"
+                )
             return derive_resume_state(
                 source_rows,
                 accepted,
@@ -521,12 +765,10 @@ class TeacherStateStore:
             )
 
         assert manifest is not None
-        if set(manifest) != MANIFEST_KEYS:
-            missing = sorted(MANIFEST_KEYS - set(manifest))
-            extra = sorted(set(manifest) - MANIFEST_KEYS)
-            raise ValueError(
-                f"manifest keys mismatch; missing={missing}, extra={extra}"
-            )
+        _validate_manifest_self_consistency(
+            manifest,
+            expected_devices=config.devices,
+        )
         state = derive_resume_state(
             source_rows,
             accepted,
@@ -630,11 +872,22 @@ class TeacherStateStore:
         manifest_pre = (
             _read_json(self.manifest_path) if self.manifest_path.exists() else None
         )
-        previous_count = (
-            manifest_pre.get("processed_count")
-            if manifest_pre is not None
-            else accepted_pre["row_count"] + rejected_pre["row_count"]
-        )
+        snapshots_exist = accepted_pre["existed"] or rejected_pre["existed"]
+        if manifest_pre is None:
+            if snapshots_exist:
+                raise ValueError(
+                    "existing output snapshots require an exact V2 manifest"
+                )
+            previous_count = 0
+        else:
+            _validate_prior_committed_state(
+                manifest_pre,
+                accepted_snapshot=accepted_pre,
+                rejected_snapshot=rejected_pre,
+            )
+            previous_count = (
+                accepted_pre["row_count"] + rejected_pre["row_count"]
+            )
         if not _is_exact_int(previous_count) or previous_count != submitted_start:
             raise ValueError(
                 "submitted_start does not match previous processed count"
@@ -682,6 +935,7 @@ class TeacherStateStore:
                 "payload": manifest_pre,
             },
         }
+        journal_bytes = _json_bytes(journal)
 
         owner = f"{batch_id}.{os.getpid()}.{uuid.uuid4().hex}"
         temp_paths: list[Path] = []
@@ -699,7 +953,7 @@ class TeacherStateStore:
             )
             temp_paths.append(manifest_temp)
             journal_temp = self._write_temp(
-                self.transaction_path, _json_bytes(journal), owner
+                self.transaction_path, journal_bytes, owner
             )
             temp_paths.append(journal_temp)
 
@@ -719,7 +973,11 @@ class TeacherStateStore:
                 self._fsync_directory(self.output_dir)
 
             self.transaction_path.unlink()
-            self._fsync_directory(self.output_dir)
+            try:
+                self._fsync_directory(self.output_dir)
+            except OSError as exc:
+                self._restore_removed_journal(journal_bytes, owner, exc)
+                raise
         finally:
             for temp_path in temp_paths:
                 try:
@@ -730,6 +988,7 @@ class TeacherStateStore:
     def recover_transaction(self) -> None:
         if not self.transaction_path.exists():
             return
+        journal_bytes = self.transaction_path.read_bytes()
         try:
             journal = _read_json(self.transaction_path)
         except ValueError as exc:
@@ -809,7 +1068,11 @@ class TeacherStateStore:
                 raise ValueError("failed to restore manifest absence")
 
             self.transaction_path.unlink()
-            self._fsync_directory(self.output_dir)
+            try:
+                self._fsync_directory(self.output_dir)
+            except OSError as exc:
+                self._restore_removed_journal(journal_bytes, owner, exc)
+                raise
         finally:
             for temp_path in temp_paths:
                 try:
@@ -844,6 +1107,10 @@ class TeacherStateStore:
             raise ValueError("rejected must be a list of objects")
         if not isinstance(manifest, dict) or set(manifest) != MANIFEST_KEYS:
             raise ValueError("manifest keys mismatch")
+        _validate_manifest_self_consistency(
+            manifest,
+            expected_devices=None,
+        )
 
         for field in (
             "processed_count",
@@ -965,6 +1232,33 @@ class TeacherStateStore:
             os.fsync(handle.fileno())
         return temp_path
 
+    def _restore_removed_journal(
+        self,
+        journal_bytes: bytes,
+        owner: str,
+        original_error: OSError,
+    ) -> None:
+        temp_path: Path | None = None
+        try:
+            temp_path = self._write_temp(
+                self.transaction_path,
+                journal_bytes,
+                f"{owner}.restore",
+            )
+            os.replace(temp_path, self.transaction_path)
+            temp_path = None
+            self._fsync_file(self.transaction_path)
+        except OSError as restore_error:
+            original_error.add_note(
+                f"failed to restore transaction journal: {restore_error}"
+            )
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
+
     def _validate_journal(self, journal: dict[str, Any]) -> None:
         if set(journal) != JOURNAL_KEYS:
             raise ValueError("transaction journal keys mismatch")
@@ -1034,6 +1328,10 @@ class TeacherStateStore:
             )
         if manifest["existed"]:
             payload = manifest["payload"]
+            _validate_manifest_self_consistency(
+                payload,
+                expected_devices=None,
+            )
             manifest_checks = {
                 "processed_count": start,
                 "accepted_count": journal["accepted"]["row_count"],
@@ -1042,7 +1340,7 @@ class TeacherStateStore:
                 "rejected_sha256": journal["rejected"]["sha256"],
             }
             for field, expected in manifest_checks.items():
-                if field in payload and payload[field] != expected:
+                if payload[field] != expected:
                     raise ValueError(
                         f"transaction journal pre-manifest {field} is incoherent"
                     )

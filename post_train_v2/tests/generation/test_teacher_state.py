@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -8,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from post_train.src.countdown.io import write_jsonl
+import post_train_v2.src.generation.teacher_state as teacher_state
+from post_train.src.countdown.io import read_jsonl, write_jsonl
 from post_train_v2.src.generation.teacher_state import (
     TeacherGenerationConfig,
     TeacherStateStore,
@@ -25,7 +27,7 @@ def make_config(tmp_path: Path, **overrides) -> TeacherGenerationConfig:
     model_path.mkdir(exist_ok=True)
     input_path = tmp_path / "source.jsonl"
     if not input_path.exists():
-        input_path.write_text('{"id":"a"}\n', encoding="utf-8")
+        write_jsonl(input_path, source_rows())
     values = {
         "model_path": model_path,
         "input_path": input_path,
@@ -101,13 +103,25 @@ def test_config_is_frozen_validates_and_resolves_without_mutation(tmp_path: Path
         ("batch_size", 0, "batch_size"),
         ("batch_size", True, "batch_size"),
         ("worker_timeout_seconds", 0, "worker_timeout_seconds"),
+        ("worker_timeout_seconds", float("nan"), "worker_timeout_seconds"),
+        ("worker_timeout_seconds", float("inf"), "worker_timeout_seconds"),
+        ("worker_timeout_seconds", float("-inf"), "worker_timeout_seconds"),
         ("gpu_memory_utilization", 0, "gpu_memory_utilization"),
         ("gpu_memory_utilization", 1.01, "gpu_memory_utilization"),
+        ("gpu_memory_utilization", float("nan"), "gpu_memory_utilization"),
+        ("gpu_memory_utilization", float("inf"), "gpu_memory_utilization"),
+        ("gpu_memory_utilization", float("-inf"), "gpu_memory_utilization"),
         ("max_model_len", 0, "max_model_len"),
         ("max_new_tokens", 0, "max_new_tokens"),
         ("temperature", -0.01, "temperature"),
+        ("temperature", float("nan"), "temperature"),
+        ("temperature", float("inf"), "temperature"),
+        ("temperature", float("-inf"), "temperature"),
         ("top_p", 0, "top_p"),
         ("top_p", 1.01, "top_p"),
+        ("top_p", float("nan"), "top_p"),
+        ("top_p", float("inf"), "top_p"),
+        ("top_p", float("-inf"), "top_p"),
         ("seed", -1, "seed"),
         ("seed", False, "seed"),
         ("schema_version", -1, "schema_version"),
@@ -160,6 +174,26 @@ def test_sha256_contract_and_fingerprint_are_exact(tmp_path: Path) -> None:
     }
     canonical = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
     assert fingerprint_contract(contract) == hashlib.sha256(canonical).hexdigest()
+
+
+def test_build_manifest_resolves_cache_roots_to_absolute_logical_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    config = make_config(tmp_path, cache_root=Path("relative-cache"))
+    manifest = manifest_for_rows(
+        config,
+        [],
+        [],
+        created_at="2026-06-13T00:00:00+00:00",
+        updated_at="2026-06-13T00:00:01+00:00",
+    )
+
+    assert manifest["cache_roots"] == [
+        str((tmp_path / "relative-cache" / "gpu0").resolve()),
+        str((tmp_path / "relative-cache" / "gpu1").resolve()),
+    ]
 
 
 def test_resume_prefix_is_derived_from_combined_source_positions() -> None:
@@ -270,6 +304,57 @@ def test_empty_state_initializes_without_legacy_adoption(tmp_path: Path) -> None
     assert state.accepted == ()
     assert state.rejected == ()
     assert state.created_at
+
+
+def test_resume_requires_store_output_dir_to_match_config_before_recovery(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    wrong_output = tmp_path / "wrong-output"
+    wrong_output.mkdir()
+    store = TeacherStateStore(wrong_output)
+    store.transaction_path.write_text("{invalid", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="output_dir"):
+        store.load_resume_state(source_rows(), config)
+
+    assert store.transaction_path.exists()
+
+
+def test_resume_requires_supplied_source_rows_to_equal_configured_jsonl(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    supplied = source_rows()
+    supplied[1] = {**supplied[1], "target": 999}
+
+    with pytest.raises(ValueError, match="source_rows.*input_path"):
+        TeacherStateStore(config.output_dir).load_resume_state(supplied, config)
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    (
+        {"stage": "teacher_accepted_pool"},
+        {"generation_contract": {}},
+        {
+            "stage": "teacher_accepted_pool",
+            "generation_contract": {},
+            "schema_version": 1,
+        },
+    ),
+)
+def test_empty_v2_looking_manifest_without_fingerprint_is_corrupt(
+    tmp_path: Path,
+    manifest: dict,
+) -> None:
+    config = make_config(tmp_path)
+    config.output_dir.mkdir()
+    store = TeacherStateStore(config.output_dir)
+    store.manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="corrupt.*manifest"):
+        store.load_resume_state(source_rows(), config)
 
 
 def materialize_v2_state(
@@ -403,6 +488,7 @@ def test_v2_resume_allows_operational_timeout_and_cache_changes(tmp_path: Path) 
     operationally_changed = replace(
         config,
         worker_timeout_seconds=12.5,
+        gpu_memory_utilization=0.65,
         cache_root=tmp_path / "new-cache",
     )
 
@@ -412,6 +498,48 @@ def test_v2_resume_allows_operational_timeout_and_cache_changes(tmp_path: Path) 
         adopt_legacy_state=False,
     )
     assert state.processed_count == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    (
+        ("max_worker_batch_size", 31, "max_worker_batch_size"),
+        ("devices", [0], "devices"),
+        ("devices", [0, False], "devices"),
+        ("devices", [1, 0], "devices"),
+        ("worker_timeout_seconds", 0, "worker_timeout_seconds"),
+        ("worker_timeout_seconds", float("nan"), "worker_timeout_seconds"),
+        ("worker_timeout_seconds", float("inf"), "worker_timeout_seconds"),
+        ("gpu_memory_utilization", 0, "gpu_memory_utilization"),
+        ("gpu_memory_utilization", float("nan"), "gpu_memory_utilization"),
+        ("gpu_memory_utilization", float("inf"), "gpu_memory_utilization"),
+        ("cache_roots", [], "cache_roots"),
+        ("cache_roots", ["relative/gpu0", "/tmp/cache/gpu1"], "cache_roots"),
+        ("cache_roots", ["/tmp/cache/gpu1", "/tmp/cache/gpu0"], "cache_roots"),
+        ("created_at", "not-a-time", "created_at"),
+        ("created_at", "2026-06-13T00:00:00", "created_at"),
+        ("created_at", "2026-06-13T08:00:00+08:00", "created_at"),
+        ("updated_at", "not-a-time", "updated_at"),
+        ("updated_at", "2026-06-12T23:59:59+00:00", "updated_at"),
+    ),
+)
+def test_v2_resume_rejects_invalid_operational_manifest_fields(
+    tmp_path: Path,
+    field: str,
+    value,
+    match: str,
+) -> None:
+    config = make_config(tmp_path)
+    store, manifest = materialize_v2_state(
+        config,
+        [accepted_row("a", [1, 2], 3)],
+        [],
+    )
+    manifest[field] = value
+    store.manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=match):
+        store.load_resume_state(read_jsonl(config.input_path), config)
 
 
 @pytest.mark.parametrize(
@@ -735,6 +863,20 @@ def test_journal_range_must_match_recorded_pre_state_and_manifest(
     assert store.transaction_path.exists()
 
 
+def test_recovery_fully_validates_embedded_pre_manifest(
+    tmp_path: Path,
+) -> None:
+    _, store, _ = leave_failed_transaction(tmp_path)
+    journal = read_json(store.transaction_path)
+    journal["manifest"]["payload"]["max_worker_batch_size"] = 1
+    store.transaction_path.write_text(json.dumps(journal) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="max_worker_batch_size"):
+        TeacherStateStore(store.output_dir).recover_transaction()
+
+    assert store.transaction_path.exists()
+
+
 @pytest.mark.parametrize(
     ("batch_id", "start", "stop", "manifest_change", "match"),
     (
@@ -786,6 +928,55 @@ def test_commit_rejects_range_count_and_contract_incoherence_before_replacement(
             batch_id=batch_id,
             submitted_start=start,
             submitted_stop=stop,
+            accepted=[],
+            rejected=[],
+            manifest=manifest,
+        )
+
+    assert replacements == []
+    assert not store.transaction_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    (
+        ("max_worker_batch_size", 31, "max_worker_batch_size"),
+        ("devices", [0, False], "devices"),
+        ("worker_timeout_seconds", float("nan"), "worker_timeout_seconds"),
+        ("gpu_memory_utilization", float("inf"), "gpu_memory_utilization"),
+        ("cache_roots", ["relative/gpu0", "relative/gpu1"], "cache_roots"),
+        ("created_at", "not-a-time", "created_at"),
+        ("updated_at", "2026-06-12T23:59:59+00:00", "updated_at"),
+    ),
+)
+def test_commit_rejects_invalid_operational_manifest_before_replacement(
+    tmp_path: Path,
+    field: str,
+    value,
+    match: str,
+) -> None:
+    config = make_config(tmp_path)
+    replacements: list[tuple[Path, Path]] = []
+
+    def record_replace(source: str | Path, destination: str | Path) -> None:
+        replacements.append((Path(source), Path(destination)))
+        os.replace(source, destination)
+
+    store = TeacherStateStore(config.output_dir, replace_file=record_replace)
+    manifest = manifest_for_rows(
+        config,
+        [],
+        [],
+        created_at="2026-06-13T00:00:00+00:00",
+        updated_at="2026-06-13T00:00:01+00:00",
+    )
+    manifest[field] = value
+
+    with pytest.raises(ValueError, match=match):
+        store.commit(
+            batch_id=0,
+            submitted_start=0,
+            submitted_stop=0,
             accepted=[],
             rejected=[],
             manifest=manifest,
@@ -875,4 +1066,239 @@ def test_commit_preserves_created_at_from_previous_manifest(tmp_path: Path) -> N
         )
 
     assert read_json(store.manifest_path) == old_manifest
+    assert not store.transaction_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    (
+        ({"processed_count": 0}, "processed_count"),
+        ({"accepted_count": 0}, "accepted_count"),
+        ({"accepted_sha256": "0" * 64}, "accepted_sha256"),
+        ({"stage": "wrong-stage"}, "stage"),
+    ),
+)
+def test_commit_rejects_incoherent_pre_state_before_journal_and_recovery_is_noop(
+    tmp_path: Path,
+    mutation: dict,
+    match: str,
+) -> None:
+    config = make_config(tmp_path)
+    store = TeacherStateStore(config.output_dir)
+    old_accepted = [accepted_row("a", [1, 2], 3)]
+    old_manifest = commit_rows(
+        store,
+        config,
+        batch_id=0,
+        start=0,
+        accepted=old_accepted,
+        rejected=[],
+    )
+    old_accepted_bytes = store.accepted_path.read_bytes()
+    damaged_manifest = {**old_manifest, **mutation}
+    store.manifest_path.write_text(
+        json.dumps(damaged_manifest) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=match):
+        commit_rows(
+            store,
+            config,
+            batch_id=1,
+            start=1,
+            accepted=[*old_accepted, accepted_row("c", [3, 2], 5)],
+            rejected=[],
+            created_at=old_manifest["created_at"],
+        )
+
+    assert not store.transaction_path.exists()
+    assert store.accepted_path.read_bytes() == old_accepted_bytes
+    assert read_json(store.manifest_path) == damaged_manifest
+    store.recover_transaction()
+    assert read_json(store.manifest_path) == damaged_manifest
+
+
+def test_posix_directory_open_error_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(teacher_state.os, "name", "posix")
+    monkeypatch.setattr(
+        teacher_state.os,
+        "open",
+        lambda path, flags: (_ for _ in ()).throw(OSError(errno.EIO, "disk error")),
+    )
+
+    with pytest.raises(OSError) as exc_info:
+        teacher_state._fsync_directory_path(tmp_path)
+
+    assert exc_info.value.errno == errno.EIO
+
+
+def test_posix_directory_fsync_error_propagates_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[int] = []
+    monkeypatch.setattr(teacher_state.os, "name", "posix")
+    monkeypatch.setattr(teacher_state.os, "open", lambda path, flags: 41)
+    monkeypatch.setattr(
+        teacher_state.os,
+        "fsync",
+        lambda descriptor: (_ for _ in ()).throw(OSError(errno.EIO, "disk error")),
+    )
+    monkeypatch.setattr(teacher_state.os, "close", closed.append)
+
+    with pytest.raises(OSError) as exc_info:
+        teacher_state._fsync_directory_path(tmp_path)
+
+    assert exc_info.value.errno == errno.EIO
+    assert closed == [41]
+
+
+@pytest.mark.parametrize("failure_point", ("open", "fsync"))
+def test_windows_unsupported_directory_fsync_is_treated_as_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    closed: list[int] = []
+    monkeypatch.setattr(teacher_state.os, "name", "nt")
+    if failure_point == "open":
+        monkeypatch.setattr(
+            teacher_state.os,
+            "open",
+            lambda path, flags: (_ for _ in ()).throw(
+                OSError(errno.EACCES, "directory handles unsupported")
+            ),
+        )
+    else:
+        monkeypatch.setattr(teacher_state.os, "open", lambda path, flags: 42)
+        monkeypatch.setattr(
+            teacher_state.os,
+            "fsync",
+            lambda descriptor: (_ for _ in ()).throw(
+                OSError(errno.EINVAL, "directory fsync unsupported")
+            ),
+        )
+        monkeypatch.setattr(teacher_state.os, "close", closed.append)
+
+    teacher_state._fsync_directory_path(tmp_path)
+
+    assert closed == ([] if failure_point == "open" else [42])
+
+
+def test_windows_directory_eio_still_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(teacher_state.os, "name", "nt")
+    monkeypatch.setattr(teacher_state.os, "open", lambda path, flags: 43)
+    monkeypatch.setattr(
+        teacher_state.os,
+        "fsync",
+        lambda descriptor: (_ for _ in ()).throw(OSError(errno.EIO, "disk error")),
+    )
+    monkeypatch.setattr(teacher_state.os, "close", lambda descriptor: None)
+
+    with pytest.raises(OSError) as exc_info:
+        teacher_state._fsync_directory_path(tmp_path)
+
+    assert exc_info.value.errno == errno.EIO
+
+
+class FailNthCall:
+    def __init__(self, call_number: int, message: str) -> None:
+        self.call_number = call_number
+        self.message = message
+        self.calls = 0
+
+    def __call__(self, path: Path) -> None:
+        self.calls += 1
+        if self.calls == self.call_number:
+            raise OSError(errno.EIO, self.message)
+
+
+def test_commit_file_fsync_failure_preserves_journal_for_recovery(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    failing_fsync = FailNthCall(1, "file fsync failed")
+    store = TeacherStateStore(config.output_dir, fsync_file=failing_fsync)
+    manifest = manifest_for_rows(
+        config,
+        [],
+        [],
+        created_at="2026-06-13T00:00:00+00:00",
+        updated_at="2026-06-13T00:00:01+00:00",
+    )
+
+    with pytest.raises(OSError, match="file fsync failed"):
+        store.commit(
+            batch_id=0,
+            submitted_start=0,
+            submitted_stop=0,
+            accepted=[],
+            rejected=[],
+            manifest=manifest,
+        )
+
+    assert store.transaction_path.exists()
+    TeacherStateStore(config.output_dir).recover_transaction()
+    assert not store.transaction_path.exists()
+
+
+def test_commit_final_directory_fsync_failure_restores_journal(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    old_store = TeacherStateStore(config.output_dir)
+    old_manifest = commit_rows(
+        old_store,
+        config,
+        batch_id=0,
+        start=0,
+        accepted=[],
+        rejected=[],
+    )
+    failing_directory_fsync = FailNthCall(5, "final directory fsync failed")
+    store = TeacherStateStore(
+        config.output_dir,
+        fsync_directory=failing_directory_fsync,
+    )
+
+    with pytest.raises(OSError, match="final directory fsync failed"):
+        commit_rows(
+            store,
+            config,
+            batch_id=1,
+            start=0,
+            accepted=[accepted_row("a", [1, 2], 3)],
+            rejected=[],
+            created_at=old_manifest["created_at"],
+        )
+
+    assert store.transaction_path.exists()
+    TeacherStateStore(config.output_dir).recover_transaction()
+    assert read_json(store.manifest_path) == old_manifest
+    assert not store.transaction_path.exists()
+
+
+def test_recovery_final_directory_fsync_failure_restores_journal(
+    tmp_path: Path,
+) -> None:
+    _, store, _ = leave_failed_transaction(tmp_path)
+    journal_bytes = store.transaction_path.read_bytes()
+    failing_directory_fsync = FailNthCall(4, "recovery directory fsync failed")
+    recovering_store = TeacherStateStore(
+        store.output_dir,
+        fsync_directory=failing_directory_fsync,
+    )
+
+    with pytest.raises(OSError, match="recovery directory fsync failed"):
+        recovering_store.recover_transaction()
+
+    assert recovering_store.transaction_path.read_bytes() == journal_bytes
+    TeacherStateStore(store.output_dir).recover_transaction()
     assert not store.transaction_path.exists()
