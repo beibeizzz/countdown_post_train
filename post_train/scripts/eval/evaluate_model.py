@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_model_and_tokenizer(model_path: Path, base_model_path: Path | None = None):
+    import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     adapter_config_path = model_path / "adapter_config.json"
@@ -48,6 +49,8 @@ def load_model_and_tokenizer(model_path: Path, base_model_path: Path | None = No
                 "LoRA adapter checkpoint detected. Pass --base-model-path or set "
                 "base_model_name_or_path in adapter_config.json."
             )
+        if not (model_path / "tokenizer_config.json").is_file():
+            tokenizer_path = Path(resolved_base_model_path)
         from peft import PeftModel
 
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
@@ -55,11 +58,19 @@ def load_model_and_tokenizer(model_path: Path, base_model_path: Path | None = No
             resolved_base_model_path,
             device_map="auto",
             trust_remote_code=True,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
         )
         model = PeftModel.from_pretrained(base_model, model_path)
     else:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            device_map="auto",
+            trust_remote_code=True,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+        )
 
     model.eval()
 

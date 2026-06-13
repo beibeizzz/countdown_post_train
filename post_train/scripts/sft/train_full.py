@@ -207,13 +207,19 @@ def build_eval_callback(
 
 
 def load_model_and_tokenizer(model_path: Path, gradient_checkpointing: bool):
+    import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        attn_implementation="flash_attention_2",
+        torch_dtype=torch.bfloat16,
+    )
     if gradient_checkpointing:
         model.config.use_cache = False
         model.gradient_checkpointing_enable()

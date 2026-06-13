@@ -1,314 +1,231 @@
 # Remote Environment Setup
 
-## Required Order
+This runbook creates an isolated post-training environment for the two
+allocated A100 40 GB devices. Run commands from the repository root unless a
+step explicitly changes directory.
 
-Set up the environment only after the latest repository revision containing
-`post_train_v2/pyproject.toml` has been transferred to the remote machine.
+## 1. Update the Repository
 
-The local vLLM wheel is declared by a repository-relative path, and the uv
-indexes and exact package versions are defined in the project files.
-
-## 1. Transfer or Update the Repository
-
-Using Git:
+Clone the repository or update the existing checkout:
 
 ```bash
-cd /path/to/remote/workspace
 git clone <repository-url>
 cd <repository-name>
 ```
 
-For an existing clone:
+or:
 
 ```bash
-cd /path/to/remote/repository
+cd <repository-name>
 git pull --ff-only
 ```
 
-Confirm:
+Confirm the environment files exist:
 
 ```bash
 test -f post_train_v2/pyproject.toml
-test -f post_train_v2/environment.md
-test -f post_train_v2/constraints-verl071-vllm017-cu128.txt
+test -f post_train_v2/configs/environment/runtime-cu128.json
+test -f post_train_v2/constraints-verl060-vllm091-cu128.txt
 ```
 
-Do not copy the old AgentFlow `.venv`.
+Do not copy or reuse the AgentFlow `.venv`.
 
-## 2. Transfer Manual Artifacts
+## 2. Upload and Verify the Wheels
 
-Download on a networked machine:
+Download the exact official artifacts listed in
+`post_train_v2/wheels/README.md`, then upload them to
+`post_train_v2/wheels/` without renaming them.
 
-### vLLM 0.17.0 cu128
-
-```text
-https://github.com/vllm-project/vllm/releases/download/v0.17.0/vllm-0.17.0%2Bcu128-cp38-abi3-manylinux_2_35_x86_64.whl
-```
-
-### Flash Attention 2.8.3 source
-
-```text
-https://github.com/Dao-AILab/flash-attention/archive/refs/tags/v2.8.3.tar.gz
-```
-
-Upload as:
-
-```text
-post_train_v2/wheels/vllm-0.17.0+cu128-cp38-abi3-manylinux_2_35_x86_64.whl
-post_train_v2/wheels/flash-attention-2.8.3.tar.gz
-```
-
-Verify:
-
-```bash
-ls -lh post_train_v2/wheels/
-sha256sum post_train_v2/wheels/*
-```
-
-## 3. Leave the AgentFlow Environment
-
-```bash
-conda deactivate || true
-deactivate 2>/dev/null || true
-unset PYTHONPATH
-hash -r
-```
-
-The CUDA compiler remains available through its absolute toolkit path:
-
-```bash
-export CUDA_HOME=/inspire/hdd/project/fdu-aidake-cfff/public/.conda/envs/llm-26
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-```
-
-Validate:
-
-```bash
-"$CUDA_HOME/bin/nvcc" --version
-test -f "$CUDA_HOME/include/cuda_runtime.h"
-test -f "$CUDA_HOME/lib/libcudart.so.12"
-```
-
-## 4. Create the uv Environment
+Verify filenames and SHA-256 values before dependency resolution:
 
 ```bash
 cd post_train_v2
-rm -rf .venv
-uv venv .venv --python 3.11 --seed
-source .venv/bin/activate
+python3 scripts/env/verify_artifacts.py \
+  --manifest configs/environment/runtime-cu128.json \
+  --wheels-dir wheels
 ```
 
-The `rm -rf` command is appropriate only for a newly created or disposable
-`post_train_v2/.venv`. Do not apply it to the AgentFlow environment.
+The command must print two `OK` lines. Do not continue after a missing file or
+hash mismatch.
 
-Confirm interpreter isolation:
+## 3. Isolate the Runtime
+
+Leave existing virtual or Conda environments and clear inherited build/runtime
+paths:
 
 ```bash
-which python
-python -V
-python -c "import sys; print(sys.executable); print(sys.prefix)"
+deactivate 2>/dev/null || true
+conda deactivate 2>/dev/null || true
+unset PYTHONPATH CUDA_HOME LD_LIBRARY_PATH
+hash -r
 ```
 
-The executable must point into `post_train_v2/.venv`.
+Do not export the CUDA 12.4 compiler toolkit into this runtime. The PyTorch and
+vLLM wheels carry their selected CUDA runtime libraries; the host NVIDIA driver
+provides device access.
 
-## 5. Resolve and Install the Runtime
+## 4. Create the Exact Python Environment
 
-`pyproject.toml` uses:
+From `post_train_v2`:
 
-- TUNA for ordinary PyPI packages;
-- the official PyTorch cu128 index for the Torch family;
-- the uploaded local file for vLLM.
+```bash
+uv python install 3.11.15
+uv venv --python 3.11.15 --seed
+source .venv/bin/activate
+python -V
+python -c "import sys; print(sys.executable)"
+```
 
-Run:
+Python must report `3.11.15`, and the executable must be inside
+`post_train_v2/.venv`.
+
+## 5. Resolve and Install
 
 ```bash
 uv lock
 uv sync --frozen
-```
-
-If TUNA has not synchronized a required package, temporarily retry with PyPI
-as the default index:
-
-```bash
-uv sync --frozen \
-  --default-index https://pypi.org/simple
-```
-
-Do not replace the explicit PyTorch cu128 index.
-
-## 6. Validate the Base Runtime
-
-```bash
 uv pip check
 ```
 
-Then:
+The project uses the configured TUNA mirror for ordinary packages, the
+official PyTorch `cu128` index for the Torch family, and repository-local
+official wheels for vLLM and Flash Attention.
+
+Do not:
+
+- install any `verl` extra;
+- use `--no-deps` to bypass a resolver conflict;
+- substitute a FALSE ABI Flash Attention wheel;
+- compile or install Flash Attention from source.
+
+If resolution fails, update the manifest and design after identifying the
+actual conflict. Do not apply an undocumented override.
+
+## 6. Run Static Tests
+
+From the repository root:
 
 ```bash
-python - <<'PY'
-from importlib.metadata import version
-import torch
-
-packages = [
-    "verl",
-    "vllm",
-    "transformers",
-    "trl",
-    "peft",
-    "accelerate",
-    "datasets",
-    "tokenizers",
-    "safetensors",
-    "ray",
-    "tensordict",
-    "pyarrow",
-    "numpy",
-]
-
-for package in packages:
-    print(f"{package:15} {version(package)}")
-
-print("torch", torch.__version__)
-print("torch CUDA", torch.version.cuda)
-print("CXX11 ABI", torch._C._GLIBCXX_USE_CXX11_ABI)
-print("CUDA available", torch.cuda.is_available())
-print("GPU count", torch.cuda.device_count())
-for index in range(torch.cuda.device_count()):
-    properties = torch.cuda.get_device_properties(index)
-    print(index, properties.name, properties.total_memory // 1024**3, "GiB")
-PY
+cd ..
+python -m pytest -q post_train_v2/tests/env
+python -m pytest -q \
+  post_train/tests/test_train_full_model_loader.py \
+  post_train/tests/test_evaluate_model_loader.py \
+  post_train/tests/test_flash_attention_entrypoints.py
 ```
 
-Expected core versions:
+## 7. Level 1 Runtime Gates
 
-```text
-verl         0.7.1
-vllm         0.17.0
-torch        2.10.0+cu128
-transformers 4.57.6
-trl          0.27.0
-peft         0.19.1
-```
-
-GPU validation must report two devices in the actual training allocation.
-Stop if it reports zero.
-
-## 7. Build Flash Attention
-
-Set the build environment:
+Return to `post_train_v2` and set model paths as needed:
 
 ```bash
-export CUDA_HOME=/inspire/hdd/project/fdu-aidake-cfff/public/.conda/envs/llm-26
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-export TORCH_CUDA_ARCH_LIST="8.0"
-export MAX_JOBS=4
+cd post_train_v2
 ```
 
-Install build tools:
+Runtime, package, GPU, ABI, topology, and Ray checks:
 
 ```bash
-uv pip install ninja packaging wheel
+python scripts/env/check_runtime.py \
+  --manifest configs/environment/runtime-cu128.json \
+  --require-gpus 2 \
+  --check-ray
 ```
 
-Build a reusable wheel:
+Direct Flash Attention and Transformers training paths:
 
 ```bash
-mkdir -p wheels/built
-uv pip wheel \
-  wheels/flash-attention-2.8.3.tar.gz \
-  --no-build-isolation \
-  --wheel-dir wheels/built
+python scripts/env/smoke_flash_attention.py --device cuda:0
+
+python scripts/env/smoke_transformers.py \
+  --model-path ../post_train/model/qwen/qwen3-0.6b \
+  --max-seq-length 64
+
+python scripts/env/smoke_legacy_loader.py \
+  --model-path ../post_train/model/qwen/qwen3-0.6b \
+  --device cuda:0
 ```
 
-Install the generated wheel:
+NCCL:
 
 ```bash
-uv pip install wheels/built/flash_attn-2.8.3-*.whl
+CUDA_VISIBLE_DEVICES=0,1 \
+torchrun --standalone --nproc_per_node=2 scripts/env/smoke_nccl.py
 ```
 
-Validate:
+The all-reduce result is a hard gate. Missing P2P/IPC exposure under HAMI is a
+warning only.
+
+vLLM TP1 and TP2:
 
 ```bash
-python - <<'PY'
-import flash_attn
-import torch
+CUDA_VISIBLE_DEVICES=0 \
+python scripts/env/smoke_vllm.py \
+  --model-path ../post_train/model/qwen/qwen3-0.6b \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.5
 
-print("flash_attn", flash_attn.__version__)
-print("torch", torch.__version__)
-print("torch CUDA", torch.version.cuda)
-print("CUDA available", torch.cuda.is_available())
-PY
+CUDA_VISIBLE_DEVICES=0,1 \
+python scripts/env/smoke_vllm.py \
+  --model-path ../post_train/model/qwen/qwen3-0.6b \
+  --tensor-parallel-size 2 \
+  --gpu-memory-utilization 0.4
 ```
 
-The system compiler is CUDA 12.4 while Torch uses CUDA 12.8. This is a minor
-version difference within CUDA 12. The build may emit a warning. Stop if the
-build reports a CUDA major-version mismatch or an undefined-symbol import
-error.
-
-## 8. Two-GPU NCCL Smoke Test
-
-Create a temporary script:
+Two concurrent Qwen3-8B teacher engines:
 
 ```bash
-cat > /tmp/post_train_v2_nccl_smoke.py <<'PY'
-import os
-import torch
-import torch.distributed as dist
-
-dist.init_process_group("nccl")
-rank = dist.get_rank()
-local_rank = int(os.environ["LOCAL_RANK"])
-torch.cuda.set_device(local_rank)
-value = torch.tensor([rank + 1.0], device=f"cuda:{local_rank}")
-dist.all_reduce(value)
-print(
-    f"rank={rank} local_rank={local_rank} "
-    f"device={torch.cuda.get_device_name(local_rank)} value={value.item()}"
-)
-dist.destroy_process_group()
-PY
-
-torchrun --standalone --nproc_per_node=2 /tmp/post_train_v2_nccl_smoke.py
+CUDA_VISIBLE_DEVICES=0,1 \
+python scripts/env/smoke_teacher_dual_engine.py \
+  --model-path ../post_train/model/qwen/qwen3-8b \
+  --gpu-memory-utilization 0.8 \
+  --timeout-seconds 600
 ```
 
-Both ranks must print `value=3.0`.
-
-## 9. vLLM Smoke Test
-
-Use the local Qwen3-0.6B model first:
+TRL/PEFT constructors and adapter round-trip:
 
 ```bash
-python - <<'PY'
-from vllm import LLM, SamplingParams
-
-model_path = "../post_train/model/qwen/qwen3-0.6b"
-llm = LLM(
-    model=model_path,
-    trust_remote_code=True,
-    tensor_parallel_size=1,
-    gpu_memory_utilization=0.5,
-)
-outputs = llm.chat(
-    messages=[[{"role": "user", "content": "Return <answer> 1+1 </answer>."}]],
-    sampling_params=SamplingParams(temperature=0.0, max_tokens=32),
-    chat_template_kwargs={"enable_thinking": False},
-)
-print(outputs[0].outputs[0].text)
-PY
+python scripts/env/smoke_trl_peft.py \
+  --model-path ../post_train/model/qwen/qwen3-0.6b \
+  --work-dir /tmp/post_train_v2_trl_peft_smoke
 ```
 
-Run the Qwen3-8B/two-GPU generation topology only after the 0.6B smoke test
-passes.
-
-## 10. Lock and Record
+Full-model evaluation loader:
 
 ```bash
-uv pip check
+python scripts/env/smoke_eval_loader.py \
+  --model-path ../post_train/model/qwen/qwen3-0.6b
+```
+
+LoRA evaluation loader, using the adapter produced above:
+
+```bash
+python scripts/env/smoke_eval_loader.py \
+  --model-path /tmp/post_train_v2_trl_peft_smoke/adapter \
+  --base-model-path ../post_train/model/qwen/qwen3-0.6b
+```
+
+Level 1 passes only when every hard gate above succeeds on the remote GPU
+allocation.
+
+## 8. Level 2 Deferred GRPO Gate
+
+The verl optimizer-update gate is intentionally deferred until these files
+exist:
+
+- JSONL-to-verl-Parquet converter;
+- custom Countdown reward adapter;
+- two-GPU GRPO smoke configuration and launcher.
+
+Level 2 must complete one two-question, two-rollout GRPO optimizer update with
+FSDP2 and vLLM, emit reward/length metrics, and show correct Ray placement.
+Environment installation alone does not establish GRPO training readiness.
+
+## 9. Record the Resolved Environment
+
+```bash
 uv pip freeze > environment.lock.txt
 git status --short uv.lock
 ```
 
-Commit `uv.lock`. Do not commit `.venv`, downloaded wheels, or
-`environment.lock.txt`.
+Commit `uv.lock` after successful remote resolution. Do not commit `.venv`,
+wheel binaries, or `environment.lock.txt`.

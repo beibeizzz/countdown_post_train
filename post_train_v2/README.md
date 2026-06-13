@@ -114,8 +114,12 @@ raw Countdown data
 
 ## Runtime Baseline
 
-V2 implementation targets the corrected version baseline recorded in
-`environment.md` and `pyproject.toml`. The current AgentFlow environment
-contains vLLM 0.20.1 and PyTorch 2.11.0, while the V2 environment uses vLLM
-0.17.0 and PyTorch 2.10.0 cu128. A separate post-training virtual environment
-is required.
+V2 uses an isolated Python 3.11.15 uv environment pinned by
+`configs/environment/runtime-cu128.json`. The core runtime is PyTorch 2.7
+cu128, Flash Attention 2.7.4.post1, vLLM 0.9.1, verl 0.6.0, Transformers
+4.53.2, and TRL 0.19.1.
+
+All Transformers model-loading paths used by Full SFT, LoRA, RFT, DPO,
+legacy GRPO, and evaluation require Flash Attention 2 and BF16. vLLM uses its
+own attention backend. See `docs/environment_setup.md` for the remote
+installation and two-level acceptance process.

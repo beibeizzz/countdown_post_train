@@ -1,6 +1,3 @@
-from pathlib import Path
-from uuid import uuid4
-
 import pytest
 
 from post_train.scripts.data.build_teacher_pool import (
@@ -47,8 +44,8 @@ def test_validate_source_rows_rejects_duplicate_ids():
         validate_source_rows(rows)
 
 
-def test_atomic_write_jsonl_replaces_existing_file():
-    path = Path("C:/tmp") / f"teacher_accepted_20k_{uuid4().hex}.jsonl"
+def test_atomic_write_jsonl_replaces_existing_file(tmp_path):
+    path = tmp_path / "teacher_accepted_20k.jsonl"
     temp_path = path.with_name(f"{path.name}.tmp")
     path.parent.mkdir(parents=True, exist_ok=True)
 

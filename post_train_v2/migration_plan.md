@@ -6,7 +6,7 @@ V2 uses a hybrid architecture selected by training-stage requirements.
 
 The implementation baseline is pinned in `environment.md`,
 `pyproject.toml`, `requirements-runtime.txt`, and
-`constraints-verl071-vllm017-cu128.txt`. Core code must target those APIs
+`constraints-verl060-vllm091-cu128.txt`. Core code must target those APIs
 rather than dynamically adapting to arbitrary library versions.
 
 ```text
@@ -163,9 +163,9 @@ Replace the current custom training loop with verl.
 
 Recommended initial characteristics:
 
-- training backend: verl 0.7.1 with the FSDP/FSDP2 interface verified by the
-  required two-GPU smoke test on PyTorch 2.10.0;
-- rollout backend: vLLM.
+- training backend: verl 0.6.0 with the FSDP2 interface verified by the
+  required Level 2 two-GPU smoke test on PyTorch 2.7.0;
+- rollout backend: vLLM 0.9.1;
 - actor model: full-SFT Qwen3-0.6B checkpoint.
 - critic: disabled.
 - reward model: disabled.
@@ -195,8 +195,8 @@ verl terminology differs from the current config:
 | `kl_coeff` | disabled KL reward/loss configuration |
 | `sync_every_steps` | removed; verl owns actor-rollout synchronization |
 
-Exact config keys must follow verl 0.7.1. Configuration copied from newer
-`main` documentation must not be used without checking it against the v0.7.1
+Exact config keys must follow verl 0.6.0. Configuration copied from newer
+`main` documentation must not be used without checking it against the v0.6.0
 source tree.
 
 ## 3. JSONL-to-verl-Parquet Boundary

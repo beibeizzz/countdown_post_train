@@ -1,4 +1,8 @@
 .venv/
 environment.lock.txt
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_tmp/
 wheels/*
 !wheels/README.md
