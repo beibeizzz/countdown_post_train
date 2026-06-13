@@ -330,6 +330,7 @@ class ParallelVLLMEngine:
         self._processes: list[Any] = []
         self._started = False
         self._closed = False
+        self._cleanup_complete = False
         self._last_batch_id: int | None = None
 
     def start(self) -> ParallelVLLMEngine:
@@ -379,8 +380,8 @@ class ParallelVLLMEngine:
                         f"{message.worker_index}"
                     )
                 ready_workers.add(message.worker_index)
-        except Exception:
-            self.close()
+        except Exception as exc:
+            self._close_after_failure(exc)
             raise
 
         self._started = True
@@ -423,15 +424,18 @@ class ParallelVLLMEngine:
                 expected_positions=[item.position for item in items],
                 messages=messages,
             )
-        except Exception:
-            self.close()
+        except Exception as exc:
+            self._close_after_failure(exc)
             raise
 
     def close(self) -> None:
-        if self._closed:
+        if self._cleanup_complete:
             return
         self._closed = True
-        deadline = self._monotonic() + self._shutdown_timeout
+        started_at = self._monotonic()
+        graceful_deadline = started_at + (self._shutdown_timeout * 0.5)
+        terminate_deadline = started_at + (self._shutdown_timeout * 0.8)
+        final_deadline = started_at + self._shutdown_timeout
         cleanup_errors: list[str] = []
 
         for request_queue in self._request_queues:
@@ -440,7 +444,11 @@ class ParallelVLLMEngine:
             except Exception as exc:
                 cleanup_errors.append(f"failed to send worker stop: {exc}")
 
-        self._join_processes(self._processes, deadline, cleanup_errors)
+        self._join_processes(
+            self._alive_processes(),
+            graceful_deadline,
+            cleanup_errors,
+        )
         remaining = self._alive_processes()
         for process in remaining:
             try:
@@ -448,7 +456,7 @@ class ParallelVLLMEngine:
             except Exception as exc:
                 cleanup_errors.append(f"failed to terminate worker: {exc}")
 
-        self._join_processes(remaining, deadline, cleanup_errors)
+        self._join_processes(remaining, terminate_deadline, cleanup_errors)
         remaining = self._alive_processes()
         for process in remaining:
             kill = getattr(process, "kill", None)
@@ -459,27 +467,27 @@ class ParallelVLLMEngine:
             except Exception as exc:
                 cleanup_errors.append(f"failed to kill worker: {exc}")
 
-        self._join_processes(remaining, deadline, cleanup_errors)
+        self._join_processes(remaining, final_deadline, cleanup_errors)
         orphans = self._alive_processes()
-
-        for resource_queue in [*self._request_queues, self._response_queue]:
-            self._close_queue(resource_queue, cleanup_errors)
-
-        for process in self._processes:
-            if process in orphans:
-                continue
-            close = getattr(process, "close", None)
-            if close is None:
-                continue
-            try:
-                close()
-            except Exception as exc:
-                cleanup_errors.append(f"failed to close worker handle: {exc}")
 
         if orphans:
             cleanup_errors.append(
                 f"{len(orphans)} worker process(es) still alive after shutdown"
             )
+        else:
+            for resource_queue in [*self._request_queues, self._response_queue]:
+                self._close_queue(resource_queue, cleanup_errors)
+
+            for process in self._processes:
+                close = getattr(process, "close", None)
+                if close is None:
+                    continue
+                try:
+                    close()
+                except Exception as exc:
+                    cleanup_errors.append(f"failed to close worker handle: {exc}")
+            self._cleanup_complete = True
+
         if cleanup_errors:
             raise RuntimeError("; ".join(cleanup_errors))
 
@@ -525,6 +533,13 @@ class ParallelVLLMEngine:
     def _raise_if_deadline_expired(self, deadline: float, phase: str) -> None:
         if self._monotonic() >= deadline:
             raise TimeoutError(f"{phase} timed out")
+
+    def _close_after_failure(self, original_error: Exception) -> None:
+        try:
+            self.close()
+        except Exception as cleanup_error:
+            original_error.add_note(f"shutdown cleanup failed: {cleanup_error}")
+            raise original_error from cleanup_error
 
     def _join_processes(
         self,

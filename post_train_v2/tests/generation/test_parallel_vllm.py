@@ -4,6 +4,7 @@ import ast
 import multiprocessing
 import os
 import queue
+import time
 from pathlib import Path
 
 import pytest
@@ -68,6 +69,35 @@ def spawn_fake_worker(
                 ),
             )
         )
+
+
+def spawn_worker_ignoring_stop(
+    spec,
+    request_queue,
+    response_queue,
+    model_path,
+    gpu_memory_utilization,
+    max_model_len,
+    seed,
+    max_new_tokens,
+    temperature,
+    top_p,
+    enable_thinking,
+) -> None:
+    del (
+        request_queue,
+        model_path,
+        gpu_memory_utilization,
+        max_model_len,
+        seed,
+        max_new_tokens,
+        temperature,
+        top_p,
+        enable_thinking,
+    )
+    response_queue.put(WorkerReady(spec.worker_index))
+    while True:
+        time.sleep(0.05)
 
 
 @pytest.mark.parametrize(
@@ -511,6 +541,7 @@ class FakeProcess:
         start_error: Exception | None = None,
         start_hook=None,
         join_hook=None,
+        signal_hook=None,
     ) -> None:
         self.target = target
         self.args = args
@@ -520,6 +551,7 @@ class FakeProcess:
         self.start_error = start_error
         self.start_hook = start_hook
         self.join_hook = join_hook
+        self.signal_hook = signal_hook
         self.exitcode: int | None = None
         self.started = False
         self.join_timeouts: list[float | None] = []
@@ -539,7 +571,7 @@ class FakeProcess:
             raise AssertionError("cannot join process before it is started")
         self.join_timeouts.append(timeout)
         if self.join_hook is not None:
-            self.join_hook(timeout)
+            self.join_hook(self, timeout)
         if not self.stubborn:
             self.exitcode = 0
 
@@ -547,6 +579,8 @@ class FakeProcess:
         if not self.started:
             raise AttributeError("process has no pid")
         self.terminated = True
+        if self.signal_hook is not None:
+            self.signal_hook(self, "terminate")
         if self.terminate_exits:
             self.exitcode = -15
 
@@ -554,6 +588,8 @@ class FakeProcess:
         if not self.started:
             raise AttributeError("process has no pid")
         self.killed = True
+        if self.signal_hook is not None:
+            self.signal_hook(self, "kill")
         if self.kill_exits:
             self.exitcode = -9
 
@@ -575,6 +611,7 @@ class FakeContext:
         queues: list[FakeQueue] | None = None,
         start_hook=None,
         join_hook=None,
+        signal_hook=None,
     ) -> None:
         self.queues = queues or [FakeQueue(), FakeQueue(), FakeQueue()]
         self._next_queue = 0
@@ -585,6 +622,7 @@ class FakeContext:
         self.start_error = start_error
         self.start_hook = start_hook
         self.join_hook = join_hook
+        self.signal_hook = signal_hook
 
     @property
     def request_queues(self) -> list[FakeQueue]:
@@ -609,6 +647,7 @@ class FakeContext:
             start_error=self.start_error,
             start_hook=self.start_hook,
             join_hook=self.join_hook,
+            signal_hook=self.signal_hook,
         )
         self.processes.append(process)
         return process
@@ -1006,7 +1045,8 @@ def test_close_sends_stop_joins_terminates_stubborn_workers_and_joins_again() ->
 def test_close_uses_one_deadline_then_kills_and_releases_resources() -> None:
     clock = ManualClock()
 
-    def consume_join_time(timeout: float | None) -> None:
+    def consume_join_time(process, timeout: float | None) -> None:
+        del process
         clock.advance(min(timeout or 0.0, 0.3))
 
     context = FakeContext(
@@ -1034,7 +1074,83 @@ def test_close_uses_one_deadline_then_kills_and_releases_resources() -> None:
     )
 
 
-def test_close_raises_for_orphan_after_kill_but_second_close_is_noop() -> None:
+def test_close_reserves_graceful_terminate_and_kill_phase_budgets() -> None:
+    clock = ManualClock()
+    signals: list[tuple[str, float]] = []
+
+    def consume_phase(process, timeout: float | None) -> None:
+        del process
+        clock.advance(timeout or 0.0)
+
+    def record_signal(process, signal_name: str) -> None:
+        del process
+        signals.append((signal_name, clock.value))
+
+    context = FakeContext(
+        stubborn=True,
+        terminate_exits=False,
+        kill_exits=True,
+        join_hook=consume_phase,
+        signal_hook=record_signal,
+    )
+    engine = start_engine(context)
+    engine._monotonic = clock
+    engine._shutdown_timeout = 1.0
+
+    engine.close()
+
+    terminate_times = [timestamp for name, timestamp in signals if name == "terminate"]
+    kill_times = [timestamp for name, timestamp in signals if name == "kill"]
+    assert terminate_times and max(terminate_times) <= 0.5
+    assert kill_times and max(kill_times) <= 0.8
+    assert clock.value <= 1.0
+
+
+def test_close_waits_for_delayed_exit_after_terminate_before_kill() -> None:
+    clock = ManualClock()
+
+    def delayed_terminate_exit(process, timeout: float | None) -> None:
+        if process.terminated and process.exitcode is None and (timeout or 0.0) > 0:
+            clock.advance(min(timeout or 0.0, 0.1))
+            process.exitcode = -15
+
+    context = FakeContext(
+        stubborn=True,
+        terminate_exits=False,
+        kill_exits=True,
+        join_hook=delayed_terminate_exit,
+    )
+    engine = start_engine(context)
+    engine._monotonic = clock
+    engine._shutdown_timeout = 1.0
+
+    engine.close()
+
+    assert all(process.terminated for process in context.processes)
+    assert all(not process.killed for process in context.processes)
+    assert all(process.exitcode == -15 for process in context.processes)
+
+
+def test_close_zero_timeout_escalates_without_blocking() -> None:
+    clock = ManualClock()
+    context = FakeContext(
+        stubborn=True,
+        terminate_exits=False,
+        kill_exits=True,
+    )
+    engine = start_engine(context)
+    engine._monotonic = clock
+    engine._shutdown_timeout = 0.0
+
+    engine.close()
+
+    assert clock.value == 0.0
+    assert all(process.terminated for process in context.processes)
+    assert all(process.killed for process in context.processes)
+    assert all(timeout == 0.0 for process in context.processes for timeout in process.join_timeouts)
+
+
+def test_close_retries_cleanup_after_initial_orphan_report() -> None:
     context = FakeContext(
         stubborn=True,
         terminate_exits=False,
@@ -1045,9 +1161,14 @@ def test_close_raises_for_orphan_after_kill_but_second_close_is_noop() -> None:
     with pytest.raises(RuntimeError, match="still alive"):
         engine.close()
 
+    assert all(item.close_calls == 0 for item in context.queues)
+    for process in context.processes:
+        process.kill_exits = True
+
     engine.close()
     assert all(process.terminated for process in context.processes)
     assert all(process.killed for process in context.processes)
+    assert all(process.exitcode == -9 for process in context.processes)
     assert all(item.close_calls == 1 for item in context.queues)
     assert all(
         item.join_thread_calls + item.cancel_join_thread_calls == 1
@@ -1055,10 +1176,51 @@ def test_close_raises_for_orphan_after_kill_but_second_close_is_noop() -> None:
     )
 
 
+def test_generate_failure_preserves_original_error_when_cleanup_finds_orphans() -> None:
+    context = FakeContext(
+        stubborn=True,
+        terminate_exits=False,
+        kill_exits=False,
+    )
+    engine = start_engine(context)
+    context.response_queue.put(
+        WorkerError(0, 1, "generation failed", "worker traceback")
+    )
+
+    with pytest.raises(RuntimeError, match="generation failed") as exc_info:
+        engine.generate(1, [])
+
+    assert exc_info.value.__cause__ is not None
+    assert "still alive" in str(exc_info.value.__cause__)
+    for process in context.processes:
+        process.kill_exits = True
+    engine.close()
+
+
+def test_start_failure_preserves_original_error_when_cleanup_finds_orphans() -> None:
+    context = FakeContext(
+        stubborn=True,
+        terminate_exits=False,
+        kill_exits=False,
+    )
+    context.response_queue.put("malformed")
+    engine = make_engine(context)
+
+    with pytest.raises(ValueError, match="malformed") as exc_info:
+        engine.start()
+
+    assert exc_info.value.__cause__ is not None
+    assert "still alive" in str(exc_info.value.__cause__)
+    for process in context.processes:
+        process.kill_exits = True
+    engine.close()
+
+
 def test_close_cancels_queue_join_threads_without_exceeding_deadline() -> None:
     clock = ManualClock()
 
-    def exhaust_deadline(timeout: float | None) -> None:
+    def exhaust_deadline(process, timeout: float | None) -> None:
+        del process
         clock.advance(timeout or 0.0)
 
     queues = [
@@ -1215,6 +1377,42 @@ def test_real_spawn_context_round_trip_and_shutdown(tmp_path: Path) -> None:
         (1, "worker-0:prompt-1"),
         (2, "worker-1:prompt-2"),
     ]
+    active_ids = {process.pid for process in multiprocessing.active_children()}
+    assert process_ids.isdisjoint(active_ids)
+
+
+def test_real_spawn_close_forces_workers_that_ignore_stop(tmp_path: Path) -> None:
+    try:
+        context = multiprocessing.get_context("spawn")
+    except ValueError:
+        pytest.skip("multiprocessing spawn context is unavailable")
+
+    engine = ParallelVLLMEngine(
+        model_path="/unused",
+        worker_specs=(
+            WorkerSpec(0, 0, str(tmp_path / "gpu0")),
+            WorkerSpec(1, 1, str(tmp_path / "gpu1")),
+        ),
+        gpu_memory_utilization=0.8,
+        max_model_len=128,
+        seed=0,
+        max_new_tokens=16,
+        temperature=0.0,
+        top_p=1.0,
+        enable_thinking=False,
+        timeout_seconds=5.0,
+        context=context,
+        worker_target=spawn_worker_ignoring_stop,
+        poll_interval=0.01,
+        shutdown_timeout=0.5,
+    )
+
+    engine.start()
+    processes = tuple(engine._processes)
+    process_ids = {process.pid for process in processes}
+    engine.close()
+
+    assert all(process._closed for process in processes)
     active_ids = {process.pid for process in multiprocessing.active_children()}
     assert process_ids.isdisjoint(active_ids)
 
