@@ -195,12 +195,22 @@ The teacher smoke test maps each isolated child back to a physical GPU using
 the CUDA Driver API (`libcuda.so.1`) plus `nvidia-smi`. It does not query UUIDs
 from `libcudart`.
 
-V2 coordinator smoke and resume gate, run from the repository root with the
-same active V2 virtual environment:
+After the dual-engine gate passes, run the V2 coordinator smoke and
+deterministic interruption/resume gate from the repository root with the same
+active V2 virtual environment. These are Level 1 gates and must pass before
+the remaining TRL/PEFT and evaluation-loader gates below.
 
 ```bash
 cd ..
+```
+
+Cleanup and execution are separate commands:
+
+```bash
 rm -rf -- /tmp/post_train_v2_teacher_smoke
+```
+
+```bash
 unset CUDA_VISIBLE_DEVICES
 set -o pipefail
 python post_train_v2/scripts/generation/build_teacher_pool.py \
@@ -220,15 +230,18 @@ per-worker shard sizes and latencies, committed batches, worker shutdown, and
 worker exit codes. Preserve `/tmp/post_train_v2_teacher_smoke.log` with the
 remote acceptance record.
 
-Interrupt a smoke run only after at least one `committed batch` log line, then
-rerun the exact smoke command without deleting the output directory. The
-second run must report a nonzero `resume processed=...` position and pass the
-same validator. A transaction journal left by an abnormal interruption is
-recovered automatically on restart; never delete the journal manually. Use
+Follow the deterministic resume-smoke procedure in the generation README. It
+creates an untracked `/tmp` config with batch size two, interrupts immediately
+after the first committed batch, resumes without cleanup, requires
+`resume processed` to be greater than zero, and runs the same validator
+against the completed resume output.
+
+A transaction journal left by an abnormal interruption is recovered
+automatically on restart; never delete the journal manually. Use
 `--recover-stale-lock` only after inspecting the lock with `cat`, checking its
 PID with `ps`, and confirming that it belongs to this host and the PID is
-dead. Detailed commands and the legacy-adoption boundary are in the
-generation README.
+dead. Detailed commands and the legacy-adoption boundary are in the generation
+README.
 
 Return to `post_train_v2`:
 
@@ -263,8 +276,9 @@ python scripts/env/smoke_eval_loader.py \
   --base-model-path ../post_train/model/qwen/qwen3-0.6b
 ```
 
-Level 1 passes only when every hard gate above succeeds on the remote GPU
-allocation.
+Level 1 passes only when the dual-engine gate, coordinator smoke, deterministic
+resume smoke, remaining TRL/PEFT and loader checks, and every other hard gate
+above succeed on the remote GPU allocation.
 
 ## 8. Level 2 Deferred GRPO Gate
 

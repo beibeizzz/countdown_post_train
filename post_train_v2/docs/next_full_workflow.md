@@ -47,8 +47,10 @@ Run every Level 1 gate from the environment runbook:
 6. Two-rank NCCL smoke test.
 7. vLLM tensor-parallel size 1 and 2 smoke tests.
 8. Dual-engine teacher generation smoke test.
-9. TRL and PEFT training smoke test.
-10. Full-model and LoRA-adapter evaluation loader smoke tests.
+9. V2 coordinator output smoke and validator.
+10. Deterministic V2 interruption/resume smoke and validator.
+11. TRL and PEFT training smoke test.
+12. Full-model and LoRA-adapter evaluation loader smoke tests.
 
 Stop on the first failure. Do not begin data generation or training with a
 partially accepted environment.
@@ -73,9 +75,9 @@ fields before continuing.
 
 ## Phase 4: Build the Teacher-Accepted Pool
 
-First pass the isolated V2 smoke and resume gate in
-`post_train_v2/scripts/generation/README.md`. Then run the implemented V2
-dual-engine production builder from the repository root:
+Confirm that the isolated V2 coordinator smoke and deterministic resume gate
+already passed in Phase 2. Then run the implemented V2 dual-engine production
+builder from the repository root:
 
 ```bash
 python post_train_v2/scripts/generation/build_teacher_pool.py \
