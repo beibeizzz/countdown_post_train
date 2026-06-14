@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -23,7 +25,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from post_train.src.countdown.config import load_yaml_config, resolve_path
-from post_train.src.countdown.io import read_jsonl
 from post_train.src.countdown.output_lock import OutputLock
 from post_train.src.countdown.validation import (
     extract_answer_text,
@@ -33,13 +34,13 @@ from post_train_v2.src.generation.parallel_vllm import (
     ParallelVLLMEngine,
     PositionedPrompt,
     WorkerSpec,
+    split_contiguous,
 )
 from post_train_v2.src.generation.teacher_state import (
     TeacherGenerationConfig,
     TeacherStateStore,
     build_generation_contract,
     build_manifest,
-    sha256_file,
 )
 
 
@@ -180,6 +181,57 @@ def validate_source_rows(rows: list[dict[str, Any]]) -> None:
             raise ValueError(f"source row {position} target must be an exact integer")
 
 
+def _parse_jsonl_bytes(data: bytes, path: Path) -> list[dict[str, Any]]:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{path}: invalid UTF-8") from exc
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(io.StringIO(text, newline=None), start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}:{line_number}: invalid JSON") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"{path}:{line_number}: JSONL row must be an object")
+        rows.append(row)
+    return rows
+
+
+def _stat_signature(stat_result: os.stat_result) -> tuple[int, ...]:
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
+def _read_source_snapshot(path: Path) -> tuple[bytes, tuple[int, ...], str]:
+    before = _stat_signature(path.stat())
+    data = path.read_bytes()
+    after = _stat_signature(path.stat())
+    if before != after:
+        raise ValueError(f"source file changed while being read: {path}")
+    return data, after, hashlib.sha256(data).hexdigest()
+
+
+def _verify_source_snapshot(
+    path: Path,
+    expected_stat: tuple[int, ...],
+    expected_sha256: str,
+) -> None:
+    before = _stat_signature(path.stat())
+    data = path.read_bytes()
+    after = _stat_signature(path.stat())
+    digest = hashlib.sha256(data).hexdigest()
+    if before != after or after != expected_stat or digest != expected_sha256:
+        raise ValueError(f"source file changed during resume validation: {path}")
+
+
 def build_teacher_payload(
     row: dict[str, Any],
     response: str,
@@ -200,7 +252,7 @@ def build_teacher_payload(
 
 def _jsonl_sha256(rows: list[dict[str, Any]]) -> str:
     payload = b"".join(
-        (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+        (json.dumps(row, ensure_ascii=False) + os.linesep).encode("utf-8")
         for row in rows
     )
     return hashlib.sha256(payload).hexdigest()
@@ -235,16 +287,15 @@ def _default_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _store_has_committed_state(store: Any) -> bool:
-    explicit = getattr(store, "state_exists", None)
-    if explicit is not None:
-        return bool(explicit)
-    paths = (
-        getattr(store, "accepted_path", None),
-        getattr(store, "rejected_path", None),
-        getattr(store, "manifest_path", None),
-    )
-    return any(path is not None and Path(path).exists() for path in paths)
+def _snapshot_sha256(
+    store: Any,
+    path_attribute: str,
+    rows: list[dict[str, Any]],
+) -> str:
+    path = getattr(store, path_attribute, None)
+    if path is not None and Path(path).exists():
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return _jsonl_sha256(rows)
 
 
 def _manifest(
@@ -256,6 +307,8 @@ def _manifest(
     generation_contract: dict[str, Any],
     created_at: str,
     updated_at: str,
+    accepted_sha256: str | None = None,
+    rejected_sha256: str | None = None,
 ) -> dict[str, Any]:
     processed_count = len(accepted) + len(rejected)
     return build_manifest(
@@ -267,8 +320,8 @@ def _manifest(
         completed=len(accepted) == config.stop_after_accepted,
         generation_contract=generation_contract,
         source_sha256=source_sha256,
-        accepted_sha256=_jsonl_sha256(accepted),
-        rejected_sha256=_jsonl_sha256(rejected),
+        accepted_sha256=accepted_sha256 or _jsonl_sha256(accepted),
+        rejected_sha256=rejected_sha256 or _jsonl_sha256(rejected),
         created_at=created_at,
         updated_at=updated_at,
     )
@@ -303,6 +356,224 @@ def _build_engine(
     )
 
 
+def _execute_locked(
+    *,
+    config: TeacherGenerationConfig,
+    adopt_legacy_state: bool,
+    engine_factory: Callable[..., Any],
+    state_store_factory: Callable[[Path], Any],
+    now: Callable[[], datetime | str],
+    monotonic: Callable[[], float],
+    resources: dict[str, Any],
+) -> int:
+    source_bytes, source_stat, source_hash = _read_source_snapshot(
+        config.input_path
+    )
+    source_rows = _parse_jsonl_bytes(source_bytes, config.input_path)
+    validate_source_rows(source_rows)
+    LOGGER.info("source rows=%s", len(source_rows))
+
+    store = state_store_factory(config.output_dir)
+    _verify_source_snapshot(config.input_path, source_stat, source_hash)
+    state = store.load_resume_state(
+        source_rows,
+        config,
+        adopt_legacy_state=adopt_legacy_state,
+    )
+    _verify_source_snapshot(config.input_path, source_stat, source_hash)
+    accepted = list(state.accepted)
+    rejected = list(state.rejected)
+    LOGGER.info(
+        "resume processed=%s accepted=%s rejected=%s",
+        state.processed_count,
+        len(accepted),
+        len(rejected),
+    )
+    contract = build_generation_contract(config, source_sha256=source_hash)
+    clock = _IncreasingUtcClock(now, after=state.created_at)
+
+    if not store.has_v2_manifest():
+        initial_manifest = _manifest(
+            config=config,
+            accepted=accepted,
+            rejected=rejected,
+            source_sha256=source_hash,
+            generation_contract=contract,
+            created_at=state.created_at,
+            updated_at=clock.next(),
+            accepted_sha256=_snapshot_sha256(
+                store, "accepted_path", accepted
+            ),
+            rejected_sha256=_snapshot_sha256(
+                store, "rejected_path", rejected
+            ),
+        )
+        store.commit(
+            batch_id=0,
+            submitted_start=state.processed_count,
+            submitted_stop=state.processed_count,
+            accepted=accepted,
+            rejected=rejected,
+            manifest=initial_manifest,
+        )
+        LOGGER.info(
+            "materialized V2 manifest processed=%s accepted=%s rejected=%s",
+            state.processed_count,
+            len(accepted),
+            len(rejected),
+        )
+
+    if len(accepted) >= config.stop_after_accepted:
+        LOGGER.info("teacher target already complete: %s", len(accepted))
+        return 0
+    if state.processed_count >= len(source_rows):
+        LOGGER.error(
+            "source exhausted: accepted=%s target=%s",
+            len(accepted),
+            config.stop_after_accepted,
+        )
+        return 2
+
+    engine = _build_engine(config, engine_factory)
+    resources["engine"] = engine
+    LOGGER.info("engine starting")
+    engine.start()
+    LOGGER.info("engine ready")
+    processed = state.processed_count
+    batch_id = processed // config.batch_size + 1
+    while processed < len(source_rows) and len(accepted) < config.stop_after_accepted:
+        submitted_start = processed
+        batch_rows = source_rows[
+            submitted_start : submitted_start + config.batch_size
+        ]
+        prompts = tuple(
+            PositionedPrompt(submitted_start + offset, row["prompt"])
+            for offset, row in enumerate(batch_rows)
+        )
+        LOGGER.info(
+            "batch=%s global_range=[%s,%s) count=%s",
+            batch_id,
+            submitted_start,
+            submitted_start + len(prompts),
+            len(prompts),
+        )
+        shards = split_contiguous(prompts)
+        started_at = monotonic()
+        responses = engine.generate(batch_id, prompts)
+        latency = monotonic() - started_at
+        LOGGER.info(
+            "batch=%s worker0_shard=%s worker1_shard=%s latency_seconds=%.3f",
+            batch_id,
+            len(shards[0]),
+            len(shards[1]),
+            latency,
+        )
+        expected_positions = [item.position for item in prompts]
+        if len(responses) != len(expected_positions):
+            raise ValueError(
+                "response count mismatch: "
+                f"received {len(responses)}, expected {len(expected_positions)}"
+            )
+        actual_positions = []
+        for item in responses:
+            if (
+                not isinstance(item, tuple)
+                or len(item) != 2
+                or type(item[0]) is not int
+                or not isinstance(item[1], str)
+            ):
+                raise ValueError(f"malformed positioned response: {item!r}")
+            actual_positions.append(item[0])
+        if actual_positions != expected_positions:
+            raise ValueError(
+                f"response positions {actual_positions} do not match "
+                f"expected {expected_positions}"
+            )
+
+        new_accepted = list(accepted)
+        new_rejected = list(rejected)
+        consumed = 0
+        for row, (_, response) in zip(batch_rows, responses, strict=True):
+            if len(new_accepted) >= config.stop_after_accepted:
+                break
+            payload = build_teacher_payload(row, response)
+            if payload["validation"]["ok"]:
+                new_accepted.append(payload)
+            else:
+                new_rejected.append(payload)
+            consumed += 1
+
+        new_processed = submitted_start + consumed
+        manifest = _manifest(
+            config=config,
+            accepted=new_accepted,
+            rejected=new_rejected,
+            source_sha256=source_hash,
+            generation_contract=contract,
+            created_at=state.created_at,
+            updated_at=clock.next(),
+        )
+        store.commit(
+            batch_id=batch_id,
+            submitted_start=submitted_start,
+            submitted_stop=new_processed,
+            accepted=new_accepted,
+            rejected=new_rejected,
+            manifest=manifest,
+        )
+        accepted = new_accepted
+        rejected = new_rejected
+        processed = new_processed
+        LOGGER.info(
+            "committed batch=%s processed=%s accepted=%s rejected=%s",
+            batch_id,
+            processed,
+            len(accepted),
+            len(rejected),
+        )
+        batch_id += 1
+
+    if len(accepted) == config.stop_after_accepted:
+        return 0
+    LOGGER.error(
+        "source exhausted: accepted=%s target=%s",
+        len(accepted),
+        config.stop_after_accepted,
+    )
+    return 2
+
+
+def _cleanup_resources(engine: Any | None, lock: Any) -> list[BaseException]:
+    errors: list[BaseException] = []
+    if engine is not None:
+        try:
+            engine.close()
+        except BaseException as exc:
+            errors.append(exc)
+        else:
+            LOGGER.info("workers closed")
+        try:
+            LOGGER.info("worker exitcodes=%s", engine.worker_exitcodes)
+        except BaseException as exc:
+            errors.append(exc)
+    try:
+        lock.release()
+    except BaseException as exc:
+        errors.append(exc)
+    return errors
+
+
+def _cleanup_failure(errors: list[BaseException]) -> BaseException:
+    if len(errors) == 1:
+        return errors[0]
+    if all(isinstance(error, Exception) for error in errors):
+        return ExceptionGroup(
+            "teacher coordinator cleanup failures",
+            [error for error in errors if isinstance(error, Exception)],
+        )
+    return BaseExceptionGroup("teacher coordinator cleanup failures", errors)
+
+
 def run(
     config_path: str | Path = PRODUCTION_CONFIG,
     *,
@@ -312,13 +583,12 @@ def run(
     state_store_factory: Callable[[Path], Any] = TeacherStateStore,
     lock_factory: Callable[..., Any] = OutputLock,
     now: Callable[[], datetime | str] = _default_now,
+    monotonic: Callable[[], float] = time.monotonic,
     cuda_visible_devices: str | None = None,
 ) -> int:
     resolved_config_path = resolve_path(config_path, REPO_ROOT).resolve()
     config = load_teacher_config(resolved_config_path)
     validate_cuda_visibility(config, cuda_visible_devices)
-    source_rows = read_jsonl(config.input_path)
-    validate_source_rows(source_rows)
 
     lock = lock_factory(
         path=config.output_dir / ".teacher_pool.lock",
@@ -326,157 +596,47 @@ def run(
         output_dir=config.output_dir,
         topology=config.topology,
     )
+    if recover_stale_lock:
+        LOGGER.info("stale lock recovery requested")
+    LOGGER.info("acquiring output lock: %s", lock.path)
     lock.acquire(recover_stale=recover_stale_lock)
-    engine = None
+    LOGGER.info("output lock acquired: %s", lock.path)
+    resources: dict[str, Any] = {"engine": None}
+    primary: BaseException | None = None
+    result: int | None = None
     try:
-        store = state_store_factory(config.output_dir)
-        state = store.load_resume_state(
-            source_rows,
-            config,
+        result = _execute_locked(
+            config=config,
             adopt_legacy_state=adopt_legacy_state,
+            engine_factory=engine_factory,
+            state_store_factory=state_store_factory,
+            now=now,
+            monotonic=monotonic,
+            resources=resources,
         )
-        accepted = list(state.accepted)
-        rejected = list(state.rejected)
-        source_hash = sha256_file(config.input_path)
-        contract = build_generation_contract(config, source_sha256=source_hash)
-        clock = _IncreasingUtcClock(now, after=state.created_at)
-
-        if state.processed_count == 0 and not _store_has_committed_state(store):
-            initial_manifest = _manifest(
-                config=config,
-                accepted=accepted,
-                rejected=rejected,
-                source_sha256=source_hash,
-                generation_contract=contract,
-                created_at=state.created_at,
-                updated_at=clock.next(),
-            )
-            store.commit(
-                batch_id=0,
-                submitted_start=0,
-                submitted_stop=0,
-                accepted=accepted,
-                rejected=rejected,
-                manifest=initial_manifest,
-            )
-
-        if len(accepted) >= config.stop_after_accepted:
-            LOGGER.info("teacher target already complete: %s", len(accepted))
-            return 0
-        if state.processed_count >= len(source_rows):
-            LOGGER.error(
-                "source exhausted: accepted=%s target=%s",
-                len(accepted),
-                config.stop_after_accepted,
-            )
-            return 2
-
-        engine = _build_engine(config, engine_factory)
-        engine.start()
-        processed = state.processed_count
-        batch_id = processed // config.batch_size + 1
-        while processed < len(source_rows) and len(accepted) < config.stop_after_accepted:
-            submitted_start = processed
-            batch_rows = source_rows[
-                submitted_start : submitted_start + config.batch_size
-            ]
-            prompts = tuple(
-                PositionedPrompt(submitted_start + offset, row["prompt"])
-                for offset, row in enumerate(batch_rows)
-            )
-            LOGGER.info(
-                "batch=%s range=[%s,%s) count=%s",
-                batch_id,
-                submitted_start,
-                submitted_start + len(prompts),
-                len(prompts),
-            )
-            responses = engine.generate(batch_id, prompts)
-            expected_positions = [item.position for item in prompts]
-            if len(responses) != len(expected_positions):
-                raise ValueError(
-                    "response count mismatch: "
-                    f"received {len(responses)}, expected {len(expected_positions)}"
-                )
-            actual_positions = []
-            for item in responses:
-                if (
-                    not isinstance(item, tuple)
-                    or len(item) != 2
-                    or type(item[0]) is not int
-                    or not isinstance(item[1], str)
-                ):
-                    raise ValueError(f"malformed positioned response: {item!r}")
-                actual_positions.append(item[0])
-            if actual_positions != expected_positions:
-                raise ValueError(
-                    f"response positions {actual_positions} do not match "
-                    f"expected {expected_positions}"
-                )
-
-            new_accepted = list(accepted)
-            new_rejected = list(rejected)
-            consumed = 0
-            for row, (_, response) in zip(batch_rows, responses, strict=True):
-                if len(new_accepted) >= config.stop_after_accepted:
-                    break
-                payload = build_teacher_payload(row, response)
-                if payload["validation"]["ok"]:
-                    new_accepted.append(payload)
-                else:
-                    new_rejected.append(payload)
-                consumed += 1
-
-            new_processed = submitted_start + consumed
-            manifest = _manifest(
-                config=config,
-                accepted=new_accepted,
-                rejected=new_rejected,
-                source_sha256=source_hash,
-                generation_contract=contract,
-                created_at=state.created_at,
-                updated_at=clock.next(),
-            )
-            store.commit(
-                batch_id=batch_id,
-                submitted_start=submitted_start,
-                submitted_stop=new_processed,
-                accepted=new_accepted,
-                rejected=new_rejected,
-                manifest=manifest,
-            )
-            accepted = new_accepted
-            rejected = new_rejected
-            processed = new_processed
-            LOGGER.info(
-                "committed batch=%s processed=%s accepted=%s rejected=%s",
-                batch_id,
-                processed,
-                len(accepted),
-                len(rejected),
-            )
-            batch_id += 1
-
-        if len(accepted) == config.stop_after_accepted:
-            return 0
-        LOGGER.error(
-            "source exhausted: accepted=%s target=%s",
-            len(accepted),
-            config.stop_after_accepted,
-        )
-        return 2
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
+        primary = exc
+        result = 130
         LOGGER.error("teacher generation interrupted")
+    except BaseException as exc:
+        primary = exc
+
+    cleanup_errors = _cleanup_resources(resources["engine"], lock)
+    if isinstance(primary, KeyboardInterrupt):
+        for cleanup_error in cleanup_errors:
+            primary.add_note(f"cleanup failed: {cleanup_error}")
+            LOGGER.error("cleanup failed after interrupt: %s", cleanup_error)
         return 130
-    finally:
-        try:
-            if engine is not None:
-                try:
-                    engine.close()
-                finally:
-                    LOGGER.info("workers closed")
-        finally:
-            lock.release()
+    if primary is not None:
+        if cleanup_errors:
+            cleanup_failure = _cleanup_failure(cleanup_errors)
+            primary.add_note(f"cleanup failed: {cleanup_failure}")
+            raise primary.with_traceback(primary.__traceback__) from cleanup_failure
+        raise primary.with_traceback(primary.__traceback__)
+    if cleanup_errors:
+        raise _cleanup_failure(cleanup_errors)
+    assert result is not None
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:

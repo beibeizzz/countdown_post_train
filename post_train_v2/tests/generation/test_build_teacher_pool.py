@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
+import logging
 import os
 import subprocess
 import sys
@@ -12,14 +14,16 @@ from pathlib import Path
 import pytest
 
 from post_train.src.countdown.config import load_yaml_config
-from post_train.src.countdown.io import write_jsonl
+from post_train.src.countdown.io import read_jsonl, write_jsonl
 from post_train_v2.src.generation.teacher_state import (
     ResumeState,
     TeacherGenerationConfig,
+    TeacherStateStore,
 )
 from post_train_v2.scripts.generation.build_teacher_pool import (
     PRODUCTION_CONFIG,
     SMOKE_CONFIG,
+    _parse_jsonl_bytes,
     build_teacher_payload,
     load_teacher_config,
     run,
@@ -190,6 +194,24 @@ def test_validate_source_rows_rejects_malformed_rows(rows, match: str) -> None:
         validate_source_rows(rows)
 
 
+def test_local_jsonl_parser_matches_file_iteration_for_unicode_separator(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source.jsonl"
+    data = (
+        '{"id":"a\u2028b","numbers":[1,2],"target":3,"prompt":"solve"}\n'
+    ).encode("utf-8")
+
+    assert _parse_jsonl_bytes(data, path) == [
+        {
+            "id": "a\u2028b",
+            "numbers": [1, 2],
+            "target": 3,
+            "prompt": "solve",
+        }
+    ]
+
+
 def test_payload_retains_full_stripped_response_and_validation() -> None:
     payload = build_teacher_payload(
         source_row(numbers=[7, 3, 8, 2], target=24),
@@ -208,9 +230,17 @@ def test_payload_retains_full_stripped_response_and_validation() -> None:
 
 
 class FakeLock:
-    def __init__(self, events: list, **kwargs) -> None:
+    def __init__(
+        self,
+        events: list,
+        *,
+        release_error: BaseException | None = None,
+        **kwargs,
+    ) -> None:
         self.events = events
         self.kwargs = kwargs
+        self.path = kwargs.get("path", Path("fake.lock"))
+        self.release_error = release_error
         self.released = False
 
     def acquire(self, recover_stale: bool = False) -> None:
@@ -219,6 +249,8 @@ class FakeLock:
     def release(self) -> None:
         self.released = True
         self.events.append(("lock.release",))
+        if self.release_error is not None:
+            raise self.release_error
 
 
 class FakeStore:
@@ -228,16 +260,24 @@ class FakeStore:
         state: ResumeState,
         *,
         commit_error: Exception | None = None,
-        state_exists: bool = False,
+        has_v2_manifest: bool = False,
+        load_hook=None,
     ) -> None:
         self.events = events
         self.state = state
         self.commit_error = commit_error
-        self.state_exists = state_exists
+        self._has_v2_manifest = has_v2_manifest
+        self.load_hook = load_hook
         self.commits: list[dict] = []
+
+    def has_v2_manifest(self) -> bool:
+        self.events.append(("store.has_v2_manifest",))
+        return self._has_v2_manifest
 
     def load_resume_state(self, rows, config, adopt_legacy_state=False):
         self.events.append(("store.load", adopt_legacy_state))
+        if self.load_hook is not None:
+            self.load_hook()
         return self.state
 
     def commit(self, **kwargs) -> None:
@@ -245,16 +285,25 @@ class FakeStore:
         if self.commit_error is not None:
             raise self.commit_error
         self.commits.append(kwargs)
-        self.state_exists = True
+        self._has_v2_manifest = True
 
 
 class FakeEngine:
-    def __init__(self, events: list, responses, *, generate_error=None) -> None:
+    def __init__(
+        self,
+        events: list,
+        responses,
+        *,
+        generate_error=None,
+        close_error: BaseException | None = None,
+    ) -> None:
         self.events = events
         self.responses = list(responses)
         self.generate_error = generate_error
+        self.close_error = close_error
         self.calls: list[tuple[int, tuple]] = []
         self.closed = False
+        self.worker_exitcodes = (0, 0)
 
     def start(self):
         self.events.append(("engine.start",))
@@ -271,6 +320,29 @@ class FakeEngine:
     def close(self) -> None:
         self.closed = True
         self.events.append(("engine.close",))
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class RecordingTeacherStateStore(TeacherStateStore):
+    def __init__(self, output_dir: Path) -> None:
+        super().__init__(output_dir)
+        self.commit_calls: list[dict] = []
+
+    def commit(self, **kwargs) -> None:
+        self.commit_calls.append(kwargs)
+        super().commit(**kwargs)
+
+
+def write_legacy_outputs(
+    config: TeacherGenerationConfig,
+    accepted: list[dict],
+    rejected: list[dict],
+) -> RecordingTeacherStateStore:
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    write_jsonl(config.output_dir / "teacher_accepted_20k.jsonl", accepted)
+    write_jsonl(config.output_dir / "teacher_rejected.jsonl", rejected)
+    return RecordingTeacherStateStore(config.output_dir)
 
 
 def run_with_fakes(
@@ -280,7 +352,7 @@ def run_with_fakes(
     *,
     target: int = 2,
     state: ResumeState | None = None,
-    state_exists: bool = False,
+    has_v2_manifest: bool = False,
     engine_error: BaseException | None = None,
     commit_error: Exception | None = None,
     recover_stale: bool = False,
@@ -296,7 +368,7 @@ def run_with_fakes(
         events,
         state,
         commit_error=commit_error,
-        state_exists=state_exists,
+        has_v2_manifest=has_v2_manifest,
     )
     lock_holder = {}
     engine_holder = {}
@@ -328,6 +400,209 @@ def run_with_fakes(
         cuda_visible_devices=None,
     )
     return result, store, lock_holder, engine_holder, engine_kwargs, events
+
+
+def test_adopted_nonempty_state_materializes_v2_then_continues_with_batch_gt_zero(
+    tmp_path: Path,
+) -> None:
+    rows = [source_row("a"), source_row("b")]
+    config = make_config(tmp_path, stop_after_accepted=2)
+    write_jsonl(config.input_path, rows)
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    accepted = [build_teacher_payload(rows[0], "<answer>1+2</answer>")]
+    store = write_legacy_outputs(config, accepted, [])
+    engine = FakeEngine([], [[(1, "<answer>1+2</answer>")]])
+
+    code = run(
+        config_path,
+        adopt_legacy_state=True,
+        engine_factory=lambda **kwargs: engine,
+        state_store_factory=lambda output_dir: store,
+        now=lambda: datetime(2026, 6, 14, tzinfo=timezone.utc),
+        cuda_visible_devices=None,
+    )
+
+    assert code == 0
+    assert [(call["batch_id"], call["submitted_start"], call["submitted_stop"]) for call in store.commit_calls] == [
+        (0, 1, 1),
+        (1, 1, 2),
+    ]
+    assert store.has_v2_manifest() is True
+    assert [row["id"] for row in read_jsonl(store.accepted_path)] == ["a", "b"]
+
+
+def test_adopted_already_complete_state_gets_v2_manifest_without_engine(
+    tmp_path: Path,
+) -> None:
+    row = source_row("a")
+    config = make_config(tmp_path, stop_after_accepted=1)
+    write_jsonl(config.input_path, [row])
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    store = write_legacy_outputs(
+        config,
+        [build_teacher_payload(row, "<answer>1+2</answer>")],
+        [],
+    )
+    constructed = []
+
+    assert run(
+        config_path,
+        adopt_legacy_state=True,
+        engine_factory=lambda **kwargs: constructed.append(kwargs),
+        state_store_factory=lambda output_dir: store,
+        now=lambda: datetime(2026, 6, 14, tzinfo=timezone.utc),
+        cuda_visible_devices=None,
+    ) == 0
+
+    assert constructed == []
+    assert len(store.commit_calls) == 1
+    assert store.commit_calls[0]["batch_id"] == 0
+    assert store.commit_calls[0]["submitted_start"] == 1
+    assert store.commit_calls[0]["manifest"]["completed"] is True
+    assert store.has_v2_manifest() is True
+
+
+def test_adopted_exhausted_state_gets_incomplete_v2_manifest(
+    tmp_path: Path,
+) -> None:
+    rows = [source_row("a"), source_row("b", target=99)]
+    config = make_config(tmp_path, stop_after_accepted=2)
+    write_jsonl(config.input_path, rows)
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    store = write_legacy_outputs(
+        config,
+        [build_teacher_payload(rows[0], "<answer>1+2</answer>")],
+        [build_teacher_payload(rows[1], "")],
+    )
+
+    assert run(
+        config_path,
+        adopt_legacy_state=True,
+        engine_factory=lambda **kwargs: pytest.fail("engine constructed"),
+        state_store_factory=lambda output_dir: store,
+        now=lambda: datetime(2026, 6, 14, tzinfo=timezone.utc),
+        cuda_visible_devices=None,
+    ) == 2
+
+    assert len(store.commit_calls) == 1
+    assert store.commit_calls[0]["submitted_start"] == 2
+    assert store.commit_calls[0]["submitted_stop"] == 2
+    assert store.commit_calls[0]["manifest"]["completed"] is False
+    assert store.has_v2_manifest() is True
+
+
+def test_preexisting_empty_snapshots_get_v2_manifest_before_exhaustion_return(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path, stop_after_accepted=1)
+    config.input_path.write_bytes(b"")
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    store = write_legacy_outputs(config, [], [])
+
+    assert run(
+        config_path,
+        engine_factory=lambda **kwargs: pytest.fail("engine constructed"),
+        state_store_factory=lambda output_dir: store,
+        now=lambda: datetime(2026, 6, 14, tzinfo=timezone.utc),
+        cuda_visible_devices=None,
+    ) == 2
+
+    assert len(store.commit_calls) == 1
+    assert store.commit_calls[0]["batch_id"] == 0
+    assert store.commit_calls[0]["submitted_start"] == 0
+    assert store.has_v2_manifest() is True
+
+
+def test_source_hash_uses_exact_bytes_parsed_under_lock(tmp_path: Path) -> None:
+    row = source_row("a")
+    source_bytes = (
+        json.dumps(row, separators=(", ", ": ")).encode("utf-8") + b"\r\n"
+    )
+    config = make_config(tmp_path, stop_after_accepted=1)
+    config.input_path.write_bytes(source_bytes)
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    store = write_legacy_outputs(
+        config,
+        [build_teacher_payload(row, "<answer>1+2</answer>")],
+        [],
+    )
+
+    assert run(
+        config_path,
+        adopt_legacy_state=True,
+        engine_factory=lambda **kwargs: pytest.fail("engine constructed"),
+        state_store_factory=lambda output_dir: store,
+        now=lambda: datetime(2026, 6, 14, tzinfo=timezone.utc),
+        cuda_visible_devices=None,
+    ) == 0
+
+    manifest = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["source_sha256"] == hashlib.sha256(source_bytes).hexdigest()
+
+
+def test_source_mutation_during_state_load_fails_before_engine(tmp_path: Path) -> None:
+    rows = [source_row("a")]
+    config = make_config(tmp_path)
+    write_jsonl(config.input_path, rows)
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    events: list = []
+    store = FakeStore(
+        events,
+        ResumeState((), (), 0, None, "2026-06-14T00:00:00+00:00"),
+        has_v2_manifest=True,
+        load_hook=lambda: write_jsonl(config.input_path, [source_row("changed")]),
+    )
+    constructed = []
+
+    with pytest.raises(ValueError, match="source.*changed"):
+        run(
+            config_path,
+            engine_factory=lambda **kwargs: constructed.append(kwargs),
+            state_store_factory=lambda output_dir: store,
+            lock_factory=lambda **kwargs: FakeLock(events, **kwargs),
+            cuda_visible_devices=None,
+        )
+
+    assert constructed == []
+
+
+def test_source_mutation_immediately_before_state_load_fails_before_engine(
+    tmp_path: Path,
+) -> None:
+    rows = [source_row("a")]
+    config = make_config(tmp_path)
+    write_jsonl(config.input_path, rows)
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    events: list = []
+    store = FakeStore(
+        events,
+        ResumeState((), (), 0, None, "2026-06-14T00:00:00+00:00"),
+        has_v2_manifest=True,
+    )
+    constructed = []
+
+    def store_factory(output_dir):
+        write_jsonl(config.input_path, [source_row("b")])
+        return store
+
+    with pytest.raises(ValueError, match="source.*changed"):
+        run(
+            config_path,
+            engine_factory=lambda **kwargs: constructed.append(kwargs),
+            state_store_factory=store_factory,
+            lock_factory=lambda **kwargs: FakeLock(events, **kwargs),
+            cuda_visible_devices=None,
+        )
+
+    assert constructed == []
+    assert ("store.load", False) not in events
 
 
 def test_coordinator_orders_payloads_stops_exactly_midbatch_and_commits_once(
@@ -416,7 +691,7 @@ def test_resume_batch_id_is_nonzero_and_derived_after_committed_position(
         [positioned],
         target=9,
         state=state,
-        state_exists=True,
+        has_v2_manifest=True,
     )
 
     assert code == 2
@@ -453,7 +728,7 @@ def test_already_complete_does_not_construct_engine(tmp_path: Path) -> None:
     )
 
     code, store, _, engine_holder, _, _ = run_with_fakes(
-        tmp_path, [row], [], target=1, state=state, state_exists=False
+        tmp_path, [row], [], target=1, state=state, has_v2_manifest=True
     )
 
     assert code == 0
@@ -476,10 +751,43 @@ def test_failure_does_not_commit_current_batch_and_closes_engine(
             [source_row()],
             [[(0, "")]],
             target=2,
-            state_exists=commit_error is not None,
+            has_v2_manifest=commit_error is not None,
             engine_error=engine_error,
             commit_error=commit_error,
         )
+
+
+def test_engine_failure_preserves_commit_count_and_closes_engine(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path, stop_after_accepted=2)
+    write_jsonl(config.input_path, [source_row()])
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    events: list = []
+    store = FakeStore(
+        events,
+        ResumeState((), (), 0, None, "2026-06-14T00:00:00+00:00"),
+        has_v2_manifest=True,
+    )
+    engine = FakeEngine(
+        events,
+        [],
+        generate_error=RuntimeError("worker failed"),
+    )
+    commits_before = len(store.commits)
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        run(
+            config_path,
+            engine_factory=lambda **kwargs: engine,
+            state_store_factory=lambda output_dir: store,
+            lock_factory=lambda **kwargs: FakeLock(events, **kwargs),
+            cuda_visible_devices=None,
+        )
+
+    assert len(store.commits) == commits_before
+    assert engine.closed is True
 
 
 def test_persistence_failure_after_generation_closes_engine(tmp_path: Path) -> None:
@@ -492,7 +800,7 @@ def test_persistence_failure_after_generation_closes_engine(tmp_path: Path) -> N
         events,
         ResumeState((), (), 0, None, "2026-06-14T00:00:00+00:00"),
         commit_error=OSError("disk failed"),
-        state_exists=True,
+        has_v2_manifest=True,
     )
     engine = FakeEngine(events, [[(0, "")]])
 
@@ -509,28 +817,37 @@ def test_persistence_failure_after_generation_closes_engine(tmp_path: Path) -> N
     assert engine.closed is True
 
 
-def test_engine_close_failure_still_releases_owned_lock(tmp_path: Path) -> None:
+def cleanup_case(
+    tmp_path: Path,
+    *,
+    generate_error: BaseException | None = None,
+    close_error: BaseException | None = None,
+    release_error: BaseException | None = None,
+):
     config = make_config(tmp_path, stop_after_accepted=1)
     write_jsonl(config.input_path, [source_row()])
     config_path = tmp_path / "config.yaml"
     write_config(config_path, config)
     events: list = []
-    lock = FakeLock(events, path=Path("unused"))
+    lock = FakeLock(
+        events,
+        path=Path("unused"),
+        release_error=release_error,
+    )
     store = FakeStore(
         events,
         ResumeState((), (), 0, None, "2026-06-14T00:00:00+00:00"),
-        state_exists=True,
+        has_v2_manifest=True,
+    )
+    engine = FakeEngine(
+        events,
+        [[(0, "<answer>1+2</answer>")]],
+        generate_error=generate_error,
+        close_error=close_error,
     )
 
-    class CloseFailureEngine(FakeEngine):
-        def close(self) -> None:
-            super().close()
-            raise RuntimeError("close failed")
-
-    engine = CloseFailureEngine(events, [[(0, "<answer>1+2</answer>")]])
-
-    with pytest.raises(RuntimeError, match="close failed"):
-        run(
+    def invoke():
+        return run(
             config_path,
             engine_factory=lambda **kwargs: engine,
             state_store_factory=lambda output_dir: store,
@@ -538,7 +855,104 @@ def test_engine_close_failure_still_releases_owned_lock(tmp_path: Path) -> None:
             now=lambda: datetime(2026, 6, 14, tzinfo=timezone.utc),
             cuda_visible_devices=None,
         )
+    return invoke, engine, lock, store, events
 
+
+def test_engine_close_failure_without_primary_propagates_and_releases_lock(
+    tmp_path: Path,
+) -> None:
+    invoke, engine, lock, _, _ = cleanup_case(
+        tmp_path,
+        close_error=RuntimeError("close failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        invoke()
+
+    assert engine.closed is True
+    assert lock.released is True
+
+
+def test_lock_release_failure_without_primary_propagates_after_engine_close(
+    tmp_path: Path,
+) -> None:
+    invoke, engine, lock, _, _ = cleanup_case(
+        tmp_path,
+        release_error=RuntimeError("release failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="release failed"):
+        invoke()
+
+    assert engine.closed is True
+    assert lock.released is True
+
+
+def test_both_cleanup_failures_without_primary_raise_exception_group(
+    tmp_path: Path,
+) -> None:
+    invoke, engine, lock, _, _ = cleanup_case(
+        tmp_path,
+        close_error=RuntimeError("close failed"),
+        release_error=RuntimeError("release failed"),
+    )
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        invoke()
+
+    assert {str(error) for error in exc_info.value.exceptions} == {
+        "close failed",
+        "release failed",
+    }
+    assert engine.closed is True
+    assert lock.released is True
+
+
+def test_primary_failure_is_preserved_with_both_cleanup_failures(
+    tmp_path: Path,
+) -> None:
+    invoke, engine, lock, store, _ = cleanup_case(
+        tmp_path,
+        generate_error=RuntimeError("worker failed"),
+        close_error=RuntimeError("close failed"),
+        release_error=RuntimeError("release failed"),
+    )
+    commits_before = len(store.commits)
+
+    with pytest.raises(RuntimeError, match="worker failed") as exc_info:
+        invoke()
+
+    assert isinstance(exc_info.value.__cause__, ExceptionGroup)
+    assert len(store.commits) == commits_before
+    assert engine.closed is True
+    assert lock.released is True
+
+
+@pytest.mark.parametrize(
+    ("close_error", "release_error", "cleanup_message"),
+    (
+        (RuntimeError("close failed"), None, "close failed"),
+        (None, RuntimeError("release failed"), "release failed"),
+    ),
+)
+def test_primary_failure_is_preserved_with_each_cleanup_failure(
+    tmp_path: Path,
+    close_error: BaseException | None,
+    release_error: BaseException | None,
+    cleanup_message: str,
+) -> None:
+    invoke, engine, lock, _, _ = cleanup_case(
+        tmp_path,
+        generate_error=RuntimeError("worker failed"),
+        close_error=close_error,
+        release_error=release_error,
+    )
+
+    with pytest.raises(RuntimeError, match="worker failed") as exc_info:
+        invoke()
+
+    assert str(exc_info.value.__cause__) == cleanup_message
+    assert engine.closed is True
     assert lock.released is True
 
 
@@ -559,23 +973,97 @@ def test_keyboard_interrupt_returns_130_closes_engine_and_releases_lock(
     assert lock_holder["lock"].released is True
 
 
-def test_source_schema_failure_happens_before_engine_or_output_lock(
+def test_keyboard_interrupt_keeps_130_when_both_cleanup_steps_fail(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    invoke, engine, lock, _, _ = cleanup_case(
+        tmp_path,
+        generate_error=KeyboardInterrupt(),
+        close_error=RuntimeError("close failed"),
+        release_error=RuntimeError("release failed"),
+    )
+
+    with caplog.at_level(logging.ERROR):
+        assert invoke() == 130
+
+    assert engine.closed is True
+    assert lock.released is True
+    assert "close failed" in caplog.text
+    assert "release failed" in caplog.text
+    assert "workers closed" not in caplog.text
+
+
+def test_logs_lifecycle_shards_latency_counts_and_exitcodes(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rows = [source_row("a"), source_row("b")]
+    config = make_config(tmp_path, stop_after_accepted=2)
+    write_jsonl(config.input_path, rows)
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    events: list = []
+    store = FakeStore(
+        events,
+        ResumeState((), (), 0, None, "2026-06-14T00:00:00+00:00"),
+    )
+    engine = FakeEngine(
+        events,
+        [[(0, "<answer>1+2</answer>"), (1, "<answer>1+2</answer>")]],
+    )
+    ticks = iter((10.0, 10.125))
+
+    with caplog.at_level(logging.INFO):
+        code = run(
+            config_path,
+            recover_stale_lock=True,
+            engine_factory=lambda **kwargs: engine,
+            state_store_factory=lambda output_dir: store,
+            lock_factory=lambda **kwargs: FakeLock(events, **kwargs),
+            now=lambda: datetime(2026, 6, 14, tzinfo=timezone.utc),
+            monotonic=lambda: next(ticks),
+            cuda_visible_devices=None,
+        )
+
+    assert code == 0
+    messages = caplog.text
+    assert "stale lock recovery requested" in messages
+    assert "acquiring output lock" in messages
+    assert "output lock acquired" in messages
+    assert "source rows=2" in messages
+    assert "resume processed=0 accepted=0 rejected=0" in messages
+    assert "engine starting" in messages
+    assert "engine ready" in messages
+    assert "batch=1 global_range=[0,2)" in messages
+    assert "worker0_shard=1 worker1_shard=1 latency_seconds=0.125" in messages
+    assert "accepted=2 rejected=0" in messages
+    assert "workers closed" in messages
+    assert "worker exitcodes=(0, 0)" in messages
+    assert "stale lock recovered" not in messages
+    assert "<answer>" not in messages
+
+
+def test_source_schema_failure_under_lock_happens_before_engine(
     tmp_path: Path,
 ) -> None:
     config = make_config(tmp_path)
     write_jsonl(config.input_path, [source_row(prompt="")])
     config_path = tmp_path / "config.yaml"
     write_config(config_path, config)
-    constructed = []
+    events: list = []
+    engine_constructed = []
+    lock = FakeLock(events, path=config.output_dir / ".teacher_pool.lock")
 
     with pytest.raises(ValueError, match="prompt"):
         run(
             config_path,
-            engine_factory=lambda **kwargs: constructed.append(kwargs),
-            lock_factory=lambda **kwargs: constructed.append(kwargs),
+            engine_factory=lambda **kwargs: engine_constructed.append(kwargs),
+            lock_factory=lambda **kwargs: lock,
             cuda_visible_devices=None,
         )
-    assert constructed == []
+    assert engine_constructed == []
+    assert events == [("lock.acquire", False), ("lock.release",)]
 
 
 def test_initial_real_store_commit_materializes_empty_contract(tmp_path: Path) -> None:
