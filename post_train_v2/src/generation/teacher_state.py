@@ -409,6 +409,15 @@ def _jsonl_suffix_bytes(rows: Iterable[dict[str, Any]]) -> bytes:
     )
 
 
+def _project_jsonl_bytes(rows: Iterable[dict[str, Any]]) -> bytes:
+    return b"".join(
+        (
+            json.dumps(row, ensure_ascii=False) + os.linesep
+        ).encode("utf-8")
+        for row in rows
+    )
+
+
 def _rows_from_jsonl_bytes(data: bytes, *, label: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     try:
@@ -692,6 +701,16 @@ class TeacherStateStore:
         self._fsync_file = fsync_file
         self._fsync_directory = fsync_directory
 
+    def has_v2_manifest(self) -> bool:
+        if not self.manifest_path.exists():
+            return False
+        try:
+            manifest = _read_json(self.manifest_path)
+        except ValueError:
+            return False
+        fingerprint = manifest.get("generation_contract_fingerprint")
+        return isinstance(fingerprint, str) and bool(fingerprint.strip())
+
     def load_resume_state(
         self,
         source_rows: list[dict[str, Any]],
@@ -875,10 +894,32 @@ class TeacherStateStore:
         snapshots_exist = accepted_pre["existed"] or rejected_pre["existed"]
         if manifest_pre is None:
             if snapshots_exist:
-                raise ValueError(
-                    "existing output snapshots require an exact V2 manifest"
+                self._validate_manifest_initialization(
+                    batch_id=batch_id,
+                    submitted_start=submitted_start,
+                    submitted_stop=submitted_stop,
+                    accepted=accepted,
+                    rejected=rejected,
+                    manifest=manifest,
+                    accepted_snapshot=accepted_pre,
+                    rejected_snapshot=rejected_pre,
                 )
-            previous_count = 0
+                previous_count = (
+                    accepted_pre["row_count"] + rejected_pre["row_count"]
+                )
+            else:
+                if (
+                    batch_id != 0
+                    or submitted_start != 0
+                    or submitted_stop != 0
+                    or accepted
+                    or rejected
+                ):
+                    raise ValueError(
+                        "initial commit without snapshots must be empty "
+                        "batch 0 range [0,0)"
+                    )
+                previous_count = 0
         else:
             _validate_prior_committed_state(
                 manifest_pre,
@@ -1318,6 +1359,53 @@ class TeacherStateStore:
                 "immutable generation transition rejected: "
                 + ", ".join(changed)
             )
+
+    def _validate_manifest_initialization(
+        self,
+        *,
+        batch_id: int,
+        submitted_start: int,
+        submitted_stop: int,
+        accepted: list[dict[str, Any]],
+        rejected: list[dict[str, Any]],
+        manifest: dict[str, Any],
+        accepted_snapshot: dict[str, Any],
+        rejected_snapshot: dict[str, Any],
+    ) -> None:
+        if not accepted_snapshot["existed"] or not rejected_snapshot["existed"]:
+            raise ValueError(
+                "manifest initialization requires both existing snapshots"
+            )
+        if batch_id != 0:
+            raise ValueError("manifest initialization requires batch_id 0")
+        if submitted_start != submitted_stop:
+            raise ValueError(
+                "manifest initialization requires a zero-length range"
+            )
+        previous_count = (
+            accepted_snapshot["row_count"] + rejected_snapshot["row_count"]
+        )
+        if submitted_start != previous_count:
+            raise ValueError(
+                "manifest initialization range must equal existing snapshot "
+                "row count"
+            )
+
+        supplied_bytes = (
+            ("accepted", _project_jsonl_bytes(accepted), accepted_snapshot),
+            ("rejected", _project_jsonl_bytes(rejected), rejected_snapshot),
+        )
+        for label, serialized, snapshot in supplied_bytes:
+            if serialized != snapshot["bytes"]:
+                raise ValueError(
+                    f"supplied {label} rows must match existing snapshot "
+                    "byte-for-byte"
+                )
+            hash_field = f"{label}_sha256"
+            if manifest[hash_field] != snapshot["sha256"]:
+                raise ValueError(
+                    f"manifest {hash_field} must match existing snapshot bytes"
+                )
 
     def _validate_journal(self, journal: dict[str, Any]) -> None:
         if set(journal) != JOURNAL_KEYS:

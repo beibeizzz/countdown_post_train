@@ -613,6 +613,24 @@ def manifest_for_rows(
     )
 
 
+def manifest_for_existing_snapshots(
+    store: TeacherStateStore,
+    config: TeacherGenerationConfig,
+    accepted: list[dict],
+    rejected: list[dict],
+) -> dict:
+    manifest = manifest_for_rows(
+        config,
+        accepted,
+        rejected,
+        created_at="2026-06-13T00:00:00+00:00",
+        updated_at="2026-06-13T00:00:01+00:00",
+    )
+    manifest["accepted_sha256"] = sha256_file(store.accepted_path)
+    manifest["rejected_sha256"] = sha256_file(store.rejected_path)
+    return manifest
+
+
 def commit_rows(
     store: TeacherStateStore,
     config: TeacherGenerationConfig,
@@ -629,6 +647,27 @@ def commit_rows(
             datetime(2026, 6, 13, 1, tzinfo=timezone.utc)
             + timedelta(seconds=batch_id)
         ).isoformat()
+    if (
+        not store.manifest_path.exists()
+        and not store.accepted_path.exists()
+        and not store.rejected_path.exists()
+        and (accepted or rejected)
+    ):
+        initial_manifest = manifest_for_rows(
+            config,
+            [],
+            [],
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        store.commit(
+            batch_id=0,
+            submitted_start=0,
+            submitted_stop=0,
+            accepted=[],
+            rejected=[],
+            manifest=initial_manifest,
+        )
     manifest = manifest_for_rows(
         config,
         accepted,
@@ -706,6 +745,227 @@ def test_initial_commit_allows_updated_at_equal_created_at(tmp_path: Path) -> No
     assert read_json(store.manifest_path)["updated_at"] == timestamp
 
 
+def test_has_v2_manifest_requires_nonempty_fingerprint(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    store = TeacherStateStore(config.output_dir)
+
+    assert store.has_v2_manifest() is False
+
+    config.output_dir.mkdir()
+    store.manifest_path.write_text(
+        json.dumps({"generation_contract_fingerprint": ""}) + "\n",
+        encoding="utf-8",
+    )
+    assert store.has_v2_manifest() is False
+
+    store.manifest_path.write_text(
+        json.dumps({"generation_contract_fingerprint": "fingerprint"}) + "\n",
+        encoding="utf-8",
+    )
+    assert store.has_v2_manifest() is True
+
+
+@pytest.mark.parametrize(
+    ("accepted", "rejected", "target"),
+    (
+        (
+            [accepted_row("a", [1, 2], 3)],
+            [rejected_row("b", [2, 2], 4)],
+            1,
+        ),
+        (
+            [accepted_row("a", [1, 2], 3)],
+            [
+                rejected_row("b", [2, 2], 4),
+                rejected_row("c", [3, 2], 5),
+                rejected_row("d", [4, 2], 6),
+            ],
+            10,
+        ),
+    ),
+)
+def test_commit_materializes_manifest_over_nonempty_legacy_snapshots(
+    tmp_path: Path,
+    accepted: list[dict],
+    rejected: list[dict],
+    target: int,
+) -> None:
+    config = make_config(tmp_path, stop_after_accepted=target)
+    store = write_legacy_state(config, accepted, rejected)
+    accepted_bytes = store.accepted_path.read_bytes()
+    rejected_bytes = store.rejected_path.read_bytes()
+    manifest = manifest_for_existing_snapshots(
+        store,
+        config,
+        accepted,
+        rejected,
+    )
+    processed = len(accepted) + len(rejected)
+
+    store.commit(
+        batch_id=0,
+        submitted_start=processed,
+        submitted_stop=processed,
+        accepted=accepted,
+        rejected=rejected,
+        manifest=manifest,
+    )
+
+    assert store.accepted_path.read_bytes() == accepted_bytes
+    assert store.rejected_path.read_bytes() == rejected_bytes
+    assert read_json(store.manifest_path) == manifest
+    assert store.has_v2_manifest() is True
+    assert not store.transaction_path.exists()
+
+
+def test_commit_materializes_manifest_over_preexisting_empty_snapshots(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    store = write_legacy_state(config, [], [])
+    manifest = manifest_for_existing_snapshots(store, config, [], [])
+
+    store.commit(
+        batch_id=0,
+        submitted_start=0,
+        submitted_stop=0,
+        accepted=[],
+        rejected=[],
+        manifest=manifest,
+    )
+
+    assert store.accepted_path.read_bytes() == b""
+    assert store.rejected_path.read_bytes() == b""
+    assert read_json(store.manifest_path) == manifest
+
+
+def test_snapshot_materialization_rejects_changed_rows_before_journal(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    accepted = [accepted_row("a", [1, 2], 3)]
+    rejected = [rejected_row("b", [2, 2], 4)]
+    store = write_legacy_state(config, accepted, rejected)
+    changed_accepted = [{**accepted[0], "response": "<answer>2+1</answer>"}]
+    manifest = manifest_for_rows(
+        config,
+        changed_accepted,
+        rejected,
+        created_at="2026-06-13T00:00:00+00:00",
+        updated_at="2026-06-13T00:00:01+00:00",
+    )
+
+    with pytest.raises(ValueError, match="byte-for-byte"):
+        store.commit(
+            batch_id=0,
+            submitted_start=2,
+            submitted_stop=2,
+            accepted=changed_accepted,
+            rejected=rejected,
+            manifest=manifest,
+        )
+
+    assert not store.transaction_path.exists()
+    assert not store.manifest_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("batch_id", "start", "stop", "match"),
+    (
+        (1, 2, 2, "batch_id"),
+        (0, 1, 2, "zero-length"),
+    ),
+)
+def test_snapshot_materialization_rejects_wrong_batch_or_range_before_journal(
+    tmp_path: Path,
+    batch_id: int,
+    start: int,
+    stop: int,
+    match: str,
+) -> None:
+    config = make_config(tmp_path)
+    accepted = [accepted_row("a", [1, 2], 3)]
+    rejected = [rejected_row("b", [2, 2], 4)]
+    store = write_legacy_state(config, accepted, rejected)
+    manifest = manifest_for_existing_snapshots(
+        store,
+        config,
+        accepted,
+        rejected,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        store.commit(
+            batch_id=batch_id,
+            submitted_start=start,
+            submitted_stop=stop,
+            accepted=accepted,
+            rejected=rejected,
+            manifest=manifest,
+        )
+
+    assert not store.transaction_path.exists()
+    assert not store.manifest_path.exists()
+
+
+def test_snapshot_materialization_rejects_wrong_existing_count_before_journal(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    accepted = [accepted_row("a", [1, 2], 3)]
+    rejected = [rejected_row("b", [2, 2], 4)]
+    store = write_legacy_state(config, accepted, rejected)
+    supplied_rejected: list[dict] = []
+    manifest = manifest_for_rows(
+        config,
+        accepted,
+        supplied_rejected,
+        created_at="2026-06-13T00:00:00+00:00",
+        updated_at="2026-06-13T00:00:01+00:00",
+    )
+
+    with pytest.raises(ValueError, match="existing snapshot row count"):
+        store.commit(
+            batch_id=0,
+            submitted_start=1,
+            submitted_stop=1,
+            accepted=accepted,
+            rejected=supplied_rejected,
+            manifest=manifest,
+        )
+
+    assert not store.transaction_path.exists()
+    assert not store.manifest_path.exists()
+
+
+def test_no_manifest_commit_cannot_add_rows_to_absent_snapshots(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    store = TeacherStateStore(config.output_dir)
+    accepted = [accepted_row("a", [1, 2], 3)]
+    manifest = manifest_for_rows(
+        config,
+        accepted,
+        [],
+        created_at="2026-06-13T00:00:00+00:00",
+        updated_at="2026-06-13T00:00:01+00:00",
+    )
+
+    with pytest.raises(ValueError, match="initial commit.*empty"):
+        store.commit(
+            batch_id=0,
+            submitted_start=0,
+            submitted_stop=1,
+            accepted=accepted,
+            rejected=[],
+            manifest=manifest,
+        )
+
+    assert not store.transaction_path.exists()
+    assert not store.manifest_path.exists()
+
+
 class FailAfterDestination:
     def __init__(self, destination: Path) -> None:
         self.destination = destination
@@ -716,6 +976,44 @@ class FailAfterDestination:
         if Path(destination) == self.destination and not self.failed:
             self.failed = True
             raise OSError(f"injected failure after {self.destination.name}")
+
+
+def test_failed_snapshot_materialization_recovers_exact_files_and_no_manifest(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    accepted = [accepted_row("a", [1, 2], 3)]
+    rejected = [rejected_row("b", [2, 2], 4)]
+    initial_store = write_legacy_state(config, accepted, rejected)
+    accepted_bytes = initial_store.accepted_path.read_bytes()
+    rejected_bytes = initial_store.rejected_path.read_bytes()
+    manifest = manifest_for_existing_snapshots(
+        initial_store,
+        config,
+        accepted,
+        rejected,
+    )
+    failing_store = TeacherStateStore(
+        config.output_dir,
+        replace_file=FailAfterDestination(initial_store.rejected_path),
+    )
+
+    with pytest.raises(OSError, match="injected failure"):
+        failing_store.commit(
+            batch_id=0,
+            submitted_start=2,
+            submitted_stop=2,
+            accepted=accepted,
+            rejected=rejected,
+            manifest=manifest,
+        )
+
+    assert failing_store.transaction_path.exists()
+    TeacherStateStore(config.output_dir).recover_transaction()
+    assert initial_store.accepted_path.read_bytes() == accepted_bytes
+    assert initial_store.rejected_path.read_bytes() == rejected_bytes
+    assert not initial_store.manifest_path.exists()
+    assert not initial_store.transaction_path.exists()
 
 
 @pytest.mark.parametrize(
@@ -781,16 +1079,22 @@ def test_recovery_restores_all_absent_pre_state(tmp_path: Path) -> None:
         config.output_dir,
         replace_file=FailAfterDestination(config.output_dir / ACCEPTED_NAME),
     )
-    accepted = [accepted_row("a", [1, 2], 3)]
+    manifest = manifest_for_rows(
+        config,
+        [],
+        [],
+        created_at="2026-06-13T00:00:00+00:00",
+        updated_at="2026-06-13T00:00:00+00:00",
+    )
 
     with pytest.raises(OSError, match="injected failure"):
-        commit_rows(
-            failing_store,
-            config,
+        failing_store.commit(
             batch_id=0,
-            start=0,
-            accepted=accepted,
+            submitted_start=0,
+            submitted_stop=0,
+            accepted=[],
             rejected=[],
+            manifest=manifest,
         )
 
     assert failing_store.transaction_path.exists()
