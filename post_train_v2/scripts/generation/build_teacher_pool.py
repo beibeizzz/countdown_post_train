@@ -33,6 +33,7 @@ from post_train.src.countdown.validation import (
 from post_train_v2.src.generation.parallel_vllm import (
     ParallelVLLMEngine,
     PositionedPrompt,
+    WorkerReady,
     WorkerSpec,
     split_contiguous,
 )
@@ -335,13 +336,6 @@ def _build_engine(
         WorkerSpec(0, config.devices[0], str(config.cache_root / "gpu0")),
         WorkerSpec(1, config.devices[1], str(config.cache_root / "gpu1")),
     )
-    LOGGER.info(
-        "workers: gpu0 device=%s cache=%s; gpu1 device=%s cache=%s",
-        specs[0].device,
-        specs[0].cache_root,
-        specs[1].device,
-        specs[1].cache_root,
-    )
     return engine_factory(
         model_path=str(config.model_path),
         worker_specs=specs,
@@ -354,6 +348,34 @@ def _build_engine(
         enable_thinking=config.enable_thinking,
         timeout_seconds=config.worker_timeout_seconds,
     )
+
+
+def _validated_worker_runtime_info(
+    engine: Any,
+) -> tuple[WorkerReady, WorkerReady]:
+    info = engine.worker_runtime_info
+    if not isinstance(info, tuple) or len(info) != 2:
+        raise ValueError(
+            "worker runtime info must be a two-item tuple ordered worker0/worker1"
+        )
+    for expected_index, worker in enumerate(info):
+        if (
+            not isinstance(worker, WorkerReady)
+            or worker.worker_index != expected_index
+            or type(worker.pid) is not int
+            or worker.pid <= 0
+            or not isinstance(worker.visible_device, str)
+            or not worker.visible_device
+            or not isinstance(worker.cache_root, str)
+            or not worker.cache_root
+        ):
+            raise ValueError(
+                "worker runtime info must contain valid WorkerReady entries "
+                "ordered worker0/worker1"
+            )
+    if info[0].pid == info[1].pid:
+        raise ValueError("worker runtime info must contain distinct child PIDs")
+    return info
 
 
 def _validated_worker_latencies(engine: Any) -> tuple[float, float]:
@@ -374,6 +396,50 @@ def _validated_worker_latencies(engine: Any) -> tuple[float, float]:
             )
         normalized.append(float(latency))
     return normalized[0], normalized[1]
+
+
+def _validated_worker_counts(
+    values: Any,
+    *,
+    label: str,
+) -> tuple[int, int]:
+    if (
+        not isinstance(values, tuple)
+        or len(values) != 2
+        or any(type(value) is not int or value < 0 for value in values)
+    ):
+        raise ValueError(
+            f"{label} must be a two-item tuple of nonnegative exact integers "
+            "ordered worker0/worker1"
+        )
+    return values
+
+
+def _validated_worker_batch_metadata(
+    engine: Any,
+    expected_shard_sizes: tuple[int, int],
+) -> tuple[tuple[int, int], tuple[int, int], tuple[float, float]]:
+    result_counts = _validated_worker_counts(
+        engine.last_worker_result_counts,
+        label="worker result counts",
+    )
+    if result_counts != expected_shard_sizes:
+        raise ValueError(
+            f"worker result counts {result_counts} do not match expected shard "
+            f"sizes {expected_shard_sizes}"
+        )
+    nonempty_counts = _validated_worker_counts(
+        engine.last_worker_nonempty_counts,
+        label="worker nonempty counts",
+    )
+    if any(
+        nonempty > result
+        for nonempty, result in zip(nonempty_counts, result_counts, strict=True)
+    ):
+        raise ValueError(
+            "worker nonempty counts cannot exceed worker result counts"
+        )
+    return result_counts, nonempty_counts, _validated_worker_latencies(engine)
 
 
 def _execute_locked(
@@ -457,7 +523,17 @@ def _execute_locked(
     resources["engine"] = engine
     LOGGER.info("engine starting")
     engine.start()
+    runtime_info = _validated_worker_runtime_info(engine)
+    resources["runtime_pids"] = tuple(worker.pid for worker in runtime_info)
     LOGGER.info("engine ready")
+    for worker in runtime_info:
+        LOGGER.info(
+            "worker%s runtime pid=%s visible_device=%s cache_root=%s",
+            worker.worker_index,
+            worker.pid,
+            worker.visible_device,
+            worker.cache_root,
+        )
     processed = state.processed_count
     batch_id = processed // config.batch_size + 1
     while processed < len(source_rows) and len(accepted) < config.stop_after_accepted:
@@ -478,14 +554,23 @@ def _execute_locked(
         )
         shards = split_contiguous(prompts)
         responses = engine.generate(batch_id, prompts)
-        worker_latencies = _validated_worker_latencies(engine)
+        expected_shard_sizes = (len(shards[0]), len(shards[1]))
+        result_counts, nonempty_counts, worker_latencies = (
+            _validated_worker_batch_metadata(engine, expected_shard_sizes)
+        )
         LOGGER.info(
-            "batch=%s worker0_shard=%s worker0_latency_seconds=%.3f "
-            "worker1_shard=%s worker1_latency_seconds=%.3f",
+            "batch=%s worker0_shard=%s worker0_results=%s "
+            "worker0_nonempty=%s worker0_latency_seconds=%.3f "
+            "worker1_shard=%s worker1_results=%s worker1_nonempty=%s "
+            "worker1_latency_seconds=%.3f",
             batch_id,
-            len(shards[0]),
+            expected_shard_sizes[0],
+            result_counts[0],
+            nonempty_counts[0],
             worker_latencies[0],
-            len(shards[1]),
+            expected_shard_sizes[1],
+            result_counts[1],
+            nonempty_counts[1],
             worker_latencies[1],
         )
         expected_positions = [item.position for item in prompts]
@@ -563,7 +648,11 @@ def _execute_locked(
     return 2
 
 
-def _cleanup_resources(engine: Any | None, lock: Any) -> list[BaseException]:
+def _cleanup_resources(
+    engine: Any | None,
+    lock: Any,
+    runtime_pids: tuple[int, int] | None,
+) -> list[BaseException]:
     errors: list[BaseException] = []
     if engine is not None:
         try:
@@ -573,7 +662,11 @@ def _cleanup_resources(engine: Any | None, lock: Any) -> list[BaseException]:
         else:
             LOGGER.info("workers closed")
         try:
-            LOGGER.info("worker exitcodes=%s", engine.worker_exitcodes)
+            LOGGER.info(
+                "worker shutdown exitcodes=%s runtime_pids=%s",
+                engine.worker_exitcodes,
+                runtime_pids,
+            )
         except BaseException as exc:
             errors.append(exc)
     try:
@@ -623,7 +716,7 @@ def run(
         LOGGER.info("stale output lock recovered and acquired: %s", lock.path)
     else:
         LOGGER.info("output lock acquired normally: %s", lock.path)
-    resources: dict[str, Any] = {"engine": None}
+    resources: dict[str, Any] = {"engine": None, "runtime_pids": None}
     primary: BaseException | None = None
     result: int | None = None
     try:
@@ -642,7 +735,11 @@ def run(
     except BaseException as exc:
         primary = exc
 
-    cleanup_errors = _cleanup_resources(resources["engine"], lock)
+    cleanup_errors = _cleanup_resources(
+        resources["engine"],
+        lock,
+        resources["runtime_pids"],
+    )
     if isinstance(primary, KeyboardInterrupt):
         for cleanup_error in cleanup_errors:
             primary.add_note(f"cleanup failed: {cleanup_error}")

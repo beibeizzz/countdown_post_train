@@ -16,6 +16,7 @@ import pytest
 
 from post_train.src.countdown.config import load_yaml_config
 from post_train.src.countdown.io import read_jsonl, write_jsonl, write_manifest
+from post_train_v2.src.generation.parallel_vllm import WorkerReady
 from post_train_v2.src.generation.teacher_state import (
     ResumeState,
     TeacherGenerationConfig,
@@ -292,6 +293,8 @@ class FakeStore:
 
 
 class FakeEngine:
+    AUTO = object()
+
     def __init__(
         self,
         events: list,
@@ -300,6 +303,9 @@ class FakeEngine:
         generate_error=None,
         close_error: BaseException | None = None,
         worker_latencies: tuple[float, float] = (0.01, 0.02),
+        worker_runtime_info=AUTO,
+        worker_result_counts=AUTO,
+        worker_nonempty_counts=AUTO,
     ) -> None:
         self.events = events
         self.responses = list(responses)
@@ -309,6 +315,18 @@ class FakeEngine:
         self.closed = False
         self.worker_exitcodes = (0, 0)
         self.last_worker_latencies = worker_latencies
+        self.worker_runtime_info = (
+            (
+                WorkerReady(0, 1000, "0", "/cache/gpu0"),
+                WorkerReady(1, 1001, "1", "/cache/gpu1"),
+            )
+            if worker_runtime_info is self.AUTO
+            else worker_runtime_info
+        )
+        self._worker_result_counts = worker_result_counts
+        self._worker_nonempty_counts = worker_nonempty_counts
+        self.last_worker_result_counts = None
+        self.last_worker_nonempty_counts = None
 
     def start(self):
         self.events.append(("engine.start",))
@@ -320,6 +338,20 @@ class FakeEngine:
         if self.generate_error is not None:
             raise self.generate_error
         response = self.responses.pop(0)
+        shard_stop = (len(items) + 1) // 2
+        self.last_worker_result_counts = (
+            (shard_stop, len(items) - shard_stop)
+            if self._worker_result_counts is self.AUTO
+            else self._worker_result_counts
+        )
+        self.last_worker_nonempty_counts = (
+            (
+                sum(bool(text.strip()) for _, text in response[:shard_stop]),
+                sum(bool(text.strip()) for _, text in response[shard_stop:]),
+            )
+            if self._worker_nonempty_counts is self.AUTO
+            else self._worker_nonempty_counts
+        )
         return response
 
     def close(self) -> None:
@@ -381,6 +413,7 @@ def run_with_fakes(
     commit_error: Exception | None = None,
     recover_stale: bool = False,
     adopt_legacy: bool = False,
+    engine_options: dict | None = None,
 ):
     config = make_config(tmp_path, stop_after_accepted=target)
     write_jsonl(config.input_path, rows)
@@ -409,7 +442,12 @@ def run_with_fakes(
 
     def engine_factory(**kwargs):
         engine_kwargs.update(kwargs)
-        engine = FakeEngine(events, responses, generate_error=engine_error)
+        engine = FakeEngine(
+            events,
+            responses,
+            generate_error=engine_error,
+            **(engine_options or {}),
+        )
         engine_holder["engine"] = engine
         return engine
 
@@ -435,7 +473,9 @@ def test_adopted_nonempty_state_materializes_v2_then_continues_with_batch_gt_zer
     config_path = tmp_path / "config.yaml"
     write_config(config_path, config)
     accepted = [build_teacher_payload(rows[0], "<answer>1+2</answer>")]
-    store = write_legacy_outputs(config, accepted, [])
+    config.output_dir.mkdir(parents=True)
+    store = RecordingTeacherStateStore(config.output_dir)
+    write_jsonl(store.accepted_path, accepted)
     write_builder_legacy_manifest(store, config, accepted, [])
     engine = FakeEngine([], [[(1, "<answer>1+2</answer>")]])
 
@@ -494,14 +534,19 @@ def test_adopted_already_complete_state_gets_v2_manifest_without_engine(
 def test_adopted_exhausted_state_gets_incomplete_v2_manifest(
     tmp_path: Path,
 ) -> None:
-    rows = [source_row("a"), source_row("b", target=99)]
+    rows = [source_row("a", target=99), source_row("b", target=99)]
     config = make_config(tmp_path, stop_after_accepted=2)
     write_jsonl(config.input_path, rows)
     config_path = tmp_path / "config.yaml"
     write_config(config_path, config)
-    accepted = [build_teacher_payload(rows[0], "<answer>1+2</answer>")]
-    rejected = [build_teacher_payload(rows[1], "")]
-    store = write_legacy_outputs(config, accepted, rejected)
+    accepted = []
+    rejected = [
+        build_teacher_payload(rows[0], ""),
+        build_teacher_payload(rows[1], ""),
+    ]
+    config.output_dir.mkdir(parents=True)
+    store = RecordingTeacherStateStore(config.output_dir)
+    write_jsonl(store.rejected_path, rejected)
     write_builder_legacy_manifest(store, config, accepted, rejected)
 
     assert run(
@@ -518,6 +563,35 @@ def test_adopted_exhausted_state_gets_incomplete_v2_manifest(
     assert store.commit_calls[0]["submitted_stop"] == 2
     assert store.commit_calls[0]["manifest"]["completed"] is False
     assert store.has_v2_manifest() is True
+
+
+def test_adopted_source_field_poisoning_fails_before_engine(
+    tmp_path: Path,
+) -> None:
+    row = source_row("a")
+    config = make_config(tmp_path, stop_after_accepted=2)
+    write_jsonl(config.input_path, [row])
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    poisoned = build_teacher_payload(row, "<answer>1+2</answer>")
+    poisoned["prompt"] = "poisoned"
+    config.output_dir.mkdir(parents=True)
+    store = RecordingTeacherStateStore(config.output_dir)
+    write_jsonl(store.accepted_path, [poisoned])
+    write_builder_legacy_manifest(store, config, [poisoned], [])
+    constructed = []
+
+    with pytest.raises(ValueError, match="prompt"):
+        run(
+            config_path,
+            adopt_legacy_state=True,
+            engine_factory=lambda **kwargs: constructed.append(kwargs),
+            state_store_factory=lambda output_dir: store,
+            cuda_visible_devices=None,
+        )
+
+    assert constructed == []
+    assert store.commit_calls == []
 
 
 def test_preexisting_empty_snapshots_get_v2_manifest_before_exhaustion_return(
@@ -691,6 +765,51 @@ def test_engine_receives_two_specs_runtime_and_absolute_positions(tmp_path: Path
     assert [item.position for item in calls[0][1]] == list(range(64))
     assert [batch_id for batch_id, _ in calls] == [1, 2]
     assert store.commits[-1]["manifest"]["completed"] is False
+
+
+@pytest.mark.parametrize(
+    "runtime_info",
+    (
+        None,
+        (WorkerReady(0, 1000, "0", "/cache/gpu0"),),
+        (
+            WorkerReady(1, 1001, "1", "/cache/gpu1"),
+            WorkerReady(0, 1000, "0", "/cache/gpu0"),
+        ),
+    ),
+)
+def test_invalid_worker_runtime_info_fails_before_generate_or_commit(
+    tmp_path: Path,
+    runtime_info,
+) -> None:
+    config = make_config(tmp_path, stop_after_accepted=1)
+    write_jsonl(config.input_path, [source_row()])
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    events: list = []
+    store = FakeStore(
+        events,
+        ResumeState((), (), 0, None, "2026-06-14T00:00:00+00:00"),
+        has_v2_manifest=True,
+    )
+    engine = FakeEngine(
+        events,
+        [[(0, "<answer>1+2</answer>")]],
+        worker_runtime_info=runtime_info,
+    )
+
+    with pytest.raises(ValueError, match="worker runtime info"):
+        run(
+            config_path,
+            engine_factory=lambda **kwargs: engine,
+            state_store_factory=lambda output_dir: store,
+            lock_factory=lambda **kwargs: FakeLock(events, **kwargs),
+            cuda_visible_devices=None,
+        )
+
+    assert engine.calls == []
+    assert store.commits == []
+    assert engine.closed is True
 
 
 def test_resume_batch_id_is_nonzero_and_derived_after_committed_position(
@@ -929,6 +1048,70 @@ def test_invalid_worker_latency_metadata_fails_before_batch_commit(
     assert engine.closed is True
 
 
+@pytest.mark.parametrize(
+    ("result_counts", "nonempty_counts", "match"),
+    (
+        (None, (1, 0), "worker result counts"),
+        ((1,), (1, 0), "worker result counts"),
+        ((0, 1), (0, 1), "expected shard sizes"),
+        ((True, 0), (1, 0), "worker result counts"),
+        ((1, 0), None, "worker nonempty counts"),
+        ((1, 0), (1,), "worker nonempty counts"),
+        ((1, 0), (-1, 0), "worker nonempty counts"),
+        ((1, 0), (2, 0), "worker nonempty counts"),
+    ),
+)
+def test_invalid_worker_count_metadata_fails_before_batch_commit(
+    tmp_path: Path,
+    result_counts,
+    nonempty_counts,
+    match: str,
+) -> None:
+    config = make_config(tmp_path, stop_after_accepted=1)
+    write_jsonl(config.input_path, [source_row()])
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    events: list = []
+    store = FakeStore(
+        events,
+        ResumeState((), (), 0, None, "2026-06-14T00:00:00+00:00"),
+        has_v2_manifest=True,
+    )
+    engine = FakeEngine(
+        events,
+        [[(0, "<answer>1+2</answer>")]],
+        worker_result_counts=result_counts,
+        worker_nonempty_counts=nonempty_counts,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        run(
+            config_path,
+            engine_factory=lambda **kwargs: engine,
+            state_store_factory=lambda output_dir: store,
+            lock_factory=lambda **kwargs: FakeLock(events, **kwargs),
+            cuda_visible_devices=None,
+        )
+
+    assert store.commits == []
+    assert engine.closed is True
+
+
+def test_zero_worker_nonempty_counts_are_valid_rejected_outputs(
+    tmp_path: Path,
+) -> None:
+    code, store, _, engine_holder, _, _ = run_with_fakes(
+        tmp_path,
+        [source_row("a"), source_row("b")],
+        [[(0, ""), (1, "")]],
+        target=3,
+    )
+
+    assert code == 2
+    assert len(store.commits) == 2
+    assert engine_holder["engine"].last_worker_nonempty_counts == (0, 0)
+
+
 def cleanup_case(
     tmp_path: Path,
     *,
@@ -1146,14 +1329,24 @@ def test_logs_lifecycle_shards_latency_counts_and_exitcodes(
     assert "resume processed=0 accepted=0 rejected=0" in messages
     assert "engine starting" in messages
     assert "engine ready" in messages
+    assert (
+        "worker0 runtime pid=1000 visible_device=0 cache_root=/cache/gpu0"
+        in messages
+    )
+    assert (
+        "worker1 runtime pid=1001 visible_device=1 cache_root=/cache/gpu1"
+        in messages
+    )
     assert "batch=1 global_range=[0,2)" in messages
     assert (
-        "worker0_shard=1 worker0_latency_seconds=0.125 "
-        "worker1_shard=1 worker1_latency_seconds=0.250"
+        "worker0_shard=1 worker0_results=1 worker0_nonempty=1 "
+        "worker0_latency_seconds=0.125 worker1_shard=1 worker1_results=1 "
+        "worker1_nonempty=1 worker1_latency_seconds=0.250"
     ) in messages
     assert "accepted=2 rejected=0" in messages
     assert "workers closed" in messages
-    assert "worker exitcodes=(0, 0)" in messages
+    assert "worker shutdown exitcodes=(0, 0) runtime_pids=(1000, 1001)" in messages
+    assert "workers: gpu0 device=" not in messages
     assert "stale output lock recovered" not in messages
     assert "<answer>" not in messages
 
