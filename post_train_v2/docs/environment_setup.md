@@ -225,16 +225,28 @@ accepted/rejected/processed counts, matching source/output/contract hashes,
 an exact duplicate-free source prefix, and no remaining output lock or
 transaction journal.
 
-The log must show both worker device/cache assignments, `engine ready`,
-per-worker shard sizes and latencies, committed batches, worker shutdown, and
-worker exit codes. Preserve `/tmp/post_train_v2_teacher_smoke.log` with the
-remote acceptance record.
+Run the copy-runnable runtime-metadata and orphan checker in the generation
+README after both coordinator procedures. Acceptance requires child-reported
+worker 0/1 runtime lines with distinct positive PIDs, visible devices `0`/`1`,
+and the expected distinct `gpu0`/`gpu1` cache roots. Every smoke batch must
+show each worker's result count equal to its shard size, a positive nonempty
+count, and a finite nonnegative latency. Each run must show final
+`exitcodes=(0, 0)` with its runtime PID pair, and `ps -p PID` must find no
+recorded child after shutdown. Preserve both smoke logs with the remote
+acceptance record.
+
+The manifest/output validator cannot attribute rows to workers; the
+coordinator log is the acceptance source for worker execution. Empty
+responses are valid rejected production rows, but the smoke gates require at
+least one nonempty response from each worker to prove both generation paths.
 
 Follow the deterministic resume-smoke procedure in the generation README. It
 creates an untracked `/tmp` config with batch size two, interrupts immediately
 after the first committed batch, resumes without cleanup, requires
 `resume processed` to be greater than zero, and runs the same validator
-against the completed resume output.
+against the completed resume output. Its appended log must contain two valid
+runtime/shutdown records, one for the interrupted run and one for the resumed
+run, and all four recorded child processes must be gone.
 
 A transaction journal left by an abnormal interruption is recovered
 automatically on restart; never delete the journal manually. Use

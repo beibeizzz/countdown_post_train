@@ -47,8 +47,8 @@ Run every Level 1 gate from the environment runbook:
 6. Two-rank NCCL smoke test.
 7. vLLM tensor-parallel size 1 and 2 smoke tests.
 8. Dual-engine teacher generation smoke test.
-9. V2 coordinator output smoke and validator.
-10. Deterministic V2 interruption/resume smoke and validator.
+9. V2 coordinator output, worker-runtime metadata, and orphan checks.
+10. Deterministic V2 interruption/resume output, runtime, and orphan checks.
 11. TRL and PEFT training smoke test.
 12. Full-model and LoRA-adapter evaluation loader smoke tests.
 
@@ -98,7 +98,9 @@ python post_train/scripts/data/build_teacher_pool.py \
 
 Never run the legacy builder in a directory containing a V2 manifest or V2
 transaction journal. Legacy-to-V2 adoption requires the explicit
-`--adopt-legacy-state` procedure; V2-to-legacy mixing is prohibited.
+`--adopt-legacy-state` procedure; source-owned fields must exactly match the
+source. Accepted-only or rejected-only contiguous legacy prefixes may be
+adopted. V2-to-legacy mixing is prohibited.
 
 ## Phase 5: Build Training Splits
 

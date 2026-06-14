@@ -175,10 +175,12 @@ print(f"OK: V2 dual-Teacher output validated: {root}")
 PY
 ```
 
-The log must show both worker cache/device assignments, `engine ready`,
-per-worker shard sizes and latencies, committed batches, worker shutdown, and
-worker exit codes. The validator is the acceptance gate; a successful process
-exit alone is insufficient.
+The output validator cannot determine which child generated a response.
+Worker attribution and process cleanup are accepted from the coordinator log,
+using the runtime-metadata check below. Empty responses remain valid rejected
+rows in production. The smoke gate is stricter: every worker must produce at
+least one nonempty response in every smoke batch so both generation paths are
+proven.
 
 ## Deterministic Resume Smoke
 
@@ -278,6 +280,101 @@ Validate the completed resumed output by rerunning the validator block from
 `/tmp/post_train_v2_teacher_resume_smoke` and `TEACHER_SMOKE_TARGET` set to
 `8`.
 
+Validate runtime metadata, batch attribution, final exit codes, and orphan
+cleanup for both logs:
+
+```bash
+python - <<'PY'
+import math
+import re
+import subprocess
+from pathlib import Path
+
+checks = (
+    (
+        Path("/tmp/post_train_v2_teacher_smoke.log"),
+        1,
+        Path("/tmp/countdown_teacher_vllm_smoke"),
+    ),
+    (
+        Path("/tmp/post_train_v2_teacher_resume_smoke.log"),
+        2,
+        Path("/tmp/countdown_teacher_vllm_resume_smoke"),
+    ),
+)
+run_re = re.compile(
+    r"worker0 runtime pid=(?P<pid0>[1-9]\d*) visible_device=(?P<device0>\S+) "
+    r"cache_root=(?P<cache0>\S+).*?"
+    r"worker1 runtime pid=(?P<pid1>[1-9]\d*) visible_device=(?P<device1>\S+) "
+    r"cache_root=(?P<cache1>\S+)(?P<body>.*?)"
+    r"worker shutdown exitcodes=\((?P<exit0>-?\d+), (?P<exit1>-?\d+)\) "
+    r"runtime_pids=\((?P<shutdown_pid0>\d+), (?P<shutdown_pid1>\d+)\)",
+    re.DOTALL,
+)
+batch_re = re.compile(
+    r"worker0_shard=(?P<shard0>\d+) worker0_results=(?P<results0>\d+) "
+    r"worker0_nonempty=(?P<nonempty0>\d+) "
+    r"worker0_latency_seconds=(?P<latency0>\S+) "
+    r"worker1_shard=(?P<shard1>\d+) worker1_results=(?P<results1>\d+) "
+    r"worker1_nonempty=(?P<nonempty1>\d+) "
+    r"worker1_latency_seconds=(?P<latency1>\S+)"
+)
+
+recorded_pids = set()
+for log_path, expected_runs, cache_root in checks:
+    text = log_path.read_text(encoding="utf-8")
+    runs = list(run_re.finditer(text))
+    assert len(runs) == expected_runs, (log_path, len(runs), expected_runs)
+    for run in runs:
+        data = run.groupdict()
+        pid0, pid1 = int(data["pid0"]), int(data["pid1"])
+        assert pid0 != pid1
+        assert (data["device0"], data["device1"]) == ("0", "1")
+        assert Path(data["cache0"]).resolve() == (cache_root / "gpu0").resolve()
+        assert Path(data["cache1"]).resolve() == (cache_root / "gpu1").resolve()
+        assert data["cache0"] != data["cache1"]
+        assert (int(data["shutdown_pid0"]), int(data["shutdown_pid1"])) == (
+            pid0,
+            pid1,
+        )
+        assert (int(data["exit0"]), int(data["exit1"])) == (0, 0)
+        batches = list(batch_re.finditer(data["body"]))
+        assert batches, (log_path, pid0, pid1)
+        for batch in batches:
+            values = batch.groupdict()
+            for worker in ("0", "1"):
+                shard = int(values[f"shard{worker}"])
+                results = int(values[f"results{worker}"])
+                nonempty = int(values[f"nonempty{worker}"])
+                latency = float(values[f"latency{worker}"])
+                assert results == shard > 0
+                assert 0 < nonempty <= results
+                assert math.isfinite(latency) and latency >= 0
+        recorded_pids.update((pid0, pid1))
+
+for pid in sorted(recorded_pids):
+    probe = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "pid="],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode != 0 and not probe.stdout.strip(), (
+        f"orphan worker PID still alive: {pid}"
+    )
+
+print(f"OK: runtime metadata and orphan checks passed for {len(recorded_pids)} PIDs")
+PY
+```
+
+Each child-reported runtime pair must contain distinct positive PIDs,
+`visible_device=0` and `visible_device=1`, and the expected distinct
+`gpu0`/`gpu1` cache roots. Every batch must report each worker's result count
+equal to its shard size, a positive nonempty count, and a finite nonnegative
+latency. Each run must finish with `worker shutdown exitcodes=(0, 0)` and the
+same PID pair. The final `ps -p PID` probes must find none of the recorded
+children.
+
 ## Production
 
 After both the coordinator output smoke and deterministic resume smoke gates
@@ -355,7 +452,12 @@ contain no duplicate or unknown IDs, form an exact contiguous prefix of the
 configured source, have an accepted count less than or equal to the configured
 target (including an already complete pool), and have no V2
 generation-contract fingerprint. The builder revalidates accepted and
-rejected classifications before materializing V2 state.
+rejected classifications before materializing V2 state. Source-owned fields
+`prompt`, `numbers`, `target`, `source_index`, `gold_expr`, and `bucket` must
+exactly match the source whenever present; a legacy row may not add one of
+these fields when the source omits it. Accepted-only and rejected-only legacy
+prefixes are supported: either side may contain the entire contiguous source
+prefix while the other side is absent or empty.
 
 Adoption is one-way. After a V2 manifest or V2 transaction journal exists,
 the legacy builder must never write that directory. V2-to-legacy mixing is
