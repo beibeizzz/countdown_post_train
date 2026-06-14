@@ -249,10 +249,11 @@ codes; leave both child PIDs gone; leave no live lock owner; and leave either
 a valid committed incomplete prefix without a journal or a structurally valid
 recovery journal. Its child exit codes may be zero or platform-specific
 termination values and are not compared with an exact numeric whitelist. The
-resumed completion log must show `(0, 0)`, and its child PIDs must also be
-gone. Never delete an interrupted-run journal; the resumed builder validates
-and recovers it. Preserve all three coordinator smoke logs with the remote
-acceptance record.
+resume command automatically adds `--recover-stale-lock` when a dead-owner
+lock file remains. The resumed completion log must show `(0, 0)`, and its
+child PIDs must also be gone. Never delete an interrupted-run journal; the
+resumed builder validates and recovers it. Preserve all three coordinator
+smoke logs with the remote acceptance record.
 
 A transaction journal left by an abnormal interruption is recovered
 automatically on restart; never delete the journal manually. Use

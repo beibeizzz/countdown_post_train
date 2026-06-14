@@ -306,13 +306,37 @@ if journal_path.exists():
         "manifest",
     }
     assert journal["schema_version"] == 1
+    assert type(journal["batch_id"]) is int and journal["batch_id"] >= 0
+    assert type(journal["submitted_start"]) is int
+    assert type(journal["submitted_stop"]) is int
     assert 0 < journal["submitted_start"] <= journal["submitted_stop"]
     assert journal["submitted_start"] == (
         journal["accepted"]["row_count"] + journal["rejected"]["row_count"]
     )
-    assert set(journal["accepted"]) == {"existed", "row_count", "sha256"}
-    assert set(journal["rejected"]) == {"existed", "row_count", "sha256"}
+    for name in ("accepted", "rejected"):
+        snapshot = journal[name]
+        assert set(snapshot) == {"existed", "row_count", "sha256"}
+        assert type(snapshot["existed"]) is bool
+        assert type(snapshot["row_count"]) is int and snapshot["row_count"] >= 0
+        if snapshot["existed"]:
+            digest = snapshot["sha256"]
+            assert isinstance(digest, str) and len(digest) == 64
+            assert all(character in "0123456789abcdef" for character in digest)
+        else:
+            assert snapshot["row_count"] == 0
+            assert snapshot["sha256"] is None
     assert set(journal["manifest"]) == {"existed", "payload"}
+    assert type(journal["manifest"]["existed"]) is bool
+    if journal["manifest"]["existed"]:
+        payload = journal["manifest"]["payload"]
+        assert isinstance(payload, dict)
+        assert payload["processed_count"] == journal["submitted_start"]
+        assert payload["accepted_count"] == journal["accepted"]["row_count"]
+        assert payload["rejected_count"] == journal["rejected"]["row_count"]
+        assert payload["accepted_sha256"] == journal["accepted"]["sha256"]
+        assert payload["rejected_sha256"] == journal["rejected"]["sha256"]
+    else:
+        assert journal["manifest"]["payload"] is None
 else:
     assert 0 < manifest["processed_count"] < len(source)
     assert manifest["processed_count"] == len(accepted) + len(rejected)
@@ -411,8 +435,13 @@ Resume with the same temporary config and without cleanup:
 
 ```bash
 set -o pipefail
+RECOVER_LOCK=()
+if [[ -f /tmp/post_train_v2_teacher_resume_smoke/.teacher_pool.lock ]]; then
+  RECOVER_LOCK=(--recover-stale-lock)
+fi
 python post_train_v2/scripts/generation/build_teacher_pool.py \
   --config /tmp/post_train_v2_teacher_resume_smoke.yaml \
+  "${RECOVER_LOCK[@]}" \
   2>&1 | tee /tmp/post_train_v2_teacher_resume_resumed.log
 ```
 
