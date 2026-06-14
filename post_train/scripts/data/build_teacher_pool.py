@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 from post_train.src.countdown.config import load_yaml_config, resolve_path
 from post_train.src.countdown.generation import GenerationConfig, VLLMGenerator
 from post_train.src.countdown.io import read_jsonl, write_jsonl, write_manifest
+from post_train.src.countdown.output_lock import OutputLock
 from post_train.src.countdown.validation import extract_answer_text, validate_countdown_response
 
 
@@ -20,13 +23,18 @@ DEFAULT_INPUT = "post_train/data/processed/train_pool.jsonl"
 OUTPUT_DIR = "post_train/data/teacher_rollouts"
 ACCEPTED_FILENAME = "teacher_accepted_20k.jsonl"
 REJECTED_FILENAME = "teacher_rejected.jsonl"
+MANIFEST_FILENAME = "manifest.json"
+TRANSACTION_FILENAME = ".teacher_pool.transaction.json"
+V2_STAGE = "teacher_accepted_pool"
+V2_SCHEMA_VERSION = 1
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build teacher accepted pool.")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--input", default=DEFAULT_INPUT)
-    return parser.parse_args()
+    parser.add_argument("--recover-stale-lock", action="store_true")
+    return parser.parse_args(argv)
 
 
 def collect_processed_ids(
@@ -116,14 +124,50 @@ def atomic_write_manifest(path: Path, payload: dict[str, Any]) -> None:
     temp_path.replace(path)
 
 
-def main() -> None:
-    args = parse_args()
+def read_manifest(path: Path) -> dict[str, Any]:
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path}: invalid JSON") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"{path}: manifest must be an object")
+    return manifest
 
-    cfg_path = resolve_path(args.config, REPO_ROOT)
-    cfg = load_yaml_config(cfg_path)
-    input_path = resolve_path(args.input, REPO_ROOT)
-    model_path = resolve_path(cfg["model_path"], REPO_ROOT)
-    output_dir = resolve_path(OUTPUT_DIR, REPO_ROOT)
+
+def reject_v2_owned_state(output_dir: Path) -> None:
+    manifest_path = output_dir / MANIFEST_FILENAME
+    if manifest_path.exists():
+        manifest = read_manifest(manifest_path)
+        fingerprint = manifest.get("generation_contract_fingerprint")
+        has_v2_contract = "generation_contract" in manifest
+        has_v2_stage_schema = (
+            manifest.get("stage") == V2_STAGE
+            and type(manifest.get("schema_version")) is int
+            and manifest["schema_version"] == V2_SCHEMA_VERSION
+        )
+        if fingerprint or has_v2_contract or has_v2_stage_schema:
+            raise RuntimeError(
+                "Output directory contains V2 teacher state; archive or remove "
+                "the V2 state before using the legacy teacher generator."
+            )
+
+    transaction_path = output_dir / TRANSACTION_FILENAME
+    if transaction_path.exists():
+        raise RuntimeError(
+            "Output directory contains a V2 transaction journal; archive or remove "
+            "the transaction state before using the legacy teacher generator."
+        )
+
+
+def _execute_locked(
+    *,
+    cfg: dict[str, Any],
+    input_path: Path,
+    model_path: Path,
+    output_dir: Path,
+    generator_factory: Callable[[str], Any],
+) -> None:
+    reject_v2_owned_state(output_dir)
 
     accepted_path = output_dir / ACCEPTED_FILENAME
     rejected_path = output_dir / REJECTED_FILENAME
@@ -150,7 +194,7 @@ def main() -> None:
     ]
 
     if len(accepted) < target and remaining_rows:
-        generator = VLLMGenerator(str(model_path))
+        generator = generator_factory(str(model_path))
         for batch in batched(remaining_rows, int(cfg["batch_size"])):
             if len(accepted) >= target:
                 break
@@ -172,7 +216,7 @@ def main() -> None:
     atomic_write_jsonl(accepted_path, accepted[:target])
     atomic_write_jsonl(rejected_path, rejected)
     atomic_write_manifest(
-        output_dir / "manifest.json",
+        output_dir / MANIFEST_FILENAME,
         {
             "name": "teacher_accepted_pool",
             "model": str(model_path),
@@ -181,6 +225,63 @@ def main() -> None:
             "max_new_tokens": generation_config.max_new_tokens,
             "enable_thinking": generation_config.enable_thinking,
         },
+    )
+
+
+def run(
+    config_path: str | Path = DEFAULT_CONFIG,
+    input_path: str | Path = DEFAULT_INPUT,
+    *,
+    recover_stale_lock: bool = False,
+    lock_factory: Callable[..., Any] = OutputLock,
+    generator_factory: Callable[[str], Any] = VLLMGenerator,
+) -> None:
+    cfg_path = resolve_path(config_path, REPO_ROOT)
+    cfg = load_yaml_config(cfg_path)
+    resolved_input_path = resolve_path(input_path, REPO_ROOT)
+    model_path = resolve_path(cfg["model_path"], REPO_ROOT)
+    output_dir = resolve_path(OUTPUT_DIR, REPO_ROOT)
+
+    lock = lock_factory(
+        path=output_dir / ".teacher_pool.lock",
+        config_path=cfg_path,
+        output_dir=output_dir,
+        topology="legacy_single_tp1",
+    )
+    lock.acquire(recover_stale=recover_stale_lock)
+
+    primary_error: BaseException | None = None
+    try:
+        _execute_locked(
+            cfg=cfg,
+            input_path=resolved_input_path,
+            model_path=model_path,
+            output_dir=output_dir,
+            generator_factory=generator_factory,
+        )
+    except BaseException as exc:
+        primary_error = exc
+    finally:
+        try:
+            lock.release()
+        except BaseException as release_error:
+            if primary_error is not None:
+                primary_error.add_note(f"lock release failed: {release_error}")
+                raise primary_error.with_traceback(
+                    primary_error.__traceback__
+                ) from release_error
+            raise
+
+    if primary_error is not None:
+        raise primary_error.with_traceback(primary_error.__traceback__)
+
+
+def main() -> None:
+    args = parse_args()
+    run(
+        args.config,
+        args.input,
+        recover_stale_lock=args.recover_stale_lock,
     )
 
 
