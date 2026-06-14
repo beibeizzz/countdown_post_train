@@ -290,6 +290,20 @@ def read_jsonl(path):
 def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
+def prefix_sha256(path, row_count):
+    data = path.read_bytes()
+    if row_count == 0:
+        return hashlib.sha256(b"").hexdigest()
+    seen_rows = 0
+    prefix_length = 0
+    for line in data.splitlines(keepends=True):
+        prefix_length += len(line)
+        if line.strip():
+            seen_rows += 1
+        if seen_rows == row_count:
+            return hashlib.sha256(data[:prefix_length]).hexdigest()
+    raise AssertionError(f"{path} has fewer than {row_count} JSONL rows")
+
 accepted = read_jsonl(accepted_path)
 rejected = read_jsonl(rejected_path)
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -322,6 +336,9 @@ if journal_path.exists():
             digest = snapshot["sha256"]
             assert isinstance(digest, str) and len(digest) == 64
             assert all(character in "0123456789abcdef" for character in digest)
+            snapshot_path = accepted_path if name == "accepted" else rejected_path
+            assert snapshot_path.exists()
+            assert prefix_sha256(snapshot_path, snapshot["row_count"]) == digest
         else:
             assert snapshot["row_count"] == 0
             assert snapshot["sha256"] is None
