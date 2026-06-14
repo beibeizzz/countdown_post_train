@@ -267,6 +267,96 @@ def test_legacy_rows_require_explicit_adoption(tmp_path: Path) -> None:
     assert state.last_committed_position == 1
 
 
+def source_row_with_metadata() -> dict:
+    return {
+        "id": "a",
+        "prompt": "Use 1 and 2 to make 3.",
+        "numbers": [1, 2],
+        "target": 3,
+        "source_index": 7,
+        "gold_expr": "1+2",
+        "bucket": "easy",
+    }
+
+
+def accepted_row_from_source(row: dict) -> dict:
+    return {
+        **row,
+        "response": "<answer>1+2</answer>",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("prompt", "poisoned prompt"),
+        ("numbers", [9, 9]),
+        ("target", 18),
+        ("source_index", 8),
+        ("gold_expr", "2+1"),
+        ("bucket", "hard"),
+    ),
+)
+def test_legacy_adoption_rejects_source_owned_field_mutation(
+    tmp_path: Path,
+    field: str,
+    value,
+) -> None:
+    source = source_row_with_metadata()
+    config = make_config(tmp_path)
+    write_jsonl(config.input_path, [source])
+    output = accepted_row_from_source(source)
+    output[field] = value
+    if field == "numbers":
+        output["numbers"] = [9, 9]
+        output["target"] = 18
+        output["response"] = "<answer>9+9</answer>"
+    elif field == "target":
+        output["target"] = 2
+        output["response"] = "<answer>1*2</answer>"
+    store = write_legacy_state(config, [output], [])
+
+    with pytest.raises(ValueError, match=field):
+        store.load_resume_state([source], config, adopt_legacy_state=True)
+
+
+def test_legacy_adoption_uses_source_values_and_accepts_genuine_row(
+    tmp_path: Path,
+) -> None:
+    source = source_row_with_metadata()
+    config = make_config(tmp_path)
+    write_jsonl(config.input_path, [source])
+    output = accepted_row_from_source(source)
+    store = write_legacy_state(config, [output], [])
+
+    state = store.load_resume_state(
+        [source],
+        config,
+        adopt_legacy_state=True,
+    )
+
+    assert state.accepted == (output,)
+    assert state.processed_count == 1
+
+
+@pytest.mark.parametrize(
+    "response",
+    (None, 3, ["<answer>1+2</answer>"]),
+)
+def test_legacy_adoption_requires_response_string(
+    tmp_path: Path,
+    response,
+) -> None:
+    source = source_row_with_metadata()
+    config = make_config(tmp_path)
+    write_jsonl(config.input_path, [source])
+    output = {**source, "response": response}
+    store = write_legacy_state(config, [output], [])
+
+    with pytest.raises(ValueError, match="response.*string"):
+        store.load_resume_state([source], config, adopt_legacy_state=True)
+
+
 @pytest.mark.parametrize(
     ("accepted", "rejected", "target", "match"),
     (
@@ -626,8 +716,17 @@ def manifest_for_existing_snapshots(
         created_at="2026-06-13T00:00:00+00:00",
         updated_at="2026-06-13T00:00:01+00:00",
     )
-    manifest["accepted_sha256"] = sha256_file(store.accepted_path)
-    manifest["rejected_sha256"] = sha256_file(store.rejected_path)
+    empty_hash = hashlib.sha256(b"").hexdigest()
+    manifest["accepted_sha256"] = (
+        sha256_file(store.accepted_path)
+        if store.accepted_path.exists()
+        else empty_hash
+    )
+    manifest["rejected_sha256"] = (
+        sha256_file(store.rejected_path)
+        if store.rejected_path.exists()
+        else empty_hash
+    )
     return manifest
 
 
@@ -859,6 +958,96 @@ def test_commit_materializes_manifest_over_preexisting_empty_snapshots(
     assert read_json(store.manifest_path) == manifest
 
 
+@pytest.mark.parametrize(
+    ("existing_kind", "with_legacy_manifest"),
+    (
+        ("accepted", False),
+        ("rejected", True),
+    ),
+)
+def test_commit_materializes_v2_manifest_over_one_sided_legacy_snapshot(
+    tmp_path: Path,
+    existing_kind: str,
+    with_legacy_manifest: bool,
+) -> None:
+    config = make_config(tmp_path)
+    config.output_dir.mkdir()
+    accepted = (
+        [accepted_row("a", [1, 2], 3)]
+        if existing_kind == "accepted"
+        else []
+    )
+    rejected = (
+        [rejected_row("a", [1, 2], 3)]
+        if existing_kind == "rejected"
+        else []
+    )
+    existing_path = (
+        config.output_dir / "teacher_accepted_20k.jsonl"
+        if existing_kind == "accepted"
+        else config.output_dir / "teacher_rejected.jsonl"
+    )
+    missing_path = (
+        config.output_dir / "teacher_rejected.jsonl"
+        if existing_kind == "accepted"
+        else config.output_dir / "teacher_accepted_20k.jsonl"
+    )
+    write_jsonl(existing_path, accepted or rejected)
+    store = TeacherStateStore(config.output_dir)
+    existing_bytes = existing_path.read_bytes()
+    if with_legacy_manifest:
+        write_builder_legacy_manifest(store, config, accepted, rejected)
+    manifest = manifest_for_existing_snapshots(
+        store,
+        config,
+        accepted,
+        rejected,
+    )
+
+    store.commit(
+        batch_id=0,
+        submitted_start=1,
+        submitted_stop=1,
+        accepted=accepted,
+        rejected=rejected,
+        manifest=manifest,
+    )
+
+    assert existing_path.read_bytes() == existing_bytes
+    assert missing_path.read_bytes() == b""
+    assert store.has_v2_manifest() is True
+
+
+def test_one_sided_materialization_rejects_rows_for_absent_snapshot(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    config.output_dir.mkdir()
+    accepted = [accepted_row("a", [1, 2], 3)]
+    rejected = [rejected_row("b", [2, 2], 4)]
+    write_jsonl(config.output_dir / "teacher_accepted_20k.jsonl", accepted)
+    store = TeacherStateStore(config.output_dir)
+    manifest = manifest_for_existing_snapshots(
+        store,
+        config,
+        accepted,
+        rejected,
+    )
+
+    with pytest.raises(ValueError, match="processed_count|absent rejected"):
+        store.commit(
+            batch_id=0,
+            submitted_start=1,
+            submitted_stop=1,
+            accepted=accepted,
+            rejected=rejected,
+            manifest=manifest,
+        )
+
+    assert not store.transaction_path.exists()
+    assert not store.manifest_path.exists()
+
+
 def test_commit_materializes_v2_manifest_over_validated_legacy_manifest(
     tmp_path: Path,
 ) -> None:
@@ -1036,6 +1225,56 @@ class FailAfterDestination:
         if Path(destination) == self.destination and not self.failed:
             self.failed = True
             raise OSError(f"injected failure after {self.destination.name}")
+
+
+def test_failed_one_sided_initialization_restores_absence_and_legacy_manifest(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    config.output_dir.mkdir()
+    accepted = [accepted_row("a", [1, 2], 3)]
+    write_jsonl(
+        config.output_dir / "teacher_accepted_20k.jsonl",
+        accepted,
+    )
+    initial_store = TeacherStateStore(config.output_dir)
+    accepted_bytes = initial_store.accepted_path.read_bytes()
+    legacy_manifest = write_builder_legacy_manifest(
+        initial_store,
+        config,
+        accepted,
+        [],
+    )
+    legacy_manifest_bytes = initial_store.manifest_path.read_bytes()
+    v2_manifest = manifest_for_existing_snapshots(
+        initial_store,
+        config,
+        accepted,
+        [],
+    )
+    failing_store = TeacherStateStore(
+        config.output_dir,
+        replace_file=FailAfterDestination(initial_store.manifest_path),
+    )
+
+    with pytest.raises(OSError, match="injected failure"):
+        failing_store.commit(
+            batch_id=0,
+            submitted_start=1,
+            submitted_stop=1,
+            accepted=accepted,
+            rejected=[],
+            manifest=v2_manifest,
+        )
+
+    assert failing_store.rejected_path.exists()
+    assert failing_store.transaction_path.exists()
+    TeacherStateStore(config.output_dir).recover_transaction()
+    assert initial_store.accepted_path.read_bytes() == accepted_bytes
+    assert not initial_store.rejected_path.exists()
+    assert initial_store.manifest_path.read_bytes() == legacy_manifest_bytes
+    assert read_json(initial_store.manifest_path) == legacy_manifest
+    assert not initial_store.transaction_path.exists()
 
 
 def test_failed_legacy_manifest_initialization_restores_exact_legacy_manifest(

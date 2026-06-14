@@ -59,6 +59,14 @@ LEGACY_MANIFEST_ENVELOPE_KEYS = LEGACY_MANIFEST_PAYLOAD_KEYS | {
     "stage",
     "created_at",
 }
+LEGACY_SOURCE_FIELDS = (
+    "prompt",
+    "numbers",
+    "target",
+    "source_index",
+    "gold_expr",
+    "bucket",
+)
 
 MANIFEST_KEYS = {
     "schema_version",
@@ -392,19 +400,37 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _require_legacy_fields(row: dict[str, Any], *, kind: str) -> tuple[str, list[int], int]:
-    for field in ("response", "numbers", "target", "id"):
-        if field not in row:
-            raise ValueError(f"legacy {kind} row missing {field}")
-    response = row["response"]
-    numbers = row["numbers"]
-    target = row["target"]
+def _validate_legacy_output_row(
+    row: object,
+    *,
+    source_by_id: dict[Any, dict[str, Any]],
+    kind: str,
+) -> tuple[str, list[int], int]:
+    if not isinstance(row, dict):
+        raise ValueError(f"legacy {kind} row must be an object")
+    row_id = _row_id(row, label=f"legacy {kind}")
+    if row_id not in source_by_id:
+        raise ValueError(f"legacy {kind} row has unknown id: {row_id}")
+    source = source_by_id[row_id]
+    for field in LEGACY_SOURCE_FIELDS:
+        if field in source:
+            if field not in row or row[field] != source[field]:
+                raise ValueError(
+                    f"legacy {kind} row {field} does not match source"
+                )
+        elif field in row:
+            raise ValueError(
+                f"legacy {kind} row has output-only source field {field}"
+            )
+    response = row.get("response")
     if not isinstance(response, str):
         raise ValueError(f"legacy {kind} row response must be a string")
+    numbers = source.get("numbers")
+    target = source.get("target")
     if not isinstance(numbers, list):
-        raise ValueError(f"legacy {kind} row numbers must be a list")
+        raise ValueError("source row numbers must be a list")
     if not _is_exact_int(target):
-        raise ValueError(f"legacy {kind} row target must be an exact integer")
+        raise ValueError("source row target must be an exact integer")
     return response, numbers, target
 
 
@@ -819,15 +845,21 @@ class TeacherStateStore:
                 )
             if len(accepted) > config.stop_after_accepted:
                 raise ValueError("legacy accepted count exceeds configured target")
+            _source_positions(source_rows)
+            source_by_id = {row["id"]: row for row in source_rows}
             for row in accepted:
-                response, numbers, target = _require_legacy_fields(
-                    row, kind="accepted"
+                response, numbers, target = _validate_legacy_output_row(
+                    row,
+                    source_by_id=source_by_id,
+                    kind="accepted",
                 )
                 if not validate_countdown_response(response, numbers, target).ok:
                     raise ValueError("legacy accepted row is incorrect")
             for row in rejected:
-                response, numbers, target = _require_legacy_fields(
-                    row, kind="rejected"
+                response, numbers, target = _validate_legacy_output_row(
+                    row,
+                    source_by_id=source_by_id,
+                    kind="rejected",
                 )
                 if validate_countdown_response(response, numbers, target).ok:
                     raise ValueError("legacy rejected row is correct")
@@ -1479,9 +1511,9 @@ class TeacherStateStore:
         accepted_snapshot: dict[str, Any],
         rejected_snapshot: dict[str, Any],
     ) -> None:
-        if not accepted_snapshot["existed"] or not rejected_snapshot["existed"]:
+        if not accepted_snapshot["existed"] and not rejected_snapshot["existed"]:
             raise ValueError(
-                "manifest initialization requires both existing snapshots"
+                "manifest initialization requires at least one existing snapshot"
             )
         if batch_id != 0:
             raise ValueError("manifest initialization requires batch_id 0")
@@ -1503,13 +1535,22 @@ class TeacherStateStore:
             ("rejected", _project_jsonl_bytes(rejected), rejected_snapshot),
         )
         for label, serialized, snapshot in supplied_bytes:
-            if serialized != snapshot["bytes"]:
+            if not snapshot["existed"] and serialized:
+                raise ValueError(
+                    f"absent {label} snapshot requires empty supplied rows"
+                )
+            if snapshot["existed"] and serialized != snapshot["bytes"]:
                 raise ValueError(
                     f"supplied {label} rows must match existing snapshot "
                     "byte-for-byte"
                 )
             hash_field = f"{label}_sha256"
-            if manifest[hash_field] != snapshot["sha256"]:
+            expected_hash = (
+                snapshot["sha256"]
+                if snapshot["existed"]
+                else _sha256_bytes(b"")
+            )
+            if manifest[hash_field] != expected_hash:
                 raise ValueError(
                     f"manifest {hash_field} must match existing snapshot bytes"
                 )
