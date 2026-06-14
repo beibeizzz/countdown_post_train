@@ -26,7 +26,6 @@ REJECTED_FILENAME = "teacher_rejected.jsonl"
 MANIFEST_FILENAME = "manifest.json"
 TRANSACTION_FILENAME = ".teacher_pool.transaction.json"
 V2_STAGE = "teacher_accepted_pool"
-V2_SCHEMA_VERSION = 1
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -138,14 +137,13 @@ def reject_v2_owned_state(output_dir: Path) -> None:
     manifest_path = output_dir / MANIFEST_FILENAME
     if manifest_path.exists():
         manifest = read_manifest(manifest_path)
-        fingerprint = manifest.get("generation_contract_fingerprint")
+        has_v2_fingerprint = "generation_contract_fingerprint" in manifest
         has_v2_contract = "generation_contract" in manifest
         has_v2_stage_schema = (
             manifest.get("stage") == V2_STAGE
-            and type(manifest.get("schema_version")) is int
-            and manifest["schema_version"] == V2_SCHEMA_VERSION
+            and "schema_version" in manifest
         )
-        if fingerprint or has_v2_contract or has_v2_stage_schema:
+        if has_v2_fingerprint or has_v2_contract or has_v2_stage_schema:
             raise RuntimeError(
                 "Output directory contains V2 teacher state; archive or remove "
                 "the V2 state before using the legacy teacher generator."

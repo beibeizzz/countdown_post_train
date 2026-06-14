@@ -377,6 +377,69 @@ def test_run_rejects_v2_manifest_before_generator(
     assert events == [("acquire", False), "release"]
 
 
+@pytest.mark.parametrize(
+    "fingerprint",
+    ["", None, False, 0],
+)
+def test_run_rejects_v2_manifest_with_falsey_fingerprint(
+    tmp_path: Path,
+    monkeypatch,
+    fingerprint,
+):
+    _, _, _, output_dir = patch_run_paths(monkeypatch, tmp_path)
+    output_dir.mkdir()
+    (output_dir / "manifest.json").write_text(
+        json.dumps({"generation_contract_fingerprint": fingerprint}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="archive or remove.*V2"):
+        build_teacher_pool.run("config", "input")
+
+
+@pytest.mark.parametrize(
+    "contract",
+    [{}, None, False, 0, ""],
+)
+def test_run_rejects_v2_manifest_with_falsey_contract(
+    tmp_path: Path,
+    monkeypatch,
+    contract,
+):
+    _, _, _, output_dir = patch_run_paths(monkeypatch, tmp_path)
+    output_dir.mkdir()
+    (output_dir / "manifest.json").write_text(
+        json.dumps({"generation_contract": contract}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="archive or remove.*V2"):
+        build_teacher_pool.run("config", "input")
+
+
+@pytest.mark.parametrize("schema_version", [None, "", False, 0, 2])
+def test_run_rejects_v2_stage_with_schema_version_key_present(
+    tmp_path: Path,
+    monkeypatch,
+    schema_version,
+):
+    _, _, _, output_dir = patch_run_paths(monkeypatch, tmp_path)
+    output_dir.mkdir()
+    (output_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "stage": "teacher_accepted_pool",
+                "schema_version": schema_version,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="archive or remove.*V2"):
+        build_teacher_pool.run("config", "input")
+
+
 def test_run_accepts_legacy_envelope_manifest(
     tmp_path: Path,
     monkeypatch,
@@ -433,6 +496,57 @@ def test_run_accepts_legacy_envelope_manifest(
     )
 
     assert len(generator_constructed) == 1
+
+
+def test_run_holds_real_output_lock_during_output_access(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _, input_path, _, output_dir = patch_run_paths(monkeypatch, tmp_path)
+    lock_path = output_dir / ".teacher_pool.lock"
+    access_events = []
+
+    def fake_read_jsonl(path):
+        assert Path(path) == input_path
+        assert lock_path.exists()
+        access_events.append("read")
+        return []
+
+    def fake_atomic_write_jsonl(path, rows):
+        assert lock_path.exists()
+        access_events.append(("write_jsonl", Path(path).name))
+
+    def fake_atomic_write_manifest(path, payload):
+        assert lock_path.exists()
+        access_events.append(("write_manifest", Path(path).name))
+
+    monkeypatch.setattr(build_teacher_pool, "read_jsonl", fake_read_jsonl)
+    monkeypatch.setattr(
+        build_teacher_pool,
+        "atomic_write_jsonl",
+        fake_atomic_write_jsonl,
+    )
+    monkeypatch.setattr(
+        build_teacher_pool,
+        "atomic_write_manifest",
+        fake_atomic_write_manifest,
+    )
+
+    build_teacher_pool.run(
+        "config",
+        "input",
+        generator_factory=lambda path: pytest.fail(
+            "generator must not be constructed"
+        ),
+    )
+
+    assert access_events == [
+        "read",
+        ("write_jsonl", build_teacher_pool.ACCEPTED_FILENAME),
+        ("write_jsonl", build_teacher_pool.REJECTED_FILENAME),
+        ("write_manifest", build_teacher_pool.MANIFEST_FILENAME),
+    ]
+    assert not lock_path.exists()
 
 
 def test_run_rejects_v2_transaction_journal_before_generator(
