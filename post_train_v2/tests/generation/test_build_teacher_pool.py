@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -14,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from post_train.src.countdown.config import load_yaml_config
-from post_train.src.countdown.io import read_jsonl, write_jsonl
+from post_train.src.countdown.io import read_jsonl, write_jsonl, write_manifest
 from post_train_v2.src.generation.teacher_state import (
     ResumeState,
     TeacherGenerationConfig,
@@ -235,12 +236,14 @@ class FakeLock:
         events: list,
         *,
         release_error: BaseException | None = None,
+        recovered_stale: bool = False,
         **kwargs,
     ) -> None:
         self.events = events
         self.kwargs = kwargs
         self.path = kwargs.get("path", Path("fake.lock"))
         self.release_error = release_error
+        self.recovered_stale = recovered_stale
         self.released = False
 
     def acquire(self, recover_stale: bool = False) -> None:
@@ -296,6 +299,7 @@ class FakeEngine:
         *,
         generate_error=None,
         close_error: BaseException | None = None,
+        worker_latencies: tuple[float, float] = (0.01, 0.02),
     ) -> None:
         self.events = events
         self.responses = list(responses)
@@ -304,6 +308,7 @@ class FakeEngine:
         self.calls: list[tuple[int, tuple]] = []
         self.closed = False
         self.worker_exitcodes = (0, 0)
+        self.last_worker_latencies = worker_latencies
 
     def start(self):
         self.events.append(("engine.start",))
@@ -343,6 +348,25 @@ def write_legacy_outputs(
     write_jsonl(config.output_dir / "teacher_accepted_20k.jsonl", accepted)
     write_jsonl(config.output_dir / "teacher_rejected.jsonl", rejected)
     return RecordingTeacherStateStore(config.output_dir)
+
+
+def write_builder_legacy_manifest(
+    store: TeacherStateStore,
+    config: TeacherGenerationConfig,
+    accepted: list[dict],
+    rejected: list[dict],
+) -> None:
+    write_manifest(
+        store.manifest_path,
+        {
+            "name": "teacher_accepted_pool",
+            "model": str(config.model_path.resolve()),
+            "num_accepted": len(accepted),
+            "num_rejected": len(rejected),
+            "max_new_tokens": config.max_new_tokens,
+            "enable_thinking": config.enable_thinking,
+        },
+    )
 
 
 def run_with_fakes(
@@ -412,6 +436,7 @@ def test_adopted_nonempty_state_materializes_v2_then_continues_with_batch_gt_zer
     write_config(config_path, config)
     accepted = [build_teacher_payload(rows[0], "<answer>1+2</answer>")]
     store = write_legacy_outputs(config, accepted, [])
+    write_builder_legacy_manifest(store, config, accepted, [])
     engine = FakeEngine([], [[(1, "<answer>1+2</answer>")]])
 
     code = run(
@@ -440,11 +465,13 @@ def test_adopted_already_complete_state_gets_v2_manifest_without_engine(
     write_jsonl(config.input_path, [row])
     config_path = tmp_path / "config.yaml"
     write_config(config_path, config)
+    accepted = [build_teacher_payload(row, "<answer>1+2</answer>")]
     store = write_legacy_outputs(
         config,
-        [build_teacher_payload(row, "<answer>1+2</answer>")],
+        accepted,
         [],
     )
+    write_builder_legacy_manifest(store, config, accepted, [])
     constructed = []
 
     assert run(
@@ -472,11 +499,10 @@ def test_adopted_exhausted_state_gets_incomplete_v2_manifest(
     write_jsonl(config.input_path, rows)
     config_path = tmp_path / "config.yaml"
     write_config(config_path, config)
-    store = write_legacy_outputs(
-        config,
-        [build_teacher_payload(rows[0], "<answer>1+2</answer>")],
-        [build_teacher_payload(rows[1], "")],
-    )
+    accepted = [build_teacher_payload(rows[0], "<answer>1+2</answer>")]
+    rejected = [build_teacher_payload(rows[1], "")]
+    store = write_legacy_outputs(config, accepted, rejected)
+    write_builder_legacy_manifest(store, config, accepted, rejected)
 
     assert run(
         config_path,
@@ -717,6 +743,46 @@ def test_lock_precedes_state_load_and_flags_are_forwarded(tmp_path: Path) -> Non
     assert lock.released is True
 
 
+@pytest.mark.parametrize(
+    ("recovered_stale", "expected", "unexpected"),
+    (
+        (False, "output lock acquired normally", "stale output lock recovered"),
+        (True, "stale output lock recovered and acquired", "acquired normally"),
+    ),
+)
+def test_lock_logs_actual_recovery_outcome_after_acquire(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    recovered_stale: bool,
+    expected: str,
+    unexpected: str,
+) -> None:
+    config = make_config(tmp_path, stop_after_accepted=1)
+    config.input_path.write_bytes(b"")
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    events: list = []
+    lock = FakeLock(
+        events,
+        path=config.output_dir / ".teacher_pool.lock",
+        recovered_stale=recovered_stale,
+    )
+
+    with caplog.at_level(logging.INFO):
+        assert run(
+            config_path,
+            recover_stale_lock=True,
+            engine_factory=lambda **kwargs: pytest.fail("engine constructed"),
+            lock_factory=lambda **kwargs: lock,
+            cuda_visible_devices=None,
+        ) == 2
+
+    assert caplog.text.index("stale lock recovery requested") < caplog.text.index(
+        expected
+    )
+    assert unexpected not in caplog.text
+
+
 def test_already_complete_does_not_construct_engine(tmp_path: Path) -> None:
     row = source_row()
     state = ResumeState(
@@ -814,6 +880,52 @@ def test_persistence_failure_after_generation_closes_engine(tmp_path: Path) -> N
             cuda_visible_devices=None,
         )
 
+    assert engine.closed is True
+
+
+@pytest.mark.parametrize(
+    "latencies",
+    (
+        None,
+        (0.1,),
+        (0.1, 0.2, 0.3),
+        (-0.1, 0.2),
+        (math.nan, 0.2),
+        (math.inf, 0.2),
+        (True, 0.2),
+    ),
+)
+def test_invalid_worker_latency_metadata_fails_before_batch_commit(
+    tmp_path: Path,
+    latencies,
+) -> None:
+    config = make_config(tmp_path, stop_after_accepted=1)
+    write_jsonl(config.input_path, [source_row()])
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    events: list = []
+    store = FakeStore(
+        events,
+        ResumeState((), (), 0, None, "2026-06-14T00:00:00+00:00"),
+        has_v2_manifest=True,
+    )
+    engine = FakeEngine(
+        events,
+        [[(0, "<answer>1+2</answer>")]],
+        worker_latencies=latencies,
+    )
+    commits_before = len(store.commits)
+
+    with pytest.raises(ValueError, match="worker latencies"):
+        run(
+            config_path,
+            engine_factory=lambda **kwargs: engine,
+            state_store_factory=lambda output_dir: store,
+            lock_factory=lambda **kwargs: FakeLock(events, **kwargs),
+            cuda_visible_devices=None,
+        )
+
+    assert len(store.commits) == commits_before
     assert engine.closed is True
 
 
@@ -1011,8 +1123,8 @@ def test_logs_lifecycle_shards_latency_counts_and_exitcodes(
     engine = FakeEngine(
         events,
         [[(0, "<answer>1+2</answer>"), (1, "<answer>1+2</answer>")]],
+        worker_latencies=(0.125, 0.25),
     )
-    ticks = iter((10.0, 10.125))
 
     with caplog.at_level(logging.INFO):
         code = run(
@@ -1022,7 +1134,6 @@ def test_logs_lifecycle_shards_latency_counts_and_exitcodes(
             state_store_factory=lambda output_dir: store,
             lock_factory=lambda **kwargs: FakeLock(events, **kwargs),
             now=lambda: datetime(2026, 6, 14, tzinfo=timezone.utc),
-            monotonic=lambda: next(ticks),
             cuda_visible_devices=None,
         )
 
@@ -1030,17 +1141,20 @@ def test_logs_lifecycle_shards_latency_counts_and_exitcodes(
     messages = caplog.text
     assert "stale lock recovery requested" in messages
     assert "acquiring output lock" in messages
-    assert "output lock acquired" in messages
+    assert "output lock acquired normally" in messages
     assert "source rows=2" in messages
     assert "resume processed=0 accepted=0 rejected=0" in messages
     assert "engine starting" in messages
     assert "engine ready" in messages
     assert "batch=1 global_range=[0,2)" in messages
-    assert "worker0_shard=1 worker1_shard=1 latency_seconds=0.125" in messages
+    assert (
+        "worker0_shard=1 worker0_latency_seconds=0.125 "
+        "worker1_shard=1 worker1_latency_seconds=0.250"
+    ) in messages
     assert "accepted=2 rejected=0" in messages
     assert "workers closed" in messages
     assert "worker exitcodes=(0, 0)" in messages
-    assert "stale lock recovered" not in messages
+    assert "stale output lock recovered" not in messages
     assert "<answer>" not in messages
 
 

@@ -5,9 +5,9 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import sys
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -356,6 +356,26 @@ def _build_engine(
     )
 
 
+def _validated_worker_latencies(engine: Any) -> tuple[float, float]:
+    latencies = engine.last_worker_latencies
+    if not isinstance(latencies, tuple) or len(latencies) != 2:
+        raise ValueError(
+            "worker latencies must be a two-item tuple ordered worker0/worker1"
+        )
+    normalized: list[float] = []
+    for latency in latencies:
+        if (
+            type(latency) not in (int, float)
+            or not math.isfinite(float(latency))
+            or latency < 0
+        ):
+            raise ValueError(
+                "worker latencies must be finite nonnegative numbers"
+            )
+        normalized.append(float(latency))
+    return normalized[0], normalized[1]
+
+
 def _execute_locked(
     *,
     config: TeacherGenerationConfig,
@@ -363,7 +383,6 @@ def _execute_locked(
     engine_factory: Callable[..., Any],
     state_store_factory: Callable[[Path], Any],
     now: Callable[[], datetime | str],
-    monotonic: Callable[[], float],
     resources: dict[str, Any],
 ) -> int:
     source_bytes, source_stat, source_hash = _read_source_snapshot(
@@ -458,15 +477,16 @@ def _execute_locked(
             len(prompts),
         )
         shards = split_contiguous(prompts)
-        started_at = monotonic()
         responses = engine.generate(batch_id, prompts)
-        latency = monotonic() - started_at
+        worker_latencies = _validated_worker_latencies(engine)
         LOGGER.info(
-            "batch=%s worker0_shard=%s worker1_shard=%s latency_seconds=%.3f",
+            "batch=%s worker0_shard=%s worker0_latency_seconds=%.3f "
+            "worker1_shard=%s worker1_latency_seconds=%.3f",
             batch_id,
             len(shards[0]),
+            worker_latencies[0],
             len(shards[1]),
-            latency,
+            worker_latencies[1],
         )
         expected_positions = [item.position for item in prompts]
         if len(responses) != len(expected_positions):
@@ -583,7 +603,6 @@ def run(
     state_store_factory: Callable[[Path], Any] = TeacherStateStore,
     lock_factory: Callable[..., Any] = OutputLock,
     now: Callable[[], datetime | str] = _default_now,
-    monotonic: Callable[[], float] = time.monotonic,
     cuda_visible_devices: str | None = None,
 ) -> int:
     resolved_config_path = resolve_path(config_path, REPO_ROOT).resolve()
@@ -600,7 +619,10 @@ def run(
         LOGGER.info("stale lock recovery requested")
     LOGGER.info("acquiring output lock: %s", lock.path)
     lock.acquire(recover_stale=recover_stale_lock)
-    LOGGER.info("output lock acquired: %s", lock.path)
+    if lock.recovered_stale:
+        LOGGER.info("stale output lock recovered and acquired: %s", lock.path)
+    else:
+        LOGGER.info("output lock acquired normally: %s", lock.path)
     resources: dict[str, Any] = {"engine": None}
     primary: BaseException | None = None
     result: int | None = None
@@ -611,7 +633,6 @@ def run(
             engine_factory=engine_factory,
             state_store_factory=state_store_factory,
             now=now,
-            monotonic=monotonic,
             resources=resources,
         )
     except KeyboardInterrupt as exc:
