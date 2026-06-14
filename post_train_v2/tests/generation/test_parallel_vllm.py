@@ -1012,15 +1012,78 @@ def test_close_is_safe_before_start_and_when_called_twice() -> None:
     context = FakeContext()
     engine = make_engine(context)
 
+    assert engine.worker_exitcodes == (None, None)
+    with pytest.raises(AttributeError):
+        engine.worker_exitcodes = (0, 0)
+
     engine.close()
     engine.close()
 
+    assert engine.worker_exitcodes == (None, None)
     assert context.processes == []
     assert all(item.close_calls == 1 for item in context.queues)
     assert all(
         item.join_thread_calls + item.cancel_join_thread_calls == 1
         for item in context.queues
     )
+
+
+def test_worker_exitcodes_cache_graceful_close_in_worker_order() -> None:
+    context = FakeContext()
+    engine = start_engine(context)
+
+    assert engine.worker_exitcodes == (None, None)
+
+    engine.close()
+
+    assert engine.worker_exitcodes == (0, 0)
+
+
+def test_worker_exitcodes_cache_terminate_close_in_worker_order() -> None:
+    context = FakeContext(stubborn=True)
+    engine = start_engine(context)
+
+    engine.close()
+
+    assert engine.worker_exitcodes == (-15, -15)
+
+
+def test_worker_exitcodes_cache_kill_close_in_worker_order() -> None:
+    context = FakeContext(
+        stubborn=True,
+        terminate_exits=False,
+        kill_exits=True,
+    )
+    engine = start_engine(context)
+
+    engine.close()
+
+    assert engine.worker_exitcodes == (-9, -9)
+
+
+def test_worker_exitcodes_represent_partial_startup_failure() -> None:
+    context = FakeContext()
+
+    def process_factory(*, target, args):
+        process = FakeProcess(
+            target=target,
+            args=args,
+            start_error=(
+                RuntimeError("second start failed")
+                if len(context.processes) == 1
+                else None
+            ),
+        )
+        context.processes.append(process)
+        return process
+
+    context.Process = process_factory
+    engine = make_engine(context)
+
+    with pytest.raises(RuntimeError, match="second start failed"):
+        engine.start()
+
+    assert engine.worker_exitcodes == (0, None)
 
 
 def test_close_sends_stop_joins_terminates_stubborn_workers_and_joins_again() -> None:

@@ -328,10 +328,16 @@ class ParallelVLLMEngine:
         ]
         self._response_queue = self._context.Queue()
         self._processes: list[Any] = []
+        self._worker_exitcodes: list[int | None] = [None, None]
         self._started = False
         self._closed = False
         self._cleanup_complete = False
         self._last_batch_id: int | None = None
+
+    @property
+    def worker_exitcodes(self) -> tuple[int | None, int | None]:
+        self._cache_worker_exitcodes()
+        return self._worker_exitcodes[0], self._worker_exitcodes[1]
 
     def start(self) -> ParallelVLLMEngine:
         if self._started:
@@ -449,6 +455,7 @@ class ParallelVLLMEngine:
             graceful_deadline,
             cleanup_errors,
         )
+        self._cache_worker_exitcodes()
         remaining = self._alive_processes()
         for process in remaining:
             try:
@@ -457,6 +464,7 @@ class ParallelVLLMEngine:
                 cleanup_errors.append(f"failed to terminate worker: {exc}")
 
         self._join_processes(remaining, terminate_deadline, cleanup_errors)
+        self._cache_worker_exitcodes()
         remaining = self._alive_processes()
         for process in remaining:
             kill = getattr(process, "kill", None)
@@ -468,6 +476,7 @@ class ParallelVLLMEngine:
                 cleanup_errors.append(f"failed to kill worker: {exc}")
 
         self._join_processes(remaining, final_deadline, cleanup_errors)
+        self._cache_worker_exitcodes()
         orphans = self._alive_processes()
 
         if orphans:
@@ -559,6 +568,15 @@ class ParallelVLLMEngine:
         return [
             process for process in self._processes if self._process_is_alive(process)
         ]
+
+    def _cache_worker_exitcodes(self) -> None:
+        for worker_index, process in enumerate(self._processes[:2]):
+            try:
+                exitcode = process.exitcode
+            except (AssertionError, ValueError):
+                continue
+            if exitcode is not None:
+                self._worker_exitcodes[worker_index] = int(exitcode)
 
     @staticmethod
     def _process_was_started(process: Any) -> bool:
