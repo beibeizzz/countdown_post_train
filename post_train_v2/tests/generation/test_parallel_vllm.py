@@ -32,6 +32,26 @@ def prompts(count: int, start: int = 0) -> list[PositionedPrompt]:
     ]
 
 
+def ready(
+    worker_index,
+    *,
+    pid: object | None = None,
+    visible_device: object | None = None,
+    cache_root: object | None = None,
+) -> WorkerReady:
+    numeric_index = int(worker_index)
+    return WorkerReady(
+        worker_index=worker_index,
+        pid=1000 + numeric_index if pid is None else pid,
+        visible_device=(
+            str(numeric_index) if visible_device is None else visible_device
+        ),
+        cache_root=(
+            f"/cache/gpu{numeric_index}" if cache_root is None else cache_root
+        ),
+    )
+
+
 def spawn_fake_worker(
     spec,
     request_queue,
@@ -55,7 +75,17 @@ def spawn_fake_worker(
         top_p,
         enable_thinking,
     )
-    response_queue.put(WorkerReady(spec.worker_index))
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(spec.device)
+    os.environ["VLLM_CACHE_ROOT"] = spec.cache_root
+    Path(spec.cache_root).mkdir(parents=True, exist_ok=True)
+    response_queue.put(
+        WorkerReady(
+            spec.worker_index,
+            os.getpid(),
+            os.environ["CUDA_VISIBLE_DEVICES"],
+            os.environ["VLLM_CACHE_ROOT"],
+        )
+    )
     while True:
         message = request_queue.get()
         if message == _STOP:
@@ -96,7 +126,17 @@ def spawn_worker_ignoring_stop(
         top_p,
         enable_thinking,
     )
-    response_queue.put(WorkerReady(spec.worker_index))
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(spec.device)
+    os.environ["VLLM_CACHE_ROOT"] = spec.cache_root
+    Path(spec.cache_root).mkdir(parents=True, exist_ok=True)
+    response_queue.put(
+        WorkerReady(
+            spec.worker_index,
+            os.getpid(),
+            os.environ["CUDA_VISIBLE_DEVICES"],
+            os.environ["VLLM_CACHE_ROOT"],
+        )
+    )
     while True:
         time.sleep(0.05)
 
@@ -396,6 +436,9 @@ def test_worker_sets_environment_creates_distinct_cache_and_uses_runtime_kwargs(
     }
     assert isinstance(messages[0], WorkerReady)
     assert messages[0].worker_index == worker_index
+    assert messages[0].pid == os.getpid()
+    assert messages[0].visible_device == str(device)
+    assert messages[0].cache_root == str(tmp_path / f"gpu{worker_index}")
     assert messages[1].worker_index == worker_index
     assert messages[1].batch_id == 4
     assert messages[1].items == (
@@ -426,7 +469,10 @@ def test_worker_returns_empty_result_without_calling_generate(
         generator=generator,
     )
 
-    assert messages == [WorkerReady(1), WorkerResult(1, 5, ())]
+    assert messages == [
+        WorkerReady(1, os.getpid(), "7", str(tmp_path / "gpu1")),
+        WorkerResult(1, 5, ()),
+    ]
     assert generator.calls == []
 
 
@@ -504,7 +550,12 @@ def test_worker_emits_error_with_traceback_and_exits_nonzero(
         )
 
     assert exc_info.value.code == 1
-    assert response_queue.get_nowait() == WorkerReady(0)
+    assert response_queue.get_nowait() == WorkerReady(
+        0,
+        os.getpid(),
+        "0",
+        str(cache_root),
+    )
     error = response_queue.get_nowait()
     assert isinstance(error, WorkerError)
     assert error.worker_index == 0
@@ -766,24 +817,36 @@ def make_engine(
 
 def test_start_waits_for_two_unique_ready_messages_in_any_order() -> None:
     context = FakeContext()
-    context.response_queue.put(WorkerReady(1))
-    context.response_queue.put(WorkerReady(0))
+    context.response_queue.put(ready(1))
+    context.response_queue.put(ready(0))
     engine = make_engine(context)
 
+    assert engine.worker_runtime_info is None
     assert engine.start() is engine
 
     assert len(context.processes) == 2
     assert all(process.started for process in context.processes)
+    assert engine.worker_runtime_info == (ready(0), ready(1))
+    with pytest.raises(AttributeError):
+        engine.worker_runtime_info = None
+
+    engine.close()
+    assert engine.worker_runtime_info == (ready(0), ready(1))
+
+
+def test_worker_ready_requires_all_runtime_metadata() -> None:
+    with pytest.raises(TypeError):
+        WorkerReady(0)
 
 
 @pytest.mark.parametrize(
     ("messages", "match"),
     (
-        ([WorkerReady(0), WorkerReady(0)], "duplicate"),
-        ([WorkerReady(0), WorkerReady(4)], "worker index"),
-        ([WorkerReady(False)], "worker index"),
-        ([WorkerReady(0.0)], "worker index"),
-        ([WorkerReady(0), "bad"], "malformed"),
+        ([ready(0), ready(0)], "duplicate"),
+        ([ready(0), ready(4)], "worker index"),
+        ([ready(False)], "worker index"),
+        ([ready(0.0)], "worker index"),
+        ([ready(0), "bad"], "malformed"),
         ([None], "malformed"),
         ([WorkerError(1, None, "init failed", "trace")], "init failed"),
         ([WorkerError(8, None, "init failed", "trace")], "worker index"),
@@ -803,6 +866,48 @@ def test_start_rejects_duplicate_unknown_error_and_malformed_messages(
         engine.start()
 
     assert all(process.exitcode is not None for process in context.processes)
+    assert engine.worker_runtime_info is None
+
+
+@pytest.mark.parametrize(
+    ("message", "match"),
+    (
+        (ready(0, pid=True), "pid"),
+        (ready(0, pid=0), "pid"),
+        (ready(0, pid=-1), "pid"),
+        (ready(0, pid=1.0), "pid"),
+        (ready(0, visible_device="9"), "visible device"),
+        (ready(0, visible_device=0), "visible device"),
+        (ready(0, cache_root="/wrong/cache"), "cache root"),
+        (ready(0, cache_root=0), "cache root"),
+    ),
+)
+def test_start_rejects_invalid_worker_runtime_metadata_and_cleans_workers(
+    message: WorkerReady,
+    match: str,
+) -> None:
+    context = FakeContext()
+    context.response_queue.put(message)
+    engine = make_engine(context)
+
+    with pytest.raises(ValueError, match=match):
+        engine.start()
+
+    assert engine.worker_runtime_info is None
+    assert all(process.exitcode is not None for process in context.processes)
+
+
+def test_start_rejects_duplicate_worker_pids() -> None:
+    context = FakeContext()
+    context.response_queue.put(ready(0, pid=2222))
+    context.response_queue.put(ready(1, pid=2222))
+    engine = make_engine(context)
+
+    with pytest.raises(ValueError, match="duplicate.*PID"):
+        engine.start()
+
+    assert engine.worker_runtime_info is None
+    assert all(process.exitcode is not None for process in context.processes)
 
 
 def test_start_timeout_closes_both_workers_with_one_deadline() -> None:
@@ -819,8 +924,8 @@ def test_start_timeout_closes_both_workers_with_one_deadline() -> None:
 def test_start_deadline_begins_before_first_process_start() -> None:
     clock = ManualClock()
     context = FakeContext(start_hook=lambda: clock.advance(0.6))
-    context.response_queue.put(WorkerReady(0))
-    context.response_queue.put(WorkerReady(1))
+    context.response_queue.put(ready(0))
+    context.response_queue.put(ready(1))
     engine = make_engine(context, timeout_seconds=1.0, clock=clock)
 
     with pytest.raises(TimeoutError, match="startup"):
@@ -844,7 +949,7 @@ def test_start_failure_cleans_unstarted_process_without_masking_error() -> None:
 
 def test_start_detects_dead_worker_without_waiting_for_timeout() -> None:
     context = FakeContext()
-    context.response_queue.put(WorkerReady(0))
+    context.response_queue.put(ready(0))
     engine = make_engine(context, timeout_seconds=100.0, clock=StepClock(0.01))
 
     original_process = context.Process
@@ -860,10 +965,12 @@ def test_start_detects_dead_worker_without_waiting_for_timeout() -> None:
     with pytest.raises(RuntimeError, match="worker 1.*exit 7"):
         engine.start()
 
+    assert engine.worker_runtime_info is None
+
 
 def start_engine(context: FakeContext) -> ParallelVLLMEngine:
-    context.response_queue.put(WorkerReady(0))
-    context.response_queue.put(WorkerReady(1))
+    context.response_queue.put(ready(0))
+    context.response_queue.put(ready(1))
     engine = make_engine(context)
     engine.start()
     return engine
@@ -903,6 +1010,29 @@ def test_last_worker_latencies_follow_logical_worker_order() -> None:
         engine.last_worker_latencies = (0.0, 0.0)
 
 
+def test_last_worker_result_metadata_follows_logical_worker_order() -> None:
+    context = FakeContext()
+    engine = start_engine(context)
+    assert engine.last_worker_result_counts is None
+    assert engine.last_worker_nonempty_counts is None
+    context.response_queue.put(
+        WorkerResult(1, 1, ((2, ""), (3, " worker-one ")), 2.5)
+    )
+    context.response_queue.put(
+        WorkerResult(0, 1, ((0, "r0"), (1, "r1")), 1.25)
+    )
+
+    result = engine.generate(1, prompts(4))
+
+    assert result == [(0, "r0"), (1, "r1"), (2, ""), (3, " worker-one ")]
+    assert engine.last_worker_result_counts == (2, 2)
+    assert engine.last_worker_nonempty_counts == (2, 1)
+    with pytest.raises(AttributeError):
+        engine.last_worker_result_counts = (0, 0)
+    with pytest.raises(AttributeError):
+        engine.last_worker_nonempty_counts = (0, 0)
+
+
 def test_last_worker_latencies_reset_before_failed_generate() -> None:
     context = FakeContext()
     engine = start_engine(context)
@@ -910,6 +1040,8 @@ def test_last_worker_latencies_reset_before_failed_generate() -> None:
     context.response_queue.put(WorkerResult(1, 1, (), 0.2))
     assert engine.generate(1, []) == []
     assert engine.last_worker_latencies == (0.1, 0.2)
+    assert engine.last_worker_result_counts == (0, 0)
+    assert engine.last_worker_nonempty_counts == (0, 0)
 
     context.response_queue.put(
         WorkerError(0, 2, "generation failed", "trace")
@@ -918,6 +1050,8 @@ def test_last_worker_latencies_reset_before_failed_generate() -> None:
         engine.generate(2, [])
 
     assert engine.last_worker_latencies is None
+    assert engine.last_worker_result_counts is None
+    assert engine.last_worker_nonempty_counts is None
 
 
 def test_generate_rejects_results_with_swapped_worker_shards() -> None:
@@ -986,7 +1120,7 @@ def test_generate_raises_worker_error_and_closes_workers() -> None:
 @pytest.mark.parametrize(
     ("messages", "match"),
     (
-        ([WorkerReady(0)], "malformed"),
+        ([ready(0)], "malformed"),
         ([WorkerResult(0, 8, ())], "batch"),
         ([WorkerResult(3, 9, ())], "worker index"),
         ([WorkerResult(False, 9, ())], "worker index"),
@@ -1087,8 +1221,8 @@ def test_state_errors_and_batch_ids_are_strictly_increasing() -> None:
     with pytest.raises(RuntimeError, match="not started"):
         engine.generate(1, [])
 
-    context.response_queue.put(WorkerReady(0))
-    context.response_queue.put(WorkerReady(1))
+    context.response_queue.put(ready(0))
+    context.response_queue.put(ready(1))
     engine.start()
     with pytest.raises(RuntimeError, match="already started"):
         engine.start()
@@ -1405,8 +1539,8 @@ def test_close_cancels_queue_join_threads_without_exceeding_deadline() -> None:
 
 def test_context_manager_starts_and_closes_engine() -> None:
     context = FakeContext()
-    context.response_queue.put(WorkerReady(0))
-    context.response_queue.put(WorkerReady(1))
+    context.response_queue.put(ready(0))
+    context.response_queue.put(ready(1))
     engine = make_engine(context)
 
     with engine as entered:
@@ -1524,16 +1658,26 @@ def test_real_spawn_context_round_trip_and_shutdown(tmp_path: Path) -> None:
     )
 
     engine.start()
-    processes = tuple(engine._processes)
-    process_ids = {process.pid for process in processes}
+    runtime_info = engine.worker_runtime_info
+    assert runtime_info is not None
+    process_ids = {info.pid for info in runtime_info}
     result = engine.generate(1, prompts(3))
     engine.close()
 
+    assert len(process_ids) == 2
+    assert all(type(pid) is int and pid > 0 for pid in process_ids)
+    for info, spec in zip(runtime_info, engine.worker_specs, strict=True):
+        assert info.worker_index == spec.worker_index
+        assert info.visible_device == str(spec.device)
+        assert Path(info.cache_root).resolve() == Path(spec.cache_root).resolve()
     assert result == [
         (0, "worker-0:prompt-0"),
         (1, "worker-0:prompt-1"),
         (2, "worker-1:prompt-2"),
     ]
+    assert engine.last_worker_result_counts == (2, 1)
+    assert engine.last_worker_nonempty_counts == (2, 1)
+    assert engine.worker_runtime_info == runtime_info
     active_ids = {process.pid for process in multiprocessing.active_children()}
     assert process_ids.isdisjoint(active_ids)
 
@@ -1566,9 +1710,12 @@ def test_real_spawn_close_forces_workers_that_ignore_stop(tmp_path: Path) -> Non
 
     engine.start()
     processes = tuple(engine._processes)
+    runtime_info = engine.worker_runtime_info
+    assert runtime_info is not None
     process_ids = {process.pid for process in processes}
     engine.close()
 
+    assert engine.worker_runtime_info == runtime_info
     assert all(process._closed for process in processes)
     active_ids = {process.pid for process in multiprocessing.active_children()}
     assert process_ids.isdisjoint(active_ids)

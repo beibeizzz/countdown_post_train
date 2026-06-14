@@ -36,6 +36,9 @@ class WorkerRequest:
 @dataclass(frozen=True)
 class WorkerReady:
     worker_index: int
+    pid: int
+    visible_device: str
+    cache_root: str
 
 
 @dataclass(frozen=True)
@@ -195,6 +198,35 @@ def _validate_worker_latency(latency_seconds: float) -> None:
         )
 
 
+def _normalize_cache_root(cache_root: str) -> str:
+    return os.path.normcase(str(Path(cache_root).expanduser().resolve()))
+
+
+def _validate_worker_ready(message: WorkerReady, spec: WorkerSpec) -> None:
+    _validate_worker_index(message.worker_index)
+    if type(message.pid) is not int or message.pid <= 0:
+        raise ValueError("worker ready pid must be a positive exact int")
+    if (
+        type(message.visible_device) is not str
+        or message.visible_device != str(spec.device)
+    ):
+        raise ValueError(
+            f"worker {message.worker_index} visible device "
+            f"{message.visible_device!r} does not match expected "
+            f"{str(spec.device)!r}"
+        )
+    if type(message.cache_root) is not str:
+        raise ValueError("worker ready cache root must be a string")
+    if _normalize_cache_root(message.cache_root) != _normalize_cache_root(
+        spec.cache_root
+    ):
+        raise ValueError(
+            f"worker {message.worker_index} cache root "
+            f"{message.cache_root!r} does not match expected "
+            f"{spec.cache_root!r}"
+        )
+
+
 def _default_generator_factory(**kwargs):
     from post_train.src.countdown.generation import VLLMGenerator
 
@@ -237,7 +269,14 @@ def worker_main(
             top_p=top_p,
             enable_thinking=enable_thinking,
         )
-        response_queue.put(WorkerReady(spec.worker_index))
+        response_queue.put(
+            WorkerReady(
+                worker_index=spec.worker_index,
+                pid=os.getpid(),
+                visible_device=os.environ["CUDA_VISIBLE_DEVICES"],
+                cache_root=os.environ["VLLM_CACHE_ROOT"],
+            )
+        )
 
         while True:
             message = request_queue.get()
@@ -316,8 +355,7 @@ class ParallelVLLMEngine:
         if len({spec.device for spec in specs}) != 2:
             raise ValueError("worker devices must be distinct")
         normalized_cache_roots = {
-            os.path.normcase(os.path.abspath(spec.cache_root))
-            for spec in specs
+            _normalize_cache_root(spec.cache_root) for spec in specs
         }
         if len(normalized_cache_roots) != 2:
             raise ValueError("worker cache roots must be distinct")
@@ -350,7 +388,12 @@ class ParallelVLLMEngine:
         self._response_queue = self._context.Queue()
         self._processes: list[Any] = []
         self._worker_exitcodes: list[int | None] = [None, None]
+        self._worker_runtime_info: (
+            tuple[WorkerReady, WorkerReady] | None
+        ) = None
         self._last_worker_latencies: tuple[float, float] | None = None
+        self._last_worker_result_counts: tuple[int, int] | None = None
+        self._last_worker_nonempty_counts: tuple[int, int] | None = None
         self._started = False
         self._closed = False
         self._cleanup_complete = False
@@ -364,6 +407,18 @@ class ParallelVLLMEngine:
     @property
     def last_worker_latencies(self) -> tuple[float, float] | None:
         return self._last_worker_latencies
+
+    @property
+    def worker_runtime_info(self) -> tuple[WorkerReady, WorkerReady] | None:
+        return self._worker_runtime_info
+
+    @property
+    def last_worker_result_counts(self) -> tuple[int, int] | None:
+        return self._last_worker_result_counts
+
+    @property
+    def last_worker_nonempty_counts(self) -> tuple[int, int] | None:
+        return self._last_worker_nonempty_counts
 
     def start(self) -> ParallelVLLMEngine:
         if self._started:
@@ -397,8 +452,9 @@ class ParallelVLLMEngine:
                 process.start()
                 self._raise_if_deadline_expired(deadline, "worker startup")
 
-            ready_workers: set[int] = set()
-            while len(ready_workers) < 2:
+            ready_messages: dict[int, WorkerReady] = {}
+            ready_pids: set[int] = set()
+            while len(ready_messages) < 2:
                 message = self._next_message(deadline, "worker startup")
                 if isinstance(message, WorkerError):
                     _validate_worker_index(message.worker_index)
@@ -406,16 +462,27 @@ class ParallelVLLMEngine:
                 if not isinstance(message, WorkerReady):
                     raise ValueError(f"malformed worker startup message: {message!r}")
                 _validate_worker_index(message.worker_index)
-                if message.worker_index in ready_workers:
+                spec = self.worker_specs[message.worker_index]
+                _validate_worker_ready(message, spec)
+                if message.worker_index in ready_messages:
                     raise ValueError(
                         f"duplicate ready message from worker "
                         f"{message.worker_index}"
                     )
-                ready_workers.add(message.worker_index)
+                if message.pid in ready_pids:
+                    raise ValueError(
+                        f"duplicate worker PID in ready messages: {message.pid}"
+                    )
+                ready_messages[message.worker_index] = message
+                ready_pids.add(message.pid)
         except Exception as exc:
             self._close_after_failure(exc)
             raise
 
+        self._worker_runtime_info = (
+            ready_messages[0],
+            ready_messages[1],
+        )
         self._started = True
         return self
 
@@ -427,6 +494,8 @@ class ParallelVLLMEngine:
         if not self._started or self._closed:
             raise RuntimeError("ParallelVLLMEngine is not started")
         self._last_worker_latencies = None
+        self._last_worker_result_counts = None
+        self._last_worker_nonempty_counts = None
         if self._last_batch_id is not None and batch_id <= self._last_batch_id:
             raise ValueError(
                 "batch IDs must be strictly increasing: "
@@ -464,6 +533,20 @@ class ParallelVLLMEngine:
             self._last_worker_latencies = (
                 float(results_by_worker[0].latency_seconds),
                 float(results_by_worker[1].latency_seconds),
+            )
+            self._last_worker_result_counts = (
+                len(results_by_worker[0].items),
+                len(results_by_worker[1].items),
+            )
+            self._last_worker_nonempty_counts = (
+                sum(
+                    bool(response.strip())
+                    for _, response in results_by_worker[0].items
+                ),
+                sum(
+                    bool(response.strip())
+                    for _, response in results_by_worker[1].items
+                ),
             )
             return merged
         except Exception as exc:
