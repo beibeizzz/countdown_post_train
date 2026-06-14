@@ -234,7 +234,7 @@ command = [
     "--config",
     "/tmp/post_train_v2_teacher_resume_smoke.yaml",
 ]
-log_path = Path("/tmp/post_train_v2_teacher_resume_smoke.log")
+log_path = Path("/tmp/post_train_v2_teacher_resume_interrupted.log")
 interrupted = False
 with log_path.open("w", encoding="utf-8") as log:
     process = subprocess.Popen(
@@ -259,20 +259,168 @@ assert returncode == 130, returncode
 PY
 ```
 
+Validate the interrupted checkpoint, shutdown record, child cleanup, and lock
+owner before resuming. The child exit codes must be present and numeric, but
+are not compared with a cross-platform whitelist:
+
+```bash
+python - <<'PY'
+import hashlib
+import json
+import math
+import re
+import subprocess
+from pathlib import Path
+
+root = Path("/tmp/post_train_v2_teacher_resume_smoke")
+log_path = Path("/tmp/post_train_v2_teacher_resume_interrupted.log")
+accepted_path = root / "teacher_accepted_20k.jsonl"
+rejected_path = root / "teacher_rejected.jsonl"
+manifest_path = root / "manifest.json"
+journal_path = root / ".teacher_pool.transaction.json"
+lock_path = root / ".teacher_pool.lock"
+
+def read_jsonl(path):
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+accepted = read_jsonl(accepted_path)
+rejected = read_jsonl(rejected_path)
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+source = read_jsonl(Path(manifest["source_path"]))
+if journal_path.exists():
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert set(journal) == {
+        "schema_version",
+        "batch_id",
+        "submitted_start",
+        "submitted_stop",
+        "accepted",
+        "rejected",
+        "manifest",
+    }
+    assert journal["schema_version"] == 1
+    assert 0 < journal["submitted_start"] <= journal["submitted_stop"]
+    assert journal["submitted_start"] == (
+        journal["accepted"]["row_count"] + journal["rejected"]["row_count"]
+    )
+    assert set(journal["accepted"]) == {"existed", "row_count", "sha256"}
+    assert set(journal["rejected"]) == {"existed", "row_count", "sha256"}
+    assert set(journal["manifest"]) == {"existed", "payload"}
+else:
+    assert 0 < manifest["processed_count"] < len(source)
+    assert manifest["processed_count"] == len(accepted) + len(rejected)
+    assert manifest["accepted_count"] == len(accepted)
+    assert manifest["rejected_count"] == len(rejected)
+    assert manifest["last_committed_position"] == manifest["processed_count"] - 1
+    assert manifest["completed"] is False
+    assert manifest["accepted_sha256"] == sha256(accepted_path)
+    assert manifest["rejected_sha256"] == sha256(rejected_path)
+    source_positions = {row["id"]: position for position, row in enumerate(source)}
+    outputs = accepted + rejected
+    assert len(source_positions) == len(source)
+    assert len({row["id"] for row in outputs}) == len(outputs)
+    ordered = sorted(outputs, key=lambda row: source_positions[row["id"]])
+    assert [row["id"] for row in ordered] == [
+        row["id"] for row in source[: manifest["processed_count"]]
+    ]
+
+text = log_path.read_text(encoding="utf-8")
+runtime = re.search(
+    r"worker0 runtime pid=(?P<pid0>[1-9]\d*) visible_device=(?P<device0>\S+) "
+    r"cache_root=(?P<cache0>\S+).*?"
+    r"worker1 runtime pid=(?P<pid1>[1-9]\d*) visible_device=(?P<device1>\S+) "
+    r"cache_root=(?P<cache1>\S+)",
+    text,
+    re.DOTALL,
+)
+assert runtime
+pids = (int(runtime["pid0"]), int(runtime["pid1"]))
+assert pids[0] != pids[1]
+assert (runtime["device0"], runtime["device1"]) == ("0", "1")
+cache_root = Path("/tmp/countdown_teacher_vllm_resume_smoke")
+assert Path(runtime["cache0"]).resolve() == (cache_root / "gpu0").resolve()
+assert Path(runtime["cache1"]).resolve() == (cache_root / "gpu1").resolve()
+batch = re.search(
+    r"worker0_shard=(?P<shard0>\d+) worker0_results=(?P<results0>\d+) "
+    r"worker0_nonempty=(?P<nonempty0>\d+) "
+    r"worker0_latency_seconds=(?P<latency0>\S+) "
+    r"worker1_shard=(?P<shard1>\d+) worker1_results=(?P<results1>\d+) "
+    r"worker1_nonempty=(?P<nonempty1>\d+) "
+    r"worker1_latency_seconds=(?P<latency1>\S+)",
+    text,
+)
+assert batch
+for worker in ("0", "1"):
+    shard = int(batch[f"shard{worker}"])
+    results = int(batch[f"results{worker}"])
+    nonempty = int(batch[f"nonempty{worker}"])
+    latency = float(batch[f"latency{worker}"])
+    assert results == shard > 0
+    assert 0 < nonempty <= results
+    assert math.isfinite(latency) and latency >= 0
+shutdown = re.search(
+    r"worker shutdown exitcodes=\((?P<exit0>-?\d+), (?P<exit1>-?\d+)\) "
+    r"runtime_pids=\((?P<pid0>\d+), (?P<pid1>\d+)\)",
+    text,
+)
+assert shutdown, "shutdown/final exitcodes were not logged"
+assert (int(shutdown["pid0"]), int(shutdown["pid1"])) == pids
+
+for pid in pids:
+    probe = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "pid="],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode != 0 and not probe.stdout.strip(), pid
+
+if lock_path.exists():
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    owner = subprocess.run(
+        ["ps", "-p", str(lock["pid"]), "-o", "pid="],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert owner.returncode != 0 and not owner.stdout.strip(), (
+        f"live lock owner remains: {lock['pid']}"
+    )
+
+print(f"OK: interrupted checkpoint and shutdown validated for PIDs {pids}")
+PY
+```
+
+For this deliberately interrupted run, worker exit codes may be graceful
+zeros or platform-specific termination codes. POSIX may report negative
+signal exit codes; Windows may report a nonzero terminate code. Do not
+whitelist exact numeric values. Acceptance requires coordinator exit code
+130; shutdown/final exit codes logged; both child PIDs gone; no live lock
+owner; and either a valid committed incomplete checkpoint without a journal
+or a structurally valid recovery journal. Never delete a journal; the resumed
+builder performs the authoritative recovery validation.
+
 Resume with the same temporary config and without cleanup:
 
 ```bash
 set -o pipefail
 python post_train_v2/scripts/generation/build_teacher_pool.py \
   --config /tmp/post_train_v2_teacher_resume_smoke.yaml \
-  2>&1 | tee -a /tmp/post_train_v2_teacher_resume_smoke.log
+  2>&1 | tee /tmp/post_train_v2_teacher_resume_resumed.log
 ```
 
 Require evidence that restart loaded committed progress:
 
 ```bash
 grep -E 'resume processed=[1-9][0-9]* accepted=' \
-  /tmp/post_train_v2_teacher_resume_smoke.log
+  /tmp/post_train_v2_teacher_resume_resumed.log
 ```
 
 Validate the completed resumed output by rerunning the validator block from
@@ -293,12 +441,10 @@ from pathlib import Path
 checks = (
     (
         Path("/tmp/post_train_v2_teacher_smoke.log"),
-        1,
         Path("/tmp/countdown_teacher_vllm_smoke"),
     ),
     (
-        Path("/tmp/post_train_v2_teacher_resume_smoke.log"),
-        2,
+        Path("/tmp/post_train_v2_teacher_resume_resumed.log"),
         Path("/tmp/countdown_teacher_vllm_resume_smoke"),
     ),
 )
@@ -321,36 +467,35 @@ batch_re = re.compile(
 )
 
 recorded_pids = set()
-for log_path, expected_runs, cache_root in checks:
+for log_path, cache_root in checks:
     text = log_path.read_text(encoding="utf-8")
     runs = list(run_re.finditer(text))
-    assert len(runs) == expected_runs, (log_path, len(runs), expected_runs)
-    for run in runs:
-        data = run.groupdict()
-        pid0, pid1 = int(data["pid0"]), int(data["pid1"])
-        assert pid0 != pid1
-        assert (data["device0"], data["device1"]) == ("0", "1")
-        assert Path(data["cache0"]).resolve() == (cache_root / "gpu0").resolve()
-        assert Path(data["cache1"]).resolve() == (cache_root / "gpu1").resolve()
-        assert data["cache0"] != data["cache1"]
-        assert (int(data["shutdown_pid0"]), int(data["shutdown_pid1"])) == (
-            pid0,
-            pid1,
-        )
-        assert (int(data["exit0"]), int(data["exit1"])) == (0, 0)
-        batches = list(batch_re.finditer(data["body"]))
-        assert batches, (log_path, pid0, pid1)
-        for batch in batches:
-            values = batch.groupdict()
-            for worker in ("0", "1"):
-                shard = int(values[f"shard{worker}"])
-                results = int(values[f"results{worker}"])
-                nonempty = int(values[f"nonempty{worker}"])
-                latency = float(values[f"latency{worker}"])
-                assert results == shard > 0
-                assert 0 < nonempty <= results
-                assert math.isfinite(latency) and latency >= 0
-        recorded_pids.update((pid0, pid1))
+    assert len(runs) == 1, (log_path, len(runs))
+    data = runs[0].groupdict()
+    pid0, pid1 = int(data["pid0"]), int(data["pid1"])
+    assert pid0 != pid1
+    assert (data["device0"], data["device1"]) == ("0", "1")
+    assert Path(data["cache0"]).resolve() == (cache_root / "gpu0").resolve()
+    assert Path(data["cache1"]).resolve() == (cache_root / "gpu1").resolve()
+    assert data["cache0"] != data["cache1"]
+    assert (int(data["shutdown_pid0"]), int(data["shutdown_pid1"])) == (
+        pid0,
+        pid1,
+    )
+    assert (int(data["exit0"]), int(data["exit1"])) == (0, 0)
+    batches = list(batch_re.finditer(data["body"]))
+    assert batches, (log_path, pid0, pid1)
+    for batch in batches:
+        values = batch.groupdict()
+        for worker in ("0", "1"):
+            shard = int(values[f"shard{worker}"])
+            results = int(values[f"results{worker}"])
+            nonempty = int(values[f"nonempty{worker}"])
+            latency = float(values[f"latency{worker}"])
+            assert results == shard > 0
+            assert 0 < nonempty <= results
+            assert math.isfinite(latency) and latency >= 0
+    recorded_pids.update((pid0, pid1))
 
 for pid in sorted(recorded_pids):
     probe = subprocess.run(
@@ -367,7 +512,8 @@ print(f"OK: runtime metadata and orphan checks passed for {len(recorded_pids)} P
 PY
 ```
 
-Each child-reported runtime pair must contain distinct positive PIDs,
+For the normal uninterrupted smoke and resumed completion run, each
+child-reported runtime pair must contain distinct positive PIDs,
 `visible_device=0` and `visible_device=1`, and the expected distinct
 `gpu0`/`gpu1` cache roots. Every batch must report each worker's result count
 equal to its shard size, a positive nonempty count, and a finite nonnegative
@@ -395,7 +541,10 @@ This writes:
 
 The production run is complete only when the manifest reports
 `accepted_count: 20000`, `target_accepted_count: 20000`,
-`completed: true`, and coherent processed/rejected counts and hashes.
+`completed: true`, and coherent processed/rejected counts and hashes. Its
+uninterrupted coordinator log must also end with
+`worker shutdown exitcodes=(0, 0)` for the recorded runtime PID pair, and
+neither child PID may remain alive.
 
 ## Interruption and Resume
 

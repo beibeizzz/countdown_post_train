@@ -48,7 +48,9 @@ Run every Level 1 gate from the environment runbook:
 7. vLLM tensor-parallel size 1 and 2 smoke tests.
 8. Dual-engine teacher generation smoke test.
 9. V2 coordinator output, worker-runtime metadata, and orphan checks.
-10. Deterministic V2 interruption/resume output, runtime, and orphan checks.
+10. Deterministic V2 interruption/resume checks: interrupted exit 130 with
+    platform-neutral child exit-code handling, then resumed `(0,0)` completion
+    and no orphan PIDs.
 11. TRL and PEFT training smoke test.
 12. Full-model and LoRA-adapter evaluation loader smoke tests.
 
@@ -86,7 +88,9 @@ python post_train_v2/scripts/generation/build_teacher_pool.py \
 
 Resume until the accepted pool reaches 20,000 correct examples. Preserve
 generation order, the V2 manifest and hashes, rejected counts, solver
-validation details, and the production log.
+validation details, and the production log. Production acceptance requires
+the uninterrupted coordinator shutdown to report `(0,0)` and no recorded
+worker PID to remain alive.
 
 The legacy single-engine command is a fallback only for a fresh empty output
 directory or one that remains exclusively legacy-owned:
