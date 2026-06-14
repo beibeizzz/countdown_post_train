@@ -195,6 +195,47 @@ The teacher smoke test maps each isolated child back to a physical GPU using
 the CUDA Driver API (`libcuda.so.1`) plus `nvidia-smi`. It does not query UUIDs
 from `libcudart`.
 
+V2 coordinator smoke and resume gate, run from the repository root with the
+same active V2 virtual environment:
+
+```bash
+cd ..
+rm -rf -- /tmp/post_train_v2_teacher_smoke
+unset CUDA_VISIBLE_DEVICES
+set -o pipefail
+python post_train_v2/scripts/generation/build_teacher_pool.py \
+  --config post_train_v2/configs/generation/teacher_rollout_2gpu_smoke.yaml \
+  2>&1 | tee /tmp/post_train_v2_teacher_smoke.log
+```
+
+Run the copy-runnable validator in
+`post_train_v2/scripts/generation/README.md`. Acceptance requires exactly
+eight accepted rows, `completed: true`, `topology: dual_tp1`, coherent
+accepted/rejected/processed counts, matching source/output/contract hashes,
+an exact duplicate-free source prefix, and no remaining output lock or
+transaction journal.
+
+The log must show both worker device/cache assignments, `engine ready`,
+per-worker shard sizes and latencies, committed batches, worker shutdown, and
+worker exit codes. Preserve `/tmp/post_train_v2_teacher_smoke.log` with the
+remote acceptance record.
+
+Interrupt a smoke run only after at least one `committed batch` log line, then
+rerun the exact smoke command without deleting the output directory. The
+second run must report a nonzero `resume processed=...` position and pass the
+same validator. A transaction journal left by an abnormal interruption is
+recovered automatically on restart; never delete the journal manually. Use
+`--recover-stale-lock` only after inspecting the lock with `cat`, checking its
+PID with `ps`, and confirming that it belongs to this host and the PID is
+dead. Detailed commands and the legacy-adoption boundary are in the
+generation README.
+
+Return to `post_train_v2`:
+
+```bash
+cd post_train_v2
+```
+
 TRL/PEFT constructors and adapter round-trip:
 
 ```bash

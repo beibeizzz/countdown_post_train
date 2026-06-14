@@ -1,19 +1,19 @@
 # Next Full Workflow
 
-This document defines the execution order after the current environment and
-Flash Attention loader work. It deliberately separates validation of the
-existing `post_train` implementation from production use of the future
-distributed `post_train_v2` implementation.
+This document defines the execution order after the current environment,
+Flash Attention loader, and V2 dual-GPU Teacher generation work. It
+deliberately separates implemented V2 generation from validation of the
+existing `post_train` training workflows and future V2 distributed training.
 
 ## Current Boundary
 
 - `post_train` contains the existing data, SFT, RFT, DPO, legacy GRPO, and
   evaluation workflows.
-- `post_train_v2` currently contains the environment baseline, migration
-  design, acceptance scripts, and tests.
+- `post_train_v2` contains the environment baseline, acceptance scripts,
+  tests, and the implemented dual-TP1 Teacher accepted-pool builder.
 - Two-GPU DDP training and verl GRPO are not implemented in `post_train_v2`
-  yet. Do not start a production run from V2 until those entrypoints pass the
-  acceptance gates below.
+  yet. Do not claim or start V2 distributed SFT, RFT, DPO, or verl training
+  until those future entrypoints pass their acceptance gates.
 
 ## Phase 0: Repository Transfer
 
@@ -73,16 +73,30 @@ fields before continuing.
 
 ## Phase 4: Build the Teacher-Accepted Pool
 
-Run Qwen3-8B generation with thinking disabled and the shared prompt and
-generation modules:
+First pass the isolated V2 smoke and resume gate in
+`post_train_v2/scripts/generation/README.md`. Then run the implemented V2
+dual-engine production builder from the repository root:
+
+```bash
+python post_train_v2/scripts/generation/build_teacher_pool.py \
+  --config post_train_v2/configs/generation/teacher_rollout_2gpu.yaml
+```
+
+Resume until the accepted pool reaches 20,000 correct examples. Preserve
+generation order, the V2 manifest and hashes, rejected counts, solver
+validation details, and the production log.
+
+The legacy single-engine command is a fallback only for a fresh empty output
+directory or one that remains exclusively legacy-owned:
 
 ```bash
 python post_train/scripts/data/build_teacher_pool.py \
   --config post_train/configs/teacher_rollout.yaml
 ```
 
-Resume until the accepted pool reaches 20,000 correct examples. Preserve
-generation order, manifests, rejected counts, and solver validation details.
+Never run the legacy builder in a directory containing a V2 manifest or V2
+transaction journal. Legacy-to-V2 adoption requires the explicit
+`--adopt-legacy-state` procedure; V2-to-legacy mixing is prohibited.
 
 ## Phase 5: Build Training Splits
 
@@ -114,9 +128,11 @@ Before rewriting distributed entrypoints, run short existing-pipeline jobs:
 These runs verify contracts and loader behavior. They are not the final
 two-GPU production runs.
 
-## Phase 7: Implement V2 Distributed SFT and DPO
+## Phase 7: Implement Remaining V2 Distributed Training
 
-Implement in this order:
+Dual-GPU Teacher accepted-pool generation is implemented and used in Phase 4.
+Two-GPU DDP training remains future work. Implement the remaining entrypoints
+in this order:
 
 1. Shared distributed bootstrap, rank-safe logging, checkpointing, and fixed
    evaluator.
@@ -124,7 +140,8 @@ Implement in this order:
 3. LoRA SFT with two-rank DDP and adapter-aware evaluation.
 4. RFT training with two-rank DDP.
 5. DPO training with two-rank DDP.
-6. Two-GPU teacher and rejected-response generation sharding.
+6. DPO rejected-response generation sharding, reusing the implemented Teacher
+   orchestration only after its separate contract is designed and tested.
 
 Each entrypoint must support a two-step smoke configuration before production
 hyperparameters are enabled.
