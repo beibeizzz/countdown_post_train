@@ -113,6 +113,71 @@ def test_default_process_alive_is_resolved_when_output_lock_is_constructed(
     assert lock.process_alive is replacement
 
 
+def test_recovered_stale_is_read_only_and_false_after_normal_acquire(tmp_path: Path):
+    lock = make_lock(tmp_path)
+
+    assert lock.recovered_stale is False
+    with pytest.raises(AttributeError):
+        lock.recovered_stale = True
+
+    lock.acquire()
+
+    assert lock.recovered_stale is False
+
+
+def test_recovered_stale_is_true_after_actual_stale_recovery(tmp_path: Path):
+    lock = make_lock(tmp_path, process_alive=lambda pid: False)
+    write_existing_lock(lock, pid=2222, hostname="local-host")
+
+    lock.acquire(recover_stale=True)
+
+    assert lock.recovered_stale is True
+
+
+def test_recovered_stale_is_false_when_recovery_requested_without_stale_lock(tmp_path: Path):
+    lock = make_lock(tmp_path)
+
+    lock.acquire(recover_stale=True)
+
+    assert lock.recovered_stale is False
+
+
+def test_recovered_stale_remains_false_when_acquire_fails_after_stale_removal(
+    tmp_path: Path, monkeypatch
+):
+    lock = make_lock(tmp_path, process_alive=lambda pid: False)
+    write_existing_lock(lock, pid=2222, hostname="local-host")
+    real_open = os.open
+    open_calls = 0
+
+    def fail_second_open(path, flags, mode=0o777):
+        nonlocal open_calls
+        open_calls += 1
+        if open_calls == 1:
+            return real_open(path, flags, mode)
+        raise OSError("injected post-removal failure")
+
+    monkeypatch.setattr(output_lock.os, "open", fail_second_open)
+
+    with pytest.raises(OSError, match="injected post-removal failure"):
+        lock.acquire(recover_stale=True)
+
+    assert lock.recovered_stale is False
+    assert not lock.path.exists()
+
+
+def test_recovered_stale_resets_when_output_lock_instance_is_reused(tmp_path: Path):
+    lock = make_lock(tmp_path, process_alive=lambda pid: False)
+    write_existing_lock(lock, pid=2222, hostname="local-host")
+    lock.acquire(recover_stale=True)
+    assert lock.recovered_stale is True
+    lock.release()
+
+    lock.acquire()
+
+    assert lock.recovered_stale is False
+
+
 def test_acquire_rejects_live_pid_on_same_host_even_with_recovery(tmp_path: Path):
     lock = make_lock(tmp_path, process_alive=lambda pid: pid == 2222)
     write_existing_lock(lock, pid=2222, hostname="local-host")
@@ -120,6 +185,7 @@ def test_acquire_rejects_live_pid_on_same_host_even_with_recovery(tmp_path: Path
     with pytest.raises(RuntimeError, match="active"):
         lock.acquire(recover_stale=True)
 
+    assert lock.recovered_stale is False
     assert lock.path.exists()
 
 
@@ -130,6 +196,7 @@ def test_acquire_recovers_stale_same_host_lock_only_when_explicit(tmp_path: Path
     with pytest.raises(RuntimeError, match="recover_stale"):
         lock.acquire()
 
+    assert lock.recovered_stale is False
     lock.acquire(recover_stale=True)
 
     assert json.loads(lock.path.read_text(encoding="utf-8"))["owner_token"] == "owner-token"
@@ -142,6 +209,7 @@ def test_acquire_refuses_foreign_host_lock_even_with_recovery(tmp_path: Path):
     with pytest.raises(RuntimeError, match="foreign-host"):
         lock.acquire(recover_stale=True)
 
+    assert lock.recovered_stale is False
     assert lock.path.exists()
 
 
@@ -153,6 +221,7 @@ def test_acquire_refuses_corrupt_lock_even_with_recovery(tmp_path: Path):
     with pytest.raises(RuntimeError, match="unreadable|corrupt"):
         lock.acquire(recover_stale=True)
 
+    assert lock.recovered_stale is False
     assert lock.path.read_text(encoding="utf-8") == "{not-json"
 
 

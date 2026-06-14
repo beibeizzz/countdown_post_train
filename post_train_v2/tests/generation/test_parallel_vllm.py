@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import post_train_v2.src.generation.parallel_vllm as parallel_vllm
 from post_train_v2.src.generation.parallel_vllm import (
     ParallelVLLMEngine,
     PositionedPrompt,
@@ -250,6 +251,22 @@ def test_merge_worker_results_rejects_worker_error_with_unknown_worker() -> None
         )
 
 
+@pytest.mark.parametrize(
+    "latency",
+    (True, -0.1, float("inf"), float("-inf"), float("nan"), "slow"),
+)
+def test_merge_worker_results_rejects_invalid_worker_latency(latency) -> None:
+    with pytest.raises(ValueError, match="latency"):
+        merge_worker_results(
+            batch_id=9,
+            expected_positions=[0, 1],
+            messages=[
+                WorkerResult(0, 9, ((0, "r0"),), latency),
+                WorkerResult(1, 9, ((1, "r1"),), 0.0),
+            ],
+        )
+
+
 @pytest.mark.parametrize("worker_index", (False, 0.0))
 def test_merge_worker_results_rejects_non_exact_result_worker_index(
     worker_index,
@@ -379,11 +396,13 @@ def test_worker_sets_environment_creates_distinct_cache_and_uses_runtime_kwargs(
     }
     assert isinstance(messages[0], WorkerReady)
     assert messages[0].worker_index == worker_index
-    assert messages[1] == WorkerResult(
-        worker_index,
-        4,
-        ((0, "response:prompt-0"), (1, "response:prompt-1")),
+    assert messages[1].worker_index == worker_index
+    assert messages[1].batch_id == 4
+    assert messages[1].items == (
+        (0, "response:prompt-0"),
+        (1, "response:prompt-1"),
     )
+    assert messages[1].latency_seconds >= 0.0
     prompt_texts, config = generator.calls[0]
     assert prompt_texts == ["prompt-0", "prompt-1"]
     assert vars(config) == {
@@ -408,6 +427,45 @@ def test_worker_returns_empty_result_without_calling_generate(
     )
 
     assert messages == [WorkerReady(1), WorkerResult(1, 5, ())]
+    assert generator.calls == []
+
+
+def test_worker_measures_only_generate_latency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generator = RecordingGenerator()
+    timestamps = iter((10.0, 10.375))
+    monkeypatch.setattr(
+        parallel_vllm.time,
+        "monotonic",
+        lambda: next(timestamps),
+    )
+
+    _, messages = run_worker(
+        tmp_path,
+        monkeypatch,
+        requests=[WorkerRequest(6, tuple(prompts(2))), _STOP],
+        generator=generator,
+    )
+
+    assert messages[1].latency_seconds == pytest.approx(0.375)
+
+
+def test_worker_empty_shard_latency_is_exactly_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generator = RecordingGenerator()
+
+    _, messages = run_worker(
+        tmp_path,
+        monkeypatch,
+        requests=[WorkerRequest(7, ()), _STOP],
+        generator=generator,
+    )
+
+    assert messages[1].latency_seconds == 0.0
     assert generator.calls == []
 
 
@@ -824,6 +882,42 @@ def test_generate_sends_both_contiguous_requests_including_empty_tail_and_merges
         WorkerRequest(1, (PositionedPrompt(8, "prompt"),))
     ]
     assert context.request_queues[1].items == [WorkerRequest(1, ())]
+
+
+def test_last_worker_latencies_follow_logical_worker_order() -> None:
+    context = FakeContext()
+    engine = start_engine(context)
+    assert engine.last_worker_latencies is None
+    context.response_queue.put(
+        WorkerResult(1, 1, ((2, "r2"),), 2.5)
+    )
+    context.response_queue.put(
+        WorkerResult(0, 1, ((0, "r0"), (1, "r1")), 1.25)
+    )
+
+    result = engine.generate(1, prompts(3))
+
+    assert result == [(0, "r0"), (1, "r1"), (2, "r2")]
+    assert engine.last_worker_latencies == (1.25, 2.5)
+    with pytest.raises(AttributeError):
+        engine.last_worker_latencies = (0.0, 0.0)
+
+
+def test_last_worker_latencies_reset_before_failed_generate() -> None:
+    context = FakeContext()
+    engine = start_engine(context)
+    context.response_queue.put(WorkerResult(0, 1, (), 0.1))
+    context.response_queue.put(WorkerResult(1, 1, (), 0.2))
+    assert engine.generate(1, []) == []
+    assert engine.last_worker_latencies == (0.1, 0.2)
+
+    context.response_queue.put(
+        WorkerError(0, 2, "generation failed", "trace")
+    )
+    with pytest.raises(RuntimeError, match="generation failed"):
+        engine.generate(2, [])
+
+    assert engine.last_worker_latencies is None
 
 
 def test_generate_rejects_results_with_swapped_worker_shards() -> None:

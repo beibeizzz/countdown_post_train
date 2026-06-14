@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import post_train_v2.src.generation.teacher_state as teacher_state
-from post_train.src.countdown.io import read_jsonl, write_jsonl
+from post_train.src.countdown.io import read_jsonl, write_jsonl, write_manifest
 from post_train_v2.src.generation.teacher_state import (
     TeacherGenerationConfig,
     TeacherStateStore,
@@ -631,6 +631,26 @@ def manifest_for_existing_snapshots(
     return manifest
 
 
+def write_builder_legacy_manifest(
+    store: TeacherStateStore,
+    config: TeacherGenerationConfig,
+    accepted: list[dict],
+    rejected: list[dict],
+) -> dict:
+    write_manifest(
+        store.manifest_path,
+        {
+            "name": "teacher_accepted_pool",
+            "model": str(config.model_path.resolve()),
+            "num_accepted": len(accepted),
+            "num_rejected": len(rejected),
+            "max_new_tokens": config.max_new_tokens,
+            "enable_thinking": config.enable_thinking,
+        },
+    )
+    return read_json(store.manifest_path)
+
+
 def commit_rows(
     store: TeacherStateStore,
     config: TeacherGenerationConfig,
@@ -839,6 +859,46 @@ def test_commit_materializes_manifest_over_preexisting_empty_snapshots(
     assert read_json(store.manifest_path) == manifest
 
 
+def test_commit_materializes_v2_manifest_over_validated_legacy_manifest(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    accepted = [accepted_row("a", [1, 2], 3)]
+    rejected = [rejected_row("b", [2, 2], 4)]
+    store = write_legacy_state(config, accepted, rejected)
+    legacy_manifest = write_builder_legacy_manifest(
+        store,
+        config,
+        accepted,
+        rejected,
+    )
+    assert store.has_v2_manifest() is False
+    assert store.load_resume_state(
+        source_rows(),
+        config,
+        adopt_legacy_state=True,
+    ).processed_count == 2
+    v2_manifest = manifest_for_existing_snapshots(
+        store,
+        config,
+        accepted,
+        rejected,
+    )
+
+    store.commit(
+        batch_id=0,
+        submitted_start=2,
+        submitted_stop=2,
+        accepted=accepted,
+        rejected=rejected,
+        manifest=v2_manifest,
+    )
+
+    assert read_json(store.manifest_path) == v2_manifest
+    assert read_json(store.manifest_path) != legacy_manifest
+    assert store.has_v2_manifest() is True
+
+
 def test_snapshot_materialization_rejects_changed_rows_before_journal(
     tmp_path: Path,
 ) -> None:
@@ -976,6 +1036,93 @@ class FailAfterDestination:
         if Path(destination) == self.destination and not self.failed:
             self.failed = True
             raise OSError(f"injected failure after {self.destination.name}")
+
+
+def test_failed_legacy_manifest_initialization_restores_exact_legacy_manifest(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    accepted = [accepted_row("a", [1, 2], 3)]
+    rejected = [rejected_row("b", [2, 2], 4)]
+    initial_store = write_legacy_state(config, accepted, rejected)
+    legacy_manifest = write_builder_legacy_manifest(
+        initial_store,
+        config,
+        accepted,
+        rejected,
+    )
+    legacy_manifest_bytes = initial_store.manifest_path.read_bytes()
+    initial_store.load_resume_state(
+        source_rows(),
+        config,
+        adopt_legacy_state=True,
+    )
+    v2_manifest = manifest_for_existing_snapshots(
+        initial_store,
+        config,
+        accepted,
+        rejected,
+    )
+    failing_store = TeacherStateStore(
+        config.output_dir,
+        replace_file=FailAfterDestination(initial_store.manifest_path),
+    )
+
+    with pytest.raises(OSError, match="injected failure"):
+        failing_store.commit(
+            batch_id=0,
+            submitted_start=2,
+            submitted_stop=2,
+            accepted=accepted,
+            rejected=rejected,
+            manifest=v2_manifest,
+        )
+
+    assert failing_store.transaction_path.exists()
+    TeacherStateStore(config.output_dir).recover_transaction()
+    assert initial_store.manifest_path.read_bytes() == legacy_manifest_bytes
+    assert read_json(initial_store.manifest_path) == legacy_manifest
+    assert initial_store.has_v2_manifest() is False
+    assert not initial_store.transaction_path.exists()
+
+
+@pytest.mark.parametrize(
+    "legacy_manifest",
+    (
+        {"name": "teacher_accepted_pool", "unexpected": True},
+        {
+            "stage": "teacher_accepted_pool",
+            "generation_contract": {},
+        },
+    ),
+)
+def test_snapshot_materialization_rejects_unknown_or_v2_looking_manifest(
+    tmp_path: Path,
+    legacy_manifest: dict,
+) -> None:
+    config = make_config(tmp_path)
+    accepted = [accepted_row("a", [1, 2], 3)]
+    rejected = [rejected_row("b", [2, 2], 4)]
+    store = write_legacy_state(config, accepted, rejected, legacy_manifest)
+    v2_manifest = manifest_for_existing_snapshots(
+        store,
+        config,
+        accepted,
+        rejected,
+    )
+
+    with pytest.raises(ValueError, match="legacy|V2"):
+        store.commit(
+            batch_id=0,
+            submitted_start=2,
+            submitted_stop=2,
+            accepted=accepted,
+            rejected=rejected,
+            manifest=v2_manifest,
+        )
+
+    assert read_json(store.manifest_path) == legacy_manifest
+    assert not store.transaction_path.exists()
 
 
 def test_failed_snapshot_materialization_recovers_exact_files_and_no_manifest(

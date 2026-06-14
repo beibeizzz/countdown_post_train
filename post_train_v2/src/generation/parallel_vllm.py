@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import math
 import os
 import queue
 import time
@@ -42,6 +43,7 @@ class WorkerResult:
     worker_index: int
     batch_id: int
     items: tuple[tuple[int, str], ...]
+    latency_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -164,6 +166,7 @@ def _validate_worker_message(
     if not isinstance(message, WorkerResult):
         raise ValueError(f"malformed worker result: {message!r}")
     _validate_worker_index(message.worker_index)
+    _validate_worker_latency(message.latency_seconds)
     if message.worker_index in seen_workers:
         raise ValueError(
             f"duplicate worker result from worker {message.worker_index}"
@@ -179,6 +182,17 @@ def _validate_worker_message(
 def _validate_worker_index(worker_index: int) -> None:
     if type(worker_index) is not int or worker_index not in (0, 1):
         raise ValueError(f"unknown worker index: {worker_index}")
+
+
+def _validate_worker_latency(latency_seconds: float) -> None:
+    if (
+        type(latency_seconds) not in (int, float)
+        or not math.isfinite(float(latency_seconds))
+        or latency_seconds < 0
+    ):
+        raise ValueError(
+            "worker latency_seconds must be a finite nonnegative number"
+        )
 
 
 def _default_generator_factory(**kwargs):
@@ -241,7 +255,9 @@ def worker_main(
                 continue
 
             prompt_texts = [item.prompt for item in message.items]
+            generate_started_at = time.monotonic()
             responses = generator.generate(prompt_texts, generation_config)
+            latency_seconds = time.monotonic() - generate_started_at
             if len(responses) != len(message.items):
                 raise ValueError(
                     "response count mismatch: "
@@ -252,7 +268,12 @@ def worker_main(
                 for item, response in zip(message.items, responses, strict=True)
             )
             response_queue.put(
-                WorkerResult(spec.worker_index, batch_id, positioned)
+                WorkerResult(
+                    spec.worker_index,
+                    batch_id,
+                    positioned,
+                    latency_seconds,
+                )
             )
             batch_id = None
     except Exception as exc:
@@ -329,6 +350,7 @@ class ParallelVLLMEngine:
         self._response_queue = self._context.Queue()
         self._processes: list[Any] = []
         self._worker_exitcodes: list[int | None] = [None, None]
+        self._last_worker_latencies: tuple[float, float] | None = None
         self._started = False
         self._closed = False
         self._cleanup_complete = False
@@ -338,6 +360,10 @@ class ParallelVLLMEngine:
     def worker_exitcodes(self) -> tuple[int | None, int | None]:
         self._cache_worker_exitcodes()
         return self._worker_exitcodes[0], self._worker_exitcodes[1]
+
+    @property
+    def last_worker_latencies(self) -> tuple[float, float] | None:
+        return self._last_worker_latencies
 
     def start(self) -> ParallelVLLMEngine:
         if self._started:
@@ -400,6 +426,7 @@ class ParallelVLLMEngine:
     ) -> list[tuple[int, str]]:
         if not self._started or self._closed:
             raise RuntimeError("ParallelVLLMEngine is not started")
+        self._last_worker_latencies = None
         if self._last_batch_id is not None and batch_id <= self._last_batch_id:
             raise ValueError(
                 "batch IDs must be strictly increasing: "
@@ -425,11 +452,20 @@ class ParallelVLLMEngine:
                 workers.add(result.worker_index)
                 messages.append(result)
 
-            return merge_worker_results(
+            merged = merge_worker_results(
                 batch_id=batch_id,
                 expected_positions=[item.position for item in items],
                 messages=messages,
             )
+            results_by_worker = {
+                result.worker_index: result
+                for result in messages
+            }
+            self._last_worker_latencies = (
+                float(results_by_worker[0].latency_seconds),
+                float(results_by_worker[1].latency_seconds),
+            )
+            return merged
         except Exception as exc:
             self._close_after_failure(exc)
             raise

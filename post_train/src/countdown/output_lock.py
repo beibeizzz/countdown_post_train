@@ -86,16 +86,23 @@ class OutputLock:
     pid: int = field(default_factory=lambda: os.getpid())
     process_alive: Callable[[int], bool] = field(default_factory=lambda: process_is_alive)
     owner_token: str = field(default_factory=lambda: uuid.uuid4().hex)
+    _recovered_stale: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def recovered_stale(self) -> bool:
+        return self._recovered_stale
 
     def acquire(self, recover_stale: bool = False) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
         with self._operation_guard():
+            self._recovered_stale = False
+            removed_stale = False
             try:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             except FileExistsError:
-                self._handle_existing_lock(recover_stale)
+                removed_stale = self._handle_existing_lock(recover_stale)
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
 
             metadata = {
@@ -117,6 +124,7 @@ class OutputLock:
             except BaseException:
                 self.path.unlink(missing_ok=True)
                 raise
+            self._recovered_stale = removed_stale
 
     @contextmanager
     def _operation_guard(self):
@@ -159,7 +167,7 @@ class OutputLock:
 
         fcntl.flock(guard_file.fileno(), fcntl.LOCK_UN)
 
-    def _handle_existing_lock(self, recover_stale: bool) -> None:
+    def _handle_existing_lock(self, recover_stale: bool) -> bool:
         metadata = self._read_existing_lock()
         existing_hostname = metadata["hostname"]
         existing_pid = metadata["pid"]
@@ -186,6 +194,7 @@ class OutputLock:
             )
 
         self.path.unlink()
+        return True
 
     def _read_existing_lock(self) -> dict:
         try:

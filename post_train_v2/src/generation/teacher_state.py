@@ -45,6 +45,20 @@ JOURNAL_KEYS = {
 }
 SNAPSHOT_KEYS = {"existed", "row_count", "sha256"}
 MANIFEST_SNAPSHOT_KEYS = {"existed", "payload"}
+LEGACY_MANIFEST_PAYLOAD_KEYS = {
+    "name",
+    "model",
+    "num_accepted",
+    "num_rejected",
+    "max_new_tokens",
+    "enable_thinking",
+}
+LEGACY_MANIFEST_ENVELOPE_KEYS = LEGACY_MANIFEST_PAYLOAD_KEYS | {
+    "manifest_version",
+    "schema",
+    "stage",
+    "created_at",
+}
 
 MANIFEST_KEYS = {
     "schema_version",
@@ -400,6 +414,11 @@ def _json_bytes(payload: Any) -> bytes:
     ).encode("utf-8")
 
 
+def _legacy_manifest_bytes(payload: dict[str, Any]) -> bytes:
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    return text.replace("\n", os.linesep).encode("utf-8")
+
+
 def _jsonl_suffix_bytes(rows: Iterable[dict[str, Any]]) -> bytes:
     return b"".join(
         (
@@ -489,6 +508,54 @@ def _parse_utc_timestamp(name: str, value: object) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
         raise ValueError(f"manifest {name} must be timezone-aware UTC")
     return parsed
+
+
+def _validate_legacy_manifest(
+    manifest: dict[str, Any],
+    *,
+    accepted_count: int,
+    rejected_count: int,
+) -> None:
+    keys = set(manifest)
+    if (
+        "generation_contract" in manifest
+        or "generation_contract_fingerprint" in manifest
+    ):
+        raise ValueError("V2-looking manifest is not a recognized legacy manifest")
+    if keys not in (
+        LEGACY_MANIFEST_PAYLOAD_KEYS,
+        LEGACY_MANIFEST_ENVELOPE_KEYS,
+    ):
+        raise ValueError("existing manifest is not a recognized legacy manifest")
+    if manifest["name"] != STAGE:
+        raise ValueError("legacy manifest name mismatch")
+    if (
+        not isinstance(manifest["model"], str)
+        or not manifest["model"]
+        or not Path(manifest["model"]).is_absolute()
+    ):
+        raise ValueError("legacy manifest model must be a nonempty absolute path")
+    count_checks = {
+        "num_accepted": accepted_count,
+        "num_rejected": rejected_count,
+    }
+    for field, expected in count_checks.items():
+        if not _is_exact_int(manifest[field]) or manifest[field] != expected:
+            raise ValueError(f"legacy manifest {field} mismatch")
+    _require_positive_int(
+        "legacy manifest max_new_tokens",
+        manifest["max_new_tokens"],
+    )
+    if type(manifest["enable_thinking"]) is not bool:
+        raise ValueError("legacy manifest enable_thinking must be a boolean")
+    if keys == LEGACY_MANIFEST_ENVELOPE_KEYS:
+        if manifest["manifest_version"] != 1:
+            raise ValueError("legacy manifest manifest_version mismatch")
+        if manifest["schema"] != "countdown.post_train.manifest.v1":
+            raise ValueError("legacy manifest schema mismatch")
+        if manifest["stage"] != STAGE:
+            raise ValueError("legacy manifest stage mismatch")
+        _parse_utc_timestamp("legacy created_at", manifest["created_at"])
 
 
 def _validate_cache_roots(value: object) -> None:
@@ -892,6 +959,7 @@ class TeacherStateStore:
             _read_json(self.manifest_path) if self.manifest_path.exists() else None
         )
         snapshots_exist = accepted_pre["existed"] or rejected_pre["existed"]
+        prior_is_v2 = False
         if manifest_pre is None:
             if snapshots_exist:
                 self._validate_manifest_initialization(
@@ -921,12 +989,43 @@ class TeacherStateStore:
                     )
                 previous_count = 0
         else:
-            _validate_prior_committed_state(
-                manifest_pre,
-                accepted_snapshot=accepted_pre,
-                rejected_snapshot=rejected_pre,
-            )
-            self._validate_immutable_transition(manifest_pre, manifest)
+            try:
+                _validate_legacy_manifest(
+                    manifest_pre,
+                    accepted_count=accepted_pre["row_count"],
+                    rejected_count=rejected_pre["row_count"],
+                )
+            except ValueError as legacy_error:
+                if (
+                    isinstance(
+                        manifest_pre.get("generation_contract_fingerprint"),
+                        str,
+                    )
+                    and manifest_pre["generation_contract_fingerprint"]
+                ):
+                    _validate_prior_committed_state(
+                        manifest_pre,
+                        accepted_snapshot=accepted_pre,
+                        rejected_snapshot=rejected_pre,
+                    )
+                    self._validate_immutable_transition(manifest_pre, manifest)
+                    prior_is_v2 = True
+                else:
+                    raise ValueError(
+                        "existing manifest is neither recognized legacy nor "
+                        "an exact V2 manifest"
+                    ) from legacy_error
+            else:
+                self._validate_manifest_initialization(
+                    batch_id=batch_id,
+                    submitted_start=submitted_start,
+                    submitted_stop=submitted_stop,
+                    accepted=accepted,
+                    rejected=rejected,
+                    manifest=manifest,
+                    accepted_snapshot=accepted_pre,
+                    rejected_snapshot=rejected_pre,
+                )
             previous_count = (
                 accepted_pre["row_count"] + rejected_pre["row_count"]
             )
@@ -935,12 +1034,12 @@ class TeacherStateStore:
                 "submitted_start does not match previous processed count"
             )
         if (
-            manifest_pre is not None
+            prior_is_v2
             and "created_at" in manifest_pre
             and manifest["created_at"] != manifest_pre["created_at"]
         ):
             raise ValueError("manifest created_at must be preserved")
-        if manifest_pre is not None:
+        if prior_is_v2:
             previous_updated_at = _parse_utc_timestamp(
                 "updated_at",
                 manifest_pre["updated_at"],
@@ -1069,11 +1168,19 @@ class TeacherStateStore:
             label="rejected snapshot",
         )
         manifest_state = journal["manifest"]
-        manifest_restore = (
-            _json_bytes(manifest_state["payload"])
-            if manifest_state["existed"]
-            else None
-        )
+        manifest_restore = None
+        if manifest_state["existed"]:
+            payload = manifest_state["payload"]
+            try:
+                _validate_legacy_manifest(
+                    payload,
+                    accepted_count=journal["accepted"]["row_count"],
+                    rejected_count=journal["rejected"]["row_count"],
+                )
+            except ValueError:
+                manifest_restore = _json_bytes(payload)
+            else:
+                manifest_restore = _legacy_manifest_bytes(payload)
 
         owner = (
             f"recovery.{journal['batch_id']}.{os.getpid()}."
@@ -1476,22 +1583,41 @@ class TeacherStateStore:
             )
         if manifest["existed"]:
             payload = manifest["payload"]
-            _validate_manifest_self_consistency(
-                payload,
-                expected_devices=None,
-            )
-            manifest_checks = {
-                "processed_count": start,
-                "accepted_count": journal["accepted"]["row_count"],
-                "rejected_count": journal["rejected"]["row_count"],
-                "accepted_sha256": journal["accepted"]["sha256"],
-                "rejected_sha256": journal["rejected"]["sha256"],
-            }
-            for field, expected in manifest_checks.items():
-                if payload[field] != expected:
-                    raise ValueError(
-                        f"transaction journal pre-manifest {field} is incoherent"
+            try:
+                _validate_legacy_manifest(
+                    payload,
+                    accepted_count=journal["accepted"]["row_count"],
+                    rejected_count=journal["rejected"]["row_count"],
+                )
+            except ValueError as legacy_error:
+                if (
+                    not isinstance(
+                        payload.get("generation_contract_fingerprint"),
+                        str,
                     )
+                    or not payload["generation_contract_fingerprint"]
+                ):
+                    raise ValueError(
+                        "transaction journal pre-manifest is neither "
+                        "recognized legacy nor exact V2"
+                    ) from legacy_error
+                _validate_manifest_self_consistency(
+                    payload,
+                    expected_devices=None,
+                )
+                manifest_checks = {
+                    "processed_count": start,
+                    "accepted_count": journal["accepted"]["row_count"],
+                    "rejected_count": journal["rejected"]["row_count"],
+                    "accepted_sha256": journal["accepted"]["sha256"],
+                    "rejected_sha256": journal["rejected"]["sha256"],
+                }
+                for field, expected in manifest_checks.items():
+                    if payload[field] != expected:
+                        raise ValueError(
+                            f"transaction journal pre-manifest {field} "
+                            "is incoherent"
+                        )
 
     def _prepare_snapshot_restore(
         self,
