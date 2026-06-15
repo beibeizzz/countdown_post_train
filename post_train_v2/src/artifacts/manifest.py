@@ -107,6 +107,10 @@ def _validate_relative_path(value: Any) -> str:
         raise ValueError("artifact relative path must not traverse parents")
     if posix_path == PurePosixPath(".") or windows_path == PureWindowsPath("."):
         raise ValueError("artifact relative path must identify a file")
+    if "\\" in value or value != posix_path.as_posix():
+        raise ValueError(
+            "artifact relative path must use canonical POSIX syntax"
+        )
     return value
 
 
@@ -520,7 +524,8 @@ class ManifestV2:
 def publish_manifest(path: str | Path, manifest: ManifestV2) -> None:
     if not isinstance(manifest, ManifestV2):
         raise TypeError("manifest must be a ManifestV2")
-    publish_json(path, manifest.to_dict())
+    validated = ManifestV2.parse(manifest.to_dict())
+    publish_json(path, validated.to_dict())
 
 
 def load_manifest(path: str | Path) -> ManifestV2:

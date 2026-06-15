@@ -99,6 +99,27 @@ def test_manifest_round_trip_preserves_complete_contract(tmp_path):
     assert not list(path.parent.glob("*.tmp"))
 
 
+@pytest.mark.parametrize("preexisting", (False, True))
+def test_publish_manifest_revalidates_mutated_nested_state_before_write(
+    tmp_path, preexisting
+):
+    path = tmp_path / "manifest.json"
+    original = b'{"existing":true}'
+    if preexisting:
+        path.write_bytes(original)
+    manifest = build_manifest(config={"nested": {"seed": 42}})
+    manifest.config["nested"]["seed"] = 7
+
+    with pytest.raises(ValueError, match="config hash"):
+        publish_manifest(path, manifest)
+
+    if preexisting:
+        assert path.read_bytes() == original
+    else:
+        assert not path.exists()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
 def test_artifact_id_is_stable_across_creation_times():
     first = build_manifest(
         created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -202,6 +223,47 @@ def test_parent_artifact_rejects_invalid_sha256(sha256):
 def test_artifact_file_rejects_unsafe_relative_paths(relative_path):
     with pytest.raises(ValueError, match="relative path"):
         ArtifactFile(relative_path, FILE_HASH, 4, 1, {"id": "string"})
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "nested//source.jsonl",
+        "nested/./source.jsonl",
+        "nested\\source.jsonl",
+    ),
+)
+def test_artifact_file_rejects_noncanonical_posix_paths(relative_path):
+    with pytest.raises(ValueError, match="canonical POSIX"):
+        ArtifactFile(relative_path, FILE_HASH, 4, 1, {"id": "string"})
+
+
+@pytest.mark.parametrize(
+    "alias",
+    (
+        "nested//source.jsonl",
+        "nested/./source.jsonl",
+        "nested\\source.jsonl",
+    ),
+)
+def test_manifest_parse_rejects_duplicate_path_aliases(alias):
+    data = build_manifest(
+        files=[
+            ArtifactFile(
+                "nested/source.jsonl",
+                FILE_HASH,
+                4,
+                1,
+                {"id": "string"},
+            )
+        ]
+    ).to_dict()
+    aliased_file = deepcopy(data["files"][0])
+    aliased_file["relative_path"] = alias
+    data["files"].append(aliased_file)
+
+    with pytest.raises(ValueError, match="canonical POSIX"):
+        ManifestV2.parse(data)
 
 
 @pytest.mark.parametrize(
