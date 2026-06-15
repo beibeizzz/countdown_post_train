@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from copy import deepcopy
 from collections import defaultdict
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
@@ -38,13 +39,15 @@ def stratified_sample(
 
     bucket_keys = sorted(buckets)
     random_source = random.Random(seed)
+    quota_bucket_keys = list(bucket_keys)
+    random_source.shuffle(quota_bucket_keys)
     shuffled_buckets: dict[str, list[Row]] = {}
     for bucket_key in bucket_keys:
         bucket_rows = list(buckets[bucket_key])
         random_source.shuffle(bucket_rows)
         shuffled_buckets[bucket_key] = bucket_rows
 
-    quotas = _balanced_quotas(bucket_keys, shuffled_buckets, size)
+    quotas = _balanced_quotas(quota_bucket_keys, shuffled_buckets, size)
     selected: list[Row] = []
     leftovers: list[Row] = []
     for bucket_key in bucket_keys:
@@ -121,7 +124,7 @@ def _normalize_rows(rows: Sequence[Row]) -> list[Row]:
         bucket_key = bucket.get("bucket_key")
         if not isinstance(bucket_key, str) or not bucket_key:
             raise ValueError("row is missing bucket.bucket_key")
-        normalized.append(row)
+        normalized.append(deepcopy(row))
 
     return sorted(normalized, key=lambda row: row["id"])
 

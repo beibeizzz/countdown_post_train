@@ -1,5 +1,6 @@
 from copy import deepcopy
 import json
+import random
 
 import pytest
 
@@ -55,6 +56,63 @@ def test_sampling_does_not_modify_input_rows():
     stratified_sample(rows, size=5, seed=1)
 
     assert rows == original
+
+
+def test_sampling_results_do_not_share_mutable_objects_with_input():
+    rows = _rows()
+    sample = stratified_sample(rows, size=5, seed=1)
+    sampled_id = sample[0]["id"]
+    input_row = next(row for row in rows if row["id"] == sampled_id)
+
+    sample[0]["source_index"] = -1
+    sample[0]["bucket"]["bucket_key"] = "mutated"
+
+    assert input_row["source_index"] != -1
+    assert input_row["bucket"]["bucket_key"] != "mutated"
+
+
+def test_validation_split_results_do_not_share_mutable_objects():
+    rows = _rows()
+    splits = build_validation_splits(
+        rows,
+        validation_size=8,
+        eval_size=3,
+        seed=17,
+    )
+    shared_id = splits.eval_rows[0]["id"]
+    val_row = next(row for row in splits.val_rows if row["id"] == shared_id)
+    input_row = next(row for row in rows if row["id"] == shared_id)
+    train_row = splits.train_candidates[0]
+    train_input_row = next(row for row in rows if row["id"] == train_row["id"])
+
+    splits.eval_rows[0]["source_index"] = -1
+    splits.eval_rows[0]["bucket"]["bucket_key"] = "mutated"
+    train_row["source_index"] = -2
+    train_row["bucket"]["bucket_key"] = "train-mutated"
+
+    assert val_row["source_index"] != -1
+    assert val_row["bucket"]["bucket_key"] != "mutated"
+    assert input_row["source_index"] != -1
+    assert input_row["bucket"]["bucket_key"] != "mutated"
+    assert train_input_row["source_index"] != -2
+    assert train_input_row["bucket"]["bucket_key"] != "train-mutated"
+
+
+def test_seed_determines_remainder_bucket_order_without_lexical_bias():
+    rows = _rows(3)
+    bucket_keys = sorted(row["bucket"]["bucket_key"] for row in rows)
+    selected_by_seed = {}
+
+    for seed in range(6):
+        expected_order = list(bucket_keys)
+        random.Random(seed).shuffle(expected_order)
+        selected_bucket = stratified_sample(rows, size=1, seed=seed)[0]["bucket"][
+            "bucket_key"
+        ]
+        selected_by_seed[seed] = selected_bucket
+        assert selected_bucket == expected_order[0]
+
+    assert set(selected_by_seed.values()) == set(bucket_keys)
 
 
 @pytest.mark.parametrize("size", [-1, 13])

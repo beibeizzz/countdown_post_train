@@ -15,8 +15,12 @@ class _ExprNode:
 
 
 def solve_countdown(numbers: list[int], target: int) -> str | None:
-    normalized_numbers = tuple(sorted(int(number) for number in numbers))
-    return _solve_countdown_cached(normalized_numbers, int(target))
+    _require_non_negative_int(target, "target")
+    for index, number in enumerate(numbers):
+        _require_non_negative_int(number, f"numbers[{index}]")
+
+    normalized_numbers = tuple(sorted(numbers))
+    return _solve_countdown_cached(normalized_numbers, target)
 
 
 @functools.lru_cache(maxsize=200_000)
@@ -116,3 +120,10 @@ def _depth(node: ast.AST) -> int:
     if isinstance(node, ast.BinOp):
         return 1 + max(_depth(node.left), _depth(node.right))
     return 0
+
+
+def _require_non_negative_int(value: object, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")

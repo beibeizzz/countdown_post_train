@@ -46,6 +46,20 @@ def test_extract_and_complete_answer_apis_use_last_complete_tag():
     assert has_complete_answer_tag("<answer> 1+1") is False
 
 
+def test_extract_answer_rejects_truncated_last_answer_after_complete_answer():
+    text = "draft <answer> 1+1 </answer>\nfinal <answer> (7-3)"
+
+    assert extract_answer_text(text) is None
+    assert has_complete_answer_tag(text) is False
+    assert validate_countdown_response(text, [1, 1], 2).error == "missing_answer_tag"
+
+
+def test_extract_answer_rejects_last_answer_with_truncated_closing_tag():
+    text = "<answer> 1+1 </answer>\n<answer> 2+2 </ans"
+
+    assert extract_answer_text(text) is None
+
+
 def test_fractional_intermediate_is_valid():
     result = validate_countdown_expression(
         "(85-(45/(69-74)))",
@@ -118,6 +132,34 @@ def test_solver_returns_fully_parenthesized_valid_gold_expression():
 
 def test_solver_returns_none_for_unsolved_instance():
     assert solve_countdown([1, 1], 3) is None
+
+
+@pytest.mark.parametrize(
+    "numbers,target",
+    [
+        ([True, 1], 2),
+        ([1.0, 1], 2),
+        (["1", 1], 2),
+        ([1, 1], True),
+        ([1, 1], 2.0),
+        ([1, 1], "2"),
+    ],
+)
+def test_solver_rejects_non_integer_inputs(numbers, target):
+    with pytest.raises(ValueError):
+        solve_countdown(numbers, target)
+
+
+@pytest.mark.parametrize(
+    "numbers,target",
+    [
+        ([-1, 2], 1),
+        ([1, 2], -1),
+    ],
+)
+def test_solver_rejects_negative_inputs(numbers, target):
+    with pytest.raises(ValueError):
+        solve_countdown(numbers, target)
 
 
 def test_expression_metadata_and_bucketing_preserve_v1_semantics():

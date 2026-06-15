@@ -13,6 +13,7 @@ ANSWER_RE = re.compile(
     r"<answer>\s*(.*?)\s*</answer>",
     re.IGNORECASE | re.DOTALL,
 )
+ANSWER_START_RE = re.compile(r"<answer(?=\s|>|$)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -25,10 +26,15 @@ class ValidationResult:
 
 
 def extract_answer_text(text: str) -> str | None:
-    matches = list(ANSWER_RE.finditer(text))
-    if not matches:
+    starts = list(ANSWER_START_RE.finditer(text))
+    if not starts:
         return None
-    return matches[-1].group(1).strip()
+
+    last_start = starts[-1].start()
+    for match in reversed(list(ANSWER_RE.finditer(text))):
+        if match.start() == last_start:
+            return match.group(1).strip()
+    return None
 
 
 def has_complete_answer_tag(text: str) -> bool:
