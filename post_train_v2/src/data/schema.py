@@ -10,6 +10,7 @@ from math import gcd
 from typing import Any
 
 from post_train_v2.src.countdown.bucketing import assign_bucket
+from post_train_v2.src.countdown.prompts import build_solution_prompt
 from post_train_v2.src.countdown.validation import (
     serialize_fraction,
     validate_countdown_expression,
@@ -75,6 +76,7 @@ VALIDATION_ERRORS = {
 }
 DPO_REJECTED_CATEGORIES = VALIDATION_ERRORS | {"truncated"}
 FRACTION_RE = re.compile(r"-?(?:0|[1-9]\d*)/[1-9]\d*\Z")
+MAX_NESTING_DEPTH = 64
 
 
 def validate_normalized_source(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -89,6 +91,8 @@ def validate_normalized_source(row: Mapping[str, Any]) -> dict[str, Any]:
     target = _require_nonnegative_int("target", source["target"])
     gold_expr = _require_nonempty_string("gold_expr", source["gold_expr"])
     prompt = _require_nonempty_string("prompt", source["prompt"])
+    if prompt != build_solution_prompt(numbers, target):
+        raise ValueError("prompt must equal the canonical V2 solution prompt")
     bucket = _validate_bucket(source["bucket"], len(numbers))
     gold_validation = validate_countdown_expression(gold_expr, numbers, target)
     if not gold_validation.ok:
@@ -363,19 +367,34 @@ def _validate_reward_model(value: Any) -> dict[str, Any]:
 
 def _normalize_json_mapping(name: str, value: Any) -> dict[str, Any]:
     mapping = _require_mapping(name, value)
-    normalized = _normalize_json_value(name, mapping)
+    normalized = _normalize_json_value(name, mapping, active=set(), depth=0)
     assert isinstance(normalized, dict)
     return normalized
 
 
 def _normalize_arrow_mapping(name: str, value: Any) -> dict[str, Any]:
     mapping = _require_mapping(name, value)
-    normalized, _ = _normalize_arrow_value(name, mapping)
+    normalized, _ = _normalize_arrow_value(
+        name,
+        mapping,
+        active=set(),
+        depth=0,
+    )
     assert isinstance(normalized, dict)
     return normalized
 
 
-def _normalize_arrow_value(path: str, value: Any) -> tuple[Any, tuple[Any, ...]]:
+def _normalize_arrow_value(
+    path: str,
+    value: Any,
+    *,
+    active: set[int],
+    depth: int,
+) -> tuple[Any, tuple[Any, ...]]:
+    if isinstance(value, (list, Mapping)) and depth > MAX_NESTING_DEPTH:
+        raise ValueError(
+            f"{path} exceeds maximum nesting depth {MAX_NESTING_DEPTH}"
+        )
     if value is None:
         return None, ("null",)
     if type(value) is bool:
@@ -391,27 +410,41 @@ def _normalize_arrow_value(path: str, value: Any) -> tuple[Any, tuple[Any, ...]]
     if type(value) is str:
         return value, ("string",)
     if isinstance(value, list):
-        normalized_items: list[Any] = []
-        item_type: tuple[Any, ...] = ("null",)
-        for index, item in enumerate(value):
-            normalized_item, candidate_type = _normalize_arrow_value(
-                f"{path}[{index}]", item
-            )
-            item_type = _merge_arrow_types(path, item_type, candidate_type)
-            normalized_items.append(normalized_item)
-        return normalized_items, ("list", item_type)
+        object_id = _enter_container(path, value, active)
+        try:
+            normalized_items: list[Any] = []
+            item_type: tuple[Any, ...] = ("null",)
+            for index, item in enumerate(value):
+                normalized_item, candidate_type = _normalize_arrow_value(
+                    f"{path}[{index}]",
+                    item,
+                    active=active,
+                    depth=depth + 1,
+                )
+                item_type = _merge_arrow_types(path, item_type, candidate_type)
+                normalized_items.append(normalized_item)
+            return normalized_items, ("list", item_type)
+        finally:
+            active.remove(object_id)
     if isinstance(value, Mapping):
-        normalized_mapping: dict[str, Any] = {}
-        fields: list[tuple[str, tuple[Any, ...]]] = []
         if any(not isinstance(key, str) for key in value):
             raise ValueError(f"{path} contains a non-string mapping key")
-        for key in sorted(value):
-            normalized_item, item_type = _normalize_arrow_value(
-                f"{path}.{key}", value[key]
-            )
-            normalized_mapping[key] = normalized_item
-            fields.append((key, item_type))
-        return normalized_mapping, ("mapping", tuple(fields))
+        object_id = _enter_container(path, value, active)
+        try:
+            normalized_mapping: dict[str, Any] = {}
+            fields: list[tuple[str, tuple[Any, ...]]] = []
+            for key in sorted(value):
+                normalized_item, item_type = _normalize_arrow_value(
+                    f"{path}.{key}",
+                    value[key],
+                    active=active,
+                    depth=depth + 1,
+                )
+                normalized_mapping[key] = normalized_item
+                fields.append((key, item_type))
+            return normalized_mapping, ("mapping", tuple(fields))
+        finally:
+            active.remove(object_id)
     raise ValueError(f"{path} contains a non-Arrow-compatible value")
 
 
@@ -451,7 +484,17 @@ def _merge_arrow_types(
     raise ValueError(f"{path} list elements do not share an Arrow type")
 
 
-def _normalize_json_value(path: str, value: Any) -> Any:
+def _normalize_json_value(
+    path: str,
+    value: Any,
+    *,
+    active: set[int],
+    depth: int,
+) -> Any:
+    if isinstance(value, (list, Mapping)) and depth > MAX_NESTING_DEPTH:
+        raise ValueError(
+            f"{path} exceeds maximum nesting depth {MAX_NESTING_DEPTH}"
+        )
     if value is None or type(value) in (bool, int, str):
         return value
     if type(value) is float:
@@ -459,18 +502,44 @@ def _normalize_json_value(path: str, value: Any) -> Any:
             raise ValueError(f"{path} contains a non-finite float")
         return value
     if isinstance(value, list):
-        return [
-            _normalize_json_value(f"{path}[{index}]", item)
-            for index, item in enumerate(value)
-        ]
+        object_id = _enter_container(path, value, active)
+        try:
+            return [
+                _normalize_json_value(
+                    f"{path}[{index}]",
+                    item,
+                    active=active,
+                    depth=depth + 1,
+                )
+                for index, item in enumerate(value)
+            ]
+        finally:
+            active.remove(object_id)
     if isinstance(value, Mapping):
-        normalized: dict[str, Any] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise ValueError(f"{path} contains a non-string mapping key")
-            normalized[key] = _normalize_json_value(f"{path}.{key}", item)
-        return normalized
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError(f"{path} contains a non-string mapping key")
+        object_id = _enter_container(path, value, active)
+        try:
+            normalized: dict[str, Any] = {}
+            for key, item in value.items():
+                normalized[key] = _normalize_json_value(
+                    f"{path}.{key}",
+                    item,
+                    active=active,
+                    depth=depth + 1,
+                )
+            return normalized
+        finally:
+            active.remove(object_id)
     raise ValueError(f"{path} contains a non-JSON-compatible value")
+
+
+def _enter_container(path: str, value: Any, active: set[int]) -> int:
+    object_id = id(value)
+    if object_id in active:
+        raise ValueError(f"{path} contains a reference cycle")
+    active.add(object_id)
+    return object_id
 
 
 def _require_fraction_or_none(name: str, value: Any) -> str | None:
@@ -501,6 +570,8 @@ def _require_exact_keys(
     value: Mapping[str, Any],
     expected: set[str],
 ) -> None:
+    if any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{name} keys must be strings")
     actual = set(value)
     if actual != expected:
         missing = sorted(expected - actual)

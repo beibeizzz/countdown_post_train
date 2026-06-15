@@ -3,6 +3,7 @@ from fractions import Fraction
 
 import pytest
 
+from post_train_v2.src.countdown.prompts import build_solution_prompt
 from post_train_v2.src.data import (
     validate_dpo_record,
     validate_normalized_source,
@@ -19,7 +20,7 @@ def normalized_source() -> dict:
         "numbers": [1, 2],
         "target": 3,
         "gold_expr": "1+2",
-        "prompt": "Use 1 and 2 to make 3.",
+        "prompt": build_solution_prompt([1, 2], 3),
         "bucket": {
             "num_count": 2,
             "expr_depth": 2,
@@ -104,6 +105,14 @@ def assert_deep_copy(original: dict, result: dict, nested_path: tuple[str, ...])
         original_nested = original_nested[key]
         result_nested = result_nested[key]
     assert result_nested is not original_nested
+
+
+def nested_list(depth: int) -> list:
+    value: object = "leaf"
+    for _ in range(depth):
+        value = [value]
+    assert isinstance(value, list)
+    return value
 
 
 def test_normalized_source_returns_canonical_deep_copy_without_mutating_input():
@@ -202,6 +211,34 @@ def test_normalized_source_requires_gold_expr_to_be_a_correct_solution(
         validate_normalized_source(row)
 
 
+def test_normalized_source_requires_canonical_v2_solution_prompt():
+    row = normalized_source()
+    row["prompt"] = "Use 1 and 2 to make 3."
+
+    with pytest.raises(ValueError, match="prompt.*canonical"):
+        validate_normalized_source(row)
+
+
+@pytest.mark.parametrize(
+    ("location", "match"),
+    [
+        ("record", "normalized source.*keys must be strings"),
+        ("bucket", "bucket.*keys must be strings"),
+    ],
+)
+def test_exact_key_schemas_reject_non_string_keys_with_stable_error(
+    location,
+    match,
+):
+    row = normalized_source()
+    target = row if location == "record" else row["bucket"]
+    target["unexpected"] = True
+    target[1] = "non-string"
+
+    with pytest.raises(ValueError, match=match):
+        validate_normalized_source(row)
+
+
 def test_normalized_source_is_not_restricted_to_arrow_int64():
     large = 2**80
     row = normalized_source()
@@ -210,6 +247,7 @@ def test_normalized_source_is_not_restricted_to_arrow_int64():
             "numbers": [large, 1],
             "target": large + 1,
             "gold_expr": f"{large}+1",
+            "prompt": build_solution_prompt([large, 1], large + 1),
         }
     )
     row["bucket"] = {
@@ -474,6 +512,52 @@ def test_sft_provenance_remains_json_friendly_not_arrow_restricted():
     assert validate_sft_record(row) == row
 
 
+@pytest.mark.parametrize("cycle_kind", ["mapping", "list"])
+def test_sft_provenance_rejects_cycles_with_field_path(cycle_kind):
+    row = sft_record()
+    if cycle_kind == "mapping":
+        cycle = {}
+        cycle["self"] = cycle
+    else:
+        cycle = []
+        cycle.append(cycle)
+    row["provenance"]["cycle"] = cycle
+
+    with pytest.raises(ValueError, match="provenance.cycle.*cycle"):
+        validate_sft_record(row)
+
+
+def test_sft_provenance_rejects_excessive_nesting_without_recursion_error():
+    row = sft_record()
+    row["provenance"]["deep"] = nested_list(65)
+
+    with pytest.raises(ValueError, match="provenance.deep.*nesting depth"):
+        validate_sft_record(row)
+
+
+def test_sft_provenance_accepts_maximum_container_nesting_depth():
+    row = sft_record()
+    row["provenance"]["deep"] = nested_list(64)
+
+    assert validate_sft_record(row) == row
+
+
+def test_sft_provenance_allows_shared_noncyclic_references_and_deep_copies():
+    row = sft_record()
+    shared = {"values": [1, 2]}
+    row["provenance"]["left"] = shared
+    row["provenance"]["right"] = shared
+
+    result = validate_sft_record(row)
+
+    assert result["provenance"]["left"] == shared
+    assert result["provenance"]["right"] == shared
+    assert result["provenance"]["left"] is not shared
+    assert result["provenance"]["right"] is not shared
+    result["provenance"]["left"]["values"].append(3)
+    assert shared == {"values": [1, 2]}
+
+
 @pytest.mark.parametrize(
     "category",
     [
@@ -700,6 +784,52 @@ def test_verl_extra_info_rejects_non_json_or_arrow_friendly_values(bad_value):
 
     with pytest.raises(ValueError, match="extra_info"):
         validate_verl_record(row)
+
+
+@pytest.mark.parametrize("cycle_kind", ["mapping", "list"])
+def test_verl_extra_info_rejects_cycles_with_field_path(cycle_kind):
+    row = verl_record()
+    if cycle_kind == "mapping":
+        cycle = {}
+        cycle["self"] = cycle
+    else:
+        cycle = []
+        cycle.append(cycle)
+    row["extra_info"]["cycle"] = cycle
+
+    with pytest.raises(ValueError, match="extra_info.cycle.*cycle"):
+        validate_verl_record(row)
+
+
+def test_verl_extra_info_rejects_excessive_nesting_without_recursion_error():
+    row = verl_record()
+    row["extra_info"]["deep"] = nested_list(65)
+
+    with pytest.raises(ValueError, match="extra_info.deep.*nesting depth"):
+        validate_verl_record(row)
+
+
+def test_verl_extra_info_accepts_maximum_container_nesting_depth():
+    row = verl_record()
+    row["extra_info"]["deep"] = nested_list(64)
+
+    assert validate_verl_record(row) == row
+
+
+def test_verl_extra_info_allows_shared_noncyclic_references_and_deep_copies():
+    row = verl_record()
+    shared = {"values": [1, 2]}
+    row["extra_info"]["left"] = shared
+    row["extra_info"]["right"] = shared
+
+    result = validate_verl_record(row)
+
+    assert result["extra_info"]["left"] == shared
+    assert result["extra_info"]["right"] == shared
+    assert result["extra_info"]["left"] is not shared
+    assert result["extra_info"]["right"] is not shared
+    result["extra_info"]["left"]["values"].append(3)
+    assert shared == {"values": [1, 2]}
 
 
 def test_validate_unique_ids_preserves_order_and_returns_unaliased_rows():

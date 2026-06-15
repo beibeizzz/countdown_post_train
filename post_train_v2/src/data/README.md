@@ -15,6 +15,8 @@ id, source_index, numbers, target, gold_expr, prompt, bucket
 `id`, `gold_expr`, and `prompt` are nonempty strings. `source_index`,
 `target`, and every member of the nonempty `numbers` list are nonnegative
 exact integers; booleans and floats are rejected.
+`prompt` must exactly equal the output of the V2
+`build_solution_prompt(numbers, target)` function.
 
 `bucket` uses exactly:
 
@@ -55,7 +57,9 @@ list, and `missing_answer_tag`.
 
 `provenance` is a recursively validated JSON mapping. It may contain null,
 booleans, exact integers, finite floats, strings, lists, and string-keyed
-mappings.
+mappings. Container nesting is limited to 64 levels. Reference cycles are
+rejected with their field path, while shared noncyclic objects are allowed
+and copied without retaining caller aliases.
 
 ## DPO
 
@@ -69,6 +73,10 @@ All string fields are nonempty, chosen and rejected responses must differ,
 and rejected categories are limited to `wrong_value`, `number_mismatch`,
 `invalid_expression`, `missing_answer_tag`, and `truncated`.
 Problem and candidate IDs belong in `provenance`, not at the DPO top level.
+This structural validator does not infer `numbers` or `target` from
+provenance and does not recheck DPO mathematics. The DPO builder must
+validate chosen/rejected semantics together with the canonical source
+record and Countdown solver before publishing the record.
 
 ## verl
 
@@ -91,6 +99,9 @@ compatible. Mixed lists such as `[1, "x"]`, incompatible shared fields,
 bytes, tuples, Fraction objects, NaN, and infinities are rejected. This
 Arrow restriction does not apply to ordinary SFT/RFT/DPO provenance, which
 remains JSON-only.
+Arrow-friendly containers use the same 64-level nesting limit and cycle
+rejection as JSON provenance. Shared noncyclic references remain valid and
+are copied.
 
 ## Artifact Boundary
 
