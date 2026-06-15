@@ -13,6 +13,7 @@ from post_train_v2.src.countdown.bucketing import assign_bucket
 from post_train_v2.src.countdown.validation import (
     serialize_fraction,
     validate_countdown_expression,
+    validate_countdown_response,
 )
 
 
@@ -124,6 +125,7 @@ def validate_sft_record(row: Mapping[str, Any]) -> dict[str, Any]:
     response = _require_nonempty_string("response", record["response"])
     validation = _validate_validation(
         record["validation"],
+        response=response,
         numbers=source["numbers"],
         target=source["target"],
     )
@@ -262,6 +264,7 @@ def _validate_bucket(value: Any, number_count: int) -> dict[str, Any]:
 def _validate_validation(
     value: Any,
     *,
+    response: str,
     numbers: list[int],
     target: int,
 ) -> dict[str, Any]:
@@ -286,40 +289,26 @@ def _validate_validation(
                 "validation.error must be null or a canonical validation error"
             )
 
-    if expression is None:
-        expected_missing = {
-            "ok": False,
-            "value": None,
-            "used_numbers": [],
-            "error": "missing_answer_tag",
-        }
-        declared_missing = {
-            "ok": ok,
-            "value": fraction_text,
-            "used_numbers": used_numbers,
-            "error": error,
-        }
-        if declared_missing != expected_missing:
-            raise ValueError("validation missing_answer_tag fields are incoherent")
-    else:
-        actual = validate_countdown_expression(expression, numbers, target)
-        expected_fields = {
-            "ok": actual.ok,
-            "value": serialize_fraction(actual.value),
-            "used_numbers": actual.used_numbers,
-            "error": actual.error,
-        }
-        declared_fields = {
-            "ok": ok,
-            "value": fraction_text,
-            "used_numbers": used_numbers,
-            "error": error,
-        }
-        for field, expected in expected_fields.items():
-            if declared_fields[field] != expected:
-                raise ValueError(
-                    f"validation.{field} does not match actual expression result"
-                )
+    actual = validate_countdown_response(response, numbers, target)
+    expected_fields = {
+        "ok": actual.ok,
+        "value": serialize_fraction(actual.value),
+        "used_numbers": actual.used_numbers,
+        "expression": actual.expression,
+        "error": actual.error,
+    }
+    declared_fields = {
+        "ok": ok,
+        "value": fraction_text,
+        "used_numbers": used_numbers,
+        "expression": expression,
+        "error": error,
+    }
+    for field, expected in expected_fields.items():
+        if declared_fields[field] != expected:
+            raise ValueError(
+                f"validation.{field} does not match actual response result"
+            )
 
     return {
         "ok": ok,

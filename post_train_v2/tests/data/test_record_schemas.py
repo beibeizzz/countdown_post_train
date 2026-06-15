@@ -317,6 +317,73 @@ def test_sft_validation_rejects_expression_falsely_declared_correct():
 
 
 @pytest.mark.parametrize(
+    "response",
+    [
+        "<answer>1*2</answer>",
+        "reasoning without an answer",
+        "<answer>1+2",
+        "<answer>1+2</answer> then <answer>1*2</answer>",
+    ],
+)
+def test_sft_validation_rejects_response_that_disagrees_with_declared_result(
+    response,
+):
+    row = sft_record()
+    row["response"] = response
+
+    with pytest.raises(ValueError, match="validation.*response"):
+        validate_sft_record(row)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "reasoning <answer>1+2",
+        "<answer>1+2</answer> then truncated <answer>1*2",
+    ],
+)
+def test_sft_validation_accepts_truncated_final_answer_as_missing_tag(response):
+    row = sft_record()
+    row["response"] = response
+    row["validation"] = {
+        "ok": False,
+        "value": None,
+        "used_numbers": [],
+        "expression": None,
+        "error": "missing_answer_tag",
+    }
+
+    assert validate_sft_record(row) == row
+
+
+@pytest.mark.parametrize(
+    ("response", "validation"),
+    [
+        (
+            "<answer>1*2</answer> then <answer>1+2</answer>",
+            validation_result(),
+        ),
+        (
+            "<answer>1+2</answer> then <answer>1*2</answer>",
+            {
+                "ok": False,
+                "value": "2/1",
+                "used_numbers": [1, 2],
+                "expression": "1*2",
+                "error": "wrong_value",
+            },
+        ),
+    ],
+)
+def test_sft_validation_uses_last_answer_tag(response, validation):
+    row = sft_record()
+    row["response"] = response
+    row["validation"] = validation
+
+    assert validate_sft_record(row) == row
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("ok", True),
@@ -327,6 +394,7 @@ def test_sft_validation_rejects_expression_falsely_declared_correct():
 )
 def test_sft_validation_declared_fields_must_match_expression_result(field, value):
     row = sft_record()
+    row["response"] = "<answer>1*2</answer>"
     row["validation"] = {
         "ok": False,
         "value": "2/1",
@@ -369,6 +437,12 @@ def test_sft_validation_declared_fields_must_match_expression_result(field, valu
 def test_sft_validation_accepts_exact_v2_validator_results(validation):
     row = sft_record()
     row["validation"] = validation
+    if validation["error"] == "wrong_value":
+        row["response"] = "<answer>1*2</answer>"
+    elif validation["error"] == "invalid_expression":
+        row["response"] = "<answer>1+</answer>"
+    elif validation["error"] == "missing_answer_tag":
+        row["response"] = "reasoning only"
 
     assert validate_sft_record(row) == row
 

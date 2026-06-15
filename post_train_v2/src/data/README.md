@@ -45,11 +45,13 @@ exactly `ok`, `value`, `used_numbers`, `expression`, and `error`.
 `24/1` or `-3/7`. The allowed error vocabulary is
 `missing_answer_tag`, `invalid_expression`, `number_mismatch`, and
 `wrong_value`. Success and failure fields must agree with each other and
-with the source numbers and target. When `expression` is present, the
-validator reruns the V2 exact Countdown validator and requires the declared
-`ok`, `value`, `used_numbers`, and `error` fields to match its result
-exactly. A missing answer uses `expression: null`, null value, an empty
-used-number list, and `missing_answer_tag`.
+with the source numbers and target. The validator reruns the V2 exact
+`validate_countdown_response` function against the complete `response` and
+requires all five declared validation fields to match its result exactly.
+This preserves the V2 response semantics: the final answer tag is
+authoritative when multiple tags are present, while a missing or truncated
+final tag produces `expression: null`, null value, an empty used-number
+list, and `missing_answer_tag`.
 
 `provenance` is a recursively validated JSON mapping. It may contain null,
 booleans, exact integers, finite floats, strings, lists, and string-keyed
