@@ -100,6 +100,7 @@ def _validate_relative_path(value: Any) -> str:
         posix_path.is_absolute()
         or windows_path.is_absolute()
         or windows_path.drive
+        or windows_path.root
     ):
         raise ValueError("artifact relative path must not be absolute")
     if ".." in posix_path.parts or ".." in windows_path.parts:

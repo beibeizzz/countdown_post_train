@@ -193,6 +193,7 @@ def test_parent_artifact_rejects_invalid_sha256(sha256):
         "/absolute/source.jsonl",
         "C:\\absolute\\source.jsonl",
         "C:relative.jsonl",
+        "\\rooted.jsonl",
         "../source.jsonl",
         "nested/../../source.jsonl",
         "",
