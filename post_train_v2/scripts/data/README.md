@@ -35,8 +35,16 @@ non-consumable. The four JSONL files use atomic replacement, and a new
 `manifest.json` is published last as the completion marker.
 
 Configured paths are resolved to absolute paths only for local I/O. The full
-configuration snapshot is preserved, while manifest identity metadata uses
-the configured logical relative paths. Absolute fixture paths are normalized
-relative to the config directory. Raw parent IDs depend only on input kind
-and content SHA-256, so production relative configurations remain stable
-across checkout locations.
+four-field manifest configuration snapshot is canonicalized with the
+validated seed and logical train, test, and output paths. Absolute fixture
+paths are normalized relative to the config directory, so neither the
+manifest config hash nor artifact identity contains the checkout root. Raw
+parent IDs depend only on input kind and content SHA-256, so production
+relative configurations remain stable across checkout locations.
+
+The builder hashes both raw inputs before reading either dataset. After all
+rows are normalized and solved, it hashes both inputs again before removing
+an old manifest or writing any output. A changed train or test input aborts
+the run while preserving the previous manifest and data files. Parent
+artifacts use the fixed initial hashes rather than rereading inputs during
+manifest construction.

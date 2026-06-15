@@ -234,8 +234,7 @@ def _artifact_file(
     )
 
 
-def _raw_parent(kind: str, path: Path) -> ParentArtifact:
-    digest = sha256_file(path)
+def _raw_parent(kind: str, digest: str) -> ParentArtifact:
     return ParentArtifact(
         artifact_id=sha256_canonical_json(
             {"kind": kind, "sha256": digest}
@@ -291,6 +290,11 @@ def _revoke_completion_manifest(path: Path) -> None:
     _fsync_directory(path.parent)
 
 
+def _require_unchanged_input(path: Path, expected_sha256: str, label: str) -> None:
+    if sha256_file(path) != expected_sha256:
+        raise ValueError(f"{label} input changed during source build: {path}")
+
+
 def run_build_source(
     config_path: str | Path,
     limit: int | None = None,
@@ -322,6 +326,14 @@ def run_build_source(
         resolved_config_path.parent,
         "output_dir",
     )
+    logical_config = {
+        "seed": seed,
+        "train_input": logical_train_input,
+        "test_input": logical_test_input,
+        "output_dir": logical_output,
+    }
+    initial_train_sha256 = sha256_file(train_input)
+    initial_test_sha256 = sha256_file(test_input)
 
     train_frame = pd.read_parquet(train_input)
     if limit is not None:
@@ -329,6 +341,16 @@ def run_build_source(
     solvable_train, unsolved_train = build_train_source(train_frame)
     test_solved = build_test_source(_load_test_rows(test_input))
 
+    _require_unchanged_input(
+        train_input,
+        initial_train_sha256,
+        "train",
+    )
+    _require_unchanged_input(
+        test_input,
+        initial_test_sha256,
+        "test",
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     _revoke_completion_manifest(output_dir / "manifest.json")
     publish_jsonl(output_dir / "source_all.jsonl", solvable_train)
@@ -367,10 +389,10 @@ def run_build_source(
         stage="build_source",
         files=files,
         parents=[
-            _raw_parent("raw_train", train_input),
-            _raw_parent("raw_test", test_input),
+            _raw_parent("raw_train", initial_train_sha256),
+            _raw_parent("raw_test", initial_test_sha256),
         ],
-        config=config,
+        config=logical_config,
         global_seed=seed,
         stage_metadata={
             "completed": True,

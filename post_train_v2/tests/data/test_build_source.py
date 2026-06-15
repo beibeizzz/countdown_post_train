@@ -387,7 +387,12 @@ def test_run_build_source_manifest_has_exact_files_parents_config_and_metadata(
     tmp_path: Path,
 ):
     config_path, train_path, test_path, output_dir = write_fixture(tmp_path)
-    config_snapshot = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    logical_config = {
+        "seed": 42,
+        "train_input": "../inputs/train.parquet",
+        "test_input": "../inputs/test.json",
+        "output_dir": "../outputs",
+    }
 
     manifest = run_build_source(config_path, limit=None)
     loaded = load_manifest(output_dir / "manifest.json")
@@ -395,8 +400,8 @@ def test_run_build_source_manifest_has_exact_files_parents_config_and_metadata(
     assert loaded == manifest
     assert manifest.stage == "build_source"
     assert manifest.artifact_type == "dataset"
-    assert manifest.config == config_snapshot
-    assert manifest.config_sha256 == sha256_config(config_snapshot)
+    assert manifest.config == logical_config
+    assert manifest.config_sha256 == sha256_config(logical_config)
     assert manifest.global_seed == 42
     expected_parent_hashes = [
         ("raw_train", sha256_file(train_path)),
@@ -445,27 +450,75 @@ def test_run_build_source_manifest_has_exact_files_parents_config_and_metadata(
     assert str(REPO_ROOT.resolve()) not in metadata_text
 
 
-def test_manifest_identity_is_stable_across_absolute_io_roots(
+@pytest.mark.parametrize("changed_input", ["train", "test"])
+def test_input_change_during_build_preserves_old_outputs_and_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    changed_input: str,
 ):
-    logical_config = {
-        "seed": 42,
-        "train_input": "logical/raw_train.parquet",
-        "test_input": "logical/raw_test.json",
-        "output_dir": "logical/processed",
+    config_path, train_path, test_path, output_dir = write_fixture(tmp_path)
+    run_build_source(config_path, limit=None)
+    manifest_path = output_dir / "manifest.json"
+    old_manifest = manifest_path.read_bytes()
+    old_data = {
+        name: (output_dir / name).read_bytes() for name in DATA_FILENAMES
     }
-    config_path = tmp_path / "build_source.yaml"
-    config_path.write_text(
-        yaml.safe_dump(logical_config, sort_keys=False),
-        encoding="utf-8",
-    )
+
+    if changed_input == "train":
+        real_read_parquet = source_module.pd.read_parquet
+
+        def replacing_read_parquet(path):
+            frame = real_read_parquet(path)
+            pd.DataFrame([{"nums": [4, 5], "target": 9}]).to_parquet(
+                train_path,
+                index=False,
+            )
+            return frame
+
+        monkeypatch.setattr(
+            source_module.pd,
+            "read_parquet",
+            replacing_read_parquet,
+        )
+    else:
+        real_solve = source_module.solve_countdown
+        replaced = False
+
+        def replacing_solve(numbers, target):
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                test_path.write_text(
+                    json.dumps(
+                        [{"id": 11, "numbers": [4, 5], "target": 9}]
+                    ),
+                    encoding="utf-8",
+                )
+            return real_solve(numbers, target)
+
+        monkeypatch.setattr(source_module, "solve_countdown", replacing_solve)
+
+    with pytest.raises(ValueError, match=f"{changed_input} input changed"):
+        run_build_source(config_path, limit=None)
+
+    assert manifest_path.read_bytes() == old_manifest
+    assert {
+        name: (output_dir / name).read_bytes() for name in DATA_FILENAMES
+    } == old_data
+
+
+def test_manifest_identity_is_stable_across_real_absolute_fixture_roots(
+    tmp_path: Path,
+):
     roots = [tmp_path / "checkout-a", tmp_path / "checkout-b"]
     manifests = []
     for root in roots:
-        train_path = root / logical_config["train_input"]
-        test_path = root / logical_config["test_input"]
+        train_path = root / "inputs" / "train.parquet"
+        test_path = root / "inputs" / "test.json"
+        output_dir = root / "outputs"
+        config_path = root / "configs" / "build_source.yaml"
         train_path.parent.mkdir(parents=True)
+        config_path.parent.mkdir(parents=True)
         pd.DataFrame([{"nums": [1, 2], "target": 3}]).to_parquet(
             train_path,
             index=False,
@@ -474,20 +527,29 @@ def test_manifest_identity_is_stable_across_absolute_io_roots(
             json.dumps([{"id": 7, "numbers": [1, 2], "target": 3}]),
             encoding="utf-8",
         )
-
-        monkeypatch.setattr(
-            source_module,
-            "resolve_repo_path",
-            lambda value, root=root: (
-                Path(value).resolve()
-                if Path(value).is_absolute()
-                else (root / value).resolve()
-            ),
+        absolute_config = {
+            "seed": 42,
+            "train_input": str(train_path.resolve()),
+            "test_input": str(test_path.resolve()),
+            "output_dir": str(output_dir.resolve()),
+        }
+        config_path.write_text(
+            yaml.safe_dump(absolute_config, sort_keys=False),
+            encoding="utf-8",
         )
         manifests.append(run_build_source(config_path, limit=None))
 
     assert manifests[0].artifact_id == manifests[1].artifact_id
     assert manifests[0].parents == manifests[1].parents
+    assert manifests[0].config_sha256 == manifests[1].config_sha256
+    assert manifests[0].config == manifests[1].config == {
+        "seed": 42,
+        "train_input": "../inputs/train.parquet",
+        "test_input": "../inputs/test.json",
+        "output_dir": "../outputs",
+    }
+    config_text = json.dumps(manifests[0].config, sort_keys=True)
+    assert all(str(root.resolve()) not in config_text for root in roots)
     assert manifests[0].stage_metadata == manifests[1].stage_metadata == {
         "completed": True,
         "counts": {
@@ -498,10 +560,10 @@ def test_manifest_identity_is_stable_across_absolute_io_roots(
         },
         "limit": None,
         "inputs": {
-            "train": "logical/raw_train.parquet",
-            "test": "logical/raw_test.json",
+            "train": "../inputs/train.parquet",
+            "test": "../inputs/test.json",
         },
-        "output": "logical/processed",
+        "output": "../outputs",
     }
 
 
