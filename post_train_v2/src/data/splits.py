@@ -6,7 +6,6 @@ import errno
 import hashlib
 import json
 import os
-import uuid
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -21,6 +20,7 @@ from post_train_v2.src.artifacts.manifest import (
     load_manifest,
     publish_manifest,
 )
+from post_train_v2.src.artifacts.locking import exclusive_output_lock
 from post_train_v2.src.config.loading import (
     REPO_ROOT,
     load_yaml,
@@ -345,55 +345,19 @@ def _split_output_lock(
     config_path: Path,
     mode: str,
 ):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = output_dir / ".build_splits.lock"
-    owner_token = uuid.uuid4().hex
     try:
-        descriptor = os.open(
-            lock_path,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-            0o600,
-        )
-    except FileExistsError as error:
-        raise RuntimeError(
-            f"split output lock already exists: {lock_path}"
-        ) from error
-
-    metadata_written = False
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "schema_version": 1,
-                    "pid": os.getpid(),
-                    "owner_token": owner_token,
-                    "config_path": str(config_path.resolve()),
-                    "output_dir": str(output_dir.resolve()),
-                    "mode": mode,
-                },
-                handle,
-                sort_keys=True,
-            )
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        metadata_written = True
-        _fsync_directory(output_dir)
-        yield
-    finally:
-        if not metadata_written:
-            lock_path.unlink(missing_ok=True)
-            _fsync_directory(output_dir)
-        else:
-            try:
-                metadata = json.loads(lock_path.read_text(encoding="utf-8"))
-            except (FileNotFoundError, UnicodeError, json.JSONDecodeError):
-                metadata = None
-            if isinstance(metadata, Mapping) and metadata.get(
-                "owner_token"
-            ) == owner_token:
-                lock_path.unlink(missing_ok=True)
-                _fsync_directory(output_dir)
+        with exclusive_output_lock(
+            output_dir,
+            lock_name=".build_splits.lock",
+            metadata={
+                "config_path": str(config_path.resolve()),
+                "output_dir": str(output_dir.resolve()),
+                "mode": mode,
+            },
+        ):
+            yield
+    except RuntimeError as error:
+        raise RuntimeError(f"split {error}") from error
 
 
 def _snapshot(paths: list[Path]) -> dict[Path, str]:

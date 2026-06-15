@@ -1,0 +1,6 @@
+eval_data: post_train_v2/data/processed/eval_50.jsonl
+eval_manifest: post_train_v2/data/processed/validation_manifest.json
+output_dir: post_train_v2/data/eval/default
+max_new_tokens: 256
+enable_thinking: false
+do_sample: false

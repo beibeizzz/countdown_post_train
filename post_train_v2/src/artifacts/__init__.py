@@ -8,6 +8,7 @@ from post_train_v2.src.artifacts.hashing import (
     sha256_config,
     sha256_file,
 )
+from post_train_v2.src.artifacts.locking import exclusive_output_lock
 from post_train_v2.src.artifacts.manifest import (
     ArtifactFile,
     ManifestV2,
@@ -21,6 +22,7 @@ __all__ = [
     "ManifestV2",
     "ParentArtifact",
     "canonical_json_bytes",
+    "exclusive_output_lock",
     "load_manifest",
     "publish_json",
     "publish_jsonl",

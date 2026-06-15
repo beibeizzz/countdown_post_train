@@ -1154,13 +1154,15 @@ def test_split_output_lock_removes_owned_file_when_metadata_write_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
+    from post_train_v2.src.artifacts import locking
+
     output_dir = tmp_path / "output"
-    real_dump = splits_module.json.dump
+    real_dump = locking.json.dump
 
     def fail_dump(*args, **kwargs):
         raise OSError("lock metadata failed")
 
-    monkeypatch.setattr(splits_module.json, "dump", fail_dump)
+    monkeypatch.setattr(locking.json, "dump", fail_dump)
     with pytest.raises(OSError, match="lock metadata failed"):
         with splits_module._split_output_lock(
             output_dir,
@@ -1168,7 +1170,7 @@ def test_split_output_lock_removes_owned_file_when_metadata_write_fails(
             mode="validation",
         ):
             pytest.fail("lock body must not run")
-    monkeypatch.setattr(splits_module.json, "dump", real_dump)
+    monkeypatch.setattr(locking.json, "dump", real_dump)
 
     assert not (output_dir / ".build_splits.lock").exists()
 
