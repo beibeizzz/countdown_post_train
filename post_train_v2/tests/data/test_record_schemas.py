@@ -62,13 +62,16 @@ def sft_record() -> dict:
 
 def dpo_record(category: str = "wrong_value") -> dict:
     return {
-        "id": "train-000001",
         "prompt": "Use 1 and 2 to make 3.",
         "chosen": "<answer>1+2</answer>",
         "rejected": "<answer>1*2</answer>",
         "rejected_category": category,
         "generation_route": "forced_wrong",
-        "provenance": provenance(),
+        "provenance": {
+            **provenance(),
+            "problem_id": "train-000001",
+            "candidate_id": "candidate-000001",
+        },
     }
 
 
@@ -144,7 +147,6 @@ def test_normalized_source_rejects_missing_extra_and_wrong_types(mutation, match
     ("mutation", "match"),
     [
         (lambda bucket: bucket.update({"typo": 1}), "bucket keys"),
-        (lambda bucket: bucket.update({"num_count": 3}), "num_count"),
         (lambda bucket: bucket.update({"expr_depth": True}), "expr_depth"),
         (lambda bucket: bucket.update({"expr_len": 3.0}), "expr_len"),
         (lambda bucket: bucket.update({"has_division": 0}), "has_division"),
@@ -156,6 +158,45 @@ def test_normalized_source_rejects_missing_extra_and_wrong_types(mutation, match
 def test_normalized_source_enforces_bucket_types_and_consistency(mutation, match):
     row = normalized_source()
     mutation(row["bucket"])
+
+    with pytest.raises(ValueError, match=match):
+        validate_normalized_source(row)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("num_count", 3),
+        ("expr_depth", 99),
+        ("expr_len", 99),
+        ("has_division", True),
+        ("has_subtraction", True),
+        ("score", 1),
+        ("complexity", "medium"),
+        ("bucket_key", "2_medium"),
+    ],
+)
+def test_normalized_source_rejects_each_forged_bucket_dimension(field, value):
+    row = normalized_source()
+    row["bucket"][field] = value
+
+    with pytest.raises(ValueError, match="canonical bucket"):
+        validate_normalized_source(row)
+
+
+@pytest.mark.parametrize(
+    ("gold_expr", "match"),
+    [
+        ("1+", "gold_expr.*invalid_expression"),
+        ("1+1", "gold_expr.*number_mismatch"),
+        ("1*2", "gold_expr.*wrong_value"),
+    ],
+)
+def test_normalized_source_requires_gold_expr_to_be_a_correct_solution(
+    gold_expr, match
+):
+    row = normalized_source()
+    row["gold_expr"] = gold_expr
 
     with pytest.raises(ValueError, match=match):
         validate_normalized_source(row)
@@ -263,6 +304,13 @@ def test_sft_provenance_rejects_non_json_primitives(bad_value):
         validate_sft_record(row)
 
 
+def test_sft_provenance_remains_json_friendly_not_arrow_restricted():
+    row = sft_record()
+    row["provenance"]["heterogeneous"] = [1, "x", {"nested": True}]
+
+    assert validate_sft_record(row) == row
+
+
 @pytest.mark.parametrize(
     "category",
     [
@@ -276,7 +324,17 @@ def test_sft_provenance_rejects_non_json_primitives(bad_value):
 def test_dpo_accepts_exact_rejected_category_vocabulary(category):
     row = dpo_record(category)
 
-    assert validate_dpo_record(row) == row
+    result = validate_dpo_record(row)
+
+    assert result == row
+    assert set(result) == {
+        "prompt",
+        "chosen",
+        "rejected",
+        "rejected_category",
+        "generation_route",
+        "provenance",
+    }
 
 
 def test_dpo_rejects_unknown_category_and_identical_responses():
@@ -296,7 +354,6 @@ def test_dpo_requires_exact_keys_nonempty_strings_and_deep_copies_provenance():
         validate_dpo_record(row)
 
     for field in (
-        "id",
         "prompt",
         "chosen",
         "rejected",
@@ -314,6 +371,14 @@ def test_dpo_requires_exact_keys_nonempty_strings_and_deep_copies_provenance():
     assert result["provenance"]["metrics"] is not row["provenance"]["metrics"]
 
 
+def test_dpo_rejects_top_level_id_even_when_it_matches_provenance():
+    row = dpo_record()
+    row["id"] = row["provenance"]["problem_id"]
+
+    with pytest.raises(ValueError, match="DPO record keys"):
+        validate_dpo_record(row)
+
+
 def test_verl_accepts_structured_chat_and_ground_truth_with_deep_copy():
     row = verl_record()
     before = deepcopy(row)
@@ -328,6 +393,47 @@ def test_verl_accepts_structured_chat_and_ground_truth_with_deep_copy():
     result["reward_model"]["ground_truth"]["numbers"].append(99)
     result["prompt"][0]["content"] = "changed"
     assert row == before
+
+
+def test_canonical_verl_record_converts_to_pyarrow_table():
+    pyarrow = pytest.importorskip("pyarrow")
+    row = validate_verl_record(verl_record())
+
+    table = pyarrow.Table.from_pylist([row])
+
+    assert table.num_rows == 1
+    assert table.column_names == list(row)
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        [1, "x"],
+        [{"value": 1}, {"value": "x"}],
+        [{"left": 1}, {"right": 2}],
+        [[1], ["x"]],
+        [True, 1],
+    ],
+)
+def test_verl_extra_info_rejects_incompatible_arrow_list_types(bad_value):
+    row = verl_record()
+    row["extra_info"]["bad"] = bad_value
+
+    with pytest.raises(ValueError, match="extra_info.*Arrow"):
+        validate_verl_record(row)
+
+
+def test_verl_extra_info_accepts_arrow_mergeable_numeric_and_null_lists():
+    row = verl_record()
+    row["extra_info"]["numeric"] = [1, 2.5, None]
+    row["extra_info"]["objects"] = [
+        {"value": 1, "label": None},
+        {"value": 2.5, "label": "x"},
+    ]
+
+    result = validate_verl_record(row)
+
+    assert result == row
 
 
 @pytest.mark.parametrize(

@@ -11,6 +11,9 @@ from fractions import Fraction
 from math import gcd
 from typing import Any
 
+from post_train_v2.src.countdown.bucketing import assign_bucket
+from post_train_v2.src.countdown.validation import validate_countdown_expression
+
 
 NORMALIZED_SOURCE_KEYS = {
     "id",
@@ -44,7 +47,6 @@ SFT_RECORD_KEYS = NORMALIZED_SOURCE_KEYS | {
     "provenance",
 }
 DPO_RECORD_KEYS = {
-    "id",
     "prompt",
     "chosen",
     "rejected",
@@ -86,6 +88,18 @@ def validate_normalized_source(row: Mapping[str, Any]) -> dict[str, Any]:
     gold_expr = _require_nonempty_string("gold_expr", source["gold_expr"])
     prompt = _require_nonempty_string("prompt", source["prompt"])
     bucket = _validate_bucket(source["bucket"], len(numbers))
+    gold_validation = validate_countdown_expression(gold_expr, numbers, target)
+    if not gold_validation.ok:
+        raise ValueError(f"gold_expr failed validation: {gold_validation.error}")
+    canonical_bucket = assign_bucket(numbers, gold_expr)
+    if bucket != canonical_bucket:
+        differing_fields = sorted(
+            key for key in BUCKET_KEYS if bucket[key] != canonical_bucket[key]
+        )
+        raise ValueError(
+            "bucket does not match canonical bucket: "
+            + ", ".join(differing_fields)
+        )
 
     return {
         "id": row_id,
@@ -129,7 +143,6 @@ def validate_dpo_record(row: Mapping[str, Any]) -> dict[str, Any]:
     normalized = {
         field: _require_nonempty_string(field, record[field])
         for field in (
-            "id",
             "prompt",
             "chosen",
             "rejected",
@@ -160,7 +173,7 @@ def validate_verl_record(row: Mapping[str, Any]) -> dict[str, Any]:
     ability = _require_nonempty_string("ability", record["ability"])
     prompt = _validate_chat_prompt(record["prompt"])
     reward_model = _validate_reward_model(record["reward_model"])
-    extra_info = _normalize_json_mapping("extra_info", record["extra_info"])
+    extra_info = _normalize_arrow_mapping("extra_info", record["extra_info"])
     return {
         "data_source": data_source,
         "prompt": prompt,
@@ -225,10 +238,14 @@ def _validate_bucket(value: Any, number_count: int) -> dict[str, Any]:
         "bucket.bucket_key", bucket["bucket_key"]
     )
     if num_count != number_count:
-        raise ValueError("bucket.num_count must equal len(numbers)")
+        raise ValueError(
+            "bucket does not match canonical bucket: num_count"
+        )
     expected_key = f"{num_count}_{complexity}"
     if bucket_key != expected_key:
-        raise ValueError(f"bucket.bucket_key must be {expected_key}")
+        raise ValueError(
+            f"bucket does not match canonical bucket: bucket_key must be {expected_key}"
+        )
     return {
         "num_count": num_count,
         "expr_depth": expr_depth,
@@ -353,6 +370,90 @@ def _normalize_json_mapping(name: str, value: Any) -> dict[str, Any]:
     normalized = _normalize_json_value(name, mapping)
     assert isinstance(normalized, dict)
     return normalized
+
+
+def _normalize_arrow_mapping(name: str, value: Any) -> dict[str, Any]:
+    mapping = _require_mapping(name, value)
+    normalized, _ = _normalize_arrow_value(name, mapping)
+    assert isinstance(normalized, dict)
+    return normalized
+
+
+def _normalize_arrow_value(path: str, value: Any) -> tuple[Any, tuple[Any, ...]]:
+    if value is None:
+        return None, ("null",)
+    if type(value) is bool:
+        return value, ("bool",)
+    if type(value) is int:
+        if not -(2**63) <= value < 2**63:
+            raise ValueError(f"{path} contains an integer outside Arrow int64")
+        return value, ("int",)
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{path} contains a non-finite float")
+        return value, ("float",)
+    if type(value) is str:
+        return value, ("string",)
+    if isinstance(value, list):
+        normalized_items: list[Any] = []
+        item_type: tuple[Any, ...] = ("null",)
+        for index, item in enumerate(value):
+            normalized_item, candidate_type = _normalize_arrow_value(
+                f"{path}[{index}]", item
+            )
+            item_type = _merge_arrow_types(path, item_type, candidate_type)
+            normalized_items.append(normalized_item)
+        return normalized_items, ("list", item_type)
+    if isinstance(value, Mapping):
+        normalized_mapping: dict[str, Any] = {}
+        fields: list[tuple[str, tuple[Any, ...]]] = []
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError(f"{path} contains a non-string mapping key")
+        for key in sorted(value):
+            normalized_item, item_type = _normalize_arrow_value(
+                f"{path}.{key}", value[key]
+            )
+            normalized_mapping[key] = normalized_item
+            fields.append((key, item_type))
+        return normalized_mapping, ("mapping", tuple(fields))
+    raise ValueError(f"{path} contains a non-Arrow-compatible value")
+
+
+def _merge_arrow_types(
+    path: str,
+    left: tuple[Any, ...],
+    right: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    if left == ("null",):
+        return right
+    if right == ("null",):
+        return left
+    if left == right:
+        return left
+    if {left, right} == {("int",), ("float",)}:
+        return ("float",)
+    if left[0] == right[0] == "list":
+        return ("list", _merge_arrow_types(path, left[1], right[1]))
+    if left[0] == right[0] == "mapping":
+        left_fields = dict(left[1])
+        right_fields = dict(right[1])
+        if left_fields.keys() != right_fields.keys():
+            raise ValueError(f"{path} list mappings must share one Arrow schema")
+        return (
+            "mapping",
+            tuple(
+                (
+                    key,
+                    _merge_arrow_types(
+                        f"{path}.{key}",
+                        left_fields[key],
+                        right_fields[key],
+                    ),
+                )
+                for key in sorted(left_fields)
+            ),
+        )
+    raise ValueError(f"{path} list elements do not share an Arrow type")
 
 
 def _normalize_json_value(path: str, value: Any) -> Any:

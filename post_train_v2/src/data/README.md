@@ -26,7 +26,10 @@ score, complexity, bucket_key
 The integer metadata and score are nonnegative exact integers, the two
 feature flags are exact booleans, and complexity is `easy`, `medium`, or
 `hard`. `num_count` must equal `len(numbers)` and `bucket_key` must equal
-`<num_count>_<complexity>`.
+`<num_count>_<complexity>`. The validator also checks that `gold_expr` is a
+correct exact solution for `numbers` and `target`, recomputes the bucket
+with the V2 `assign_bucket` implementation, and requires every bucket field
+to match that canonical result.
 
 ## SFT and RFT
 
@@ -53,13 +56,13 @@ mappings.
 DPO records use exactly:
 
 ```text
-id, prompt, chosen, rejected, rejected_category, generation_route,
-provenance
+prompt, chosen, rejected, rejected_category, generation_route, provenance
 ```
 
 All string fields are nonempty, chosen and rejected responses must differ,
 and rejected categories are limited to `wrong_value`, `number_mismatch`,
 `invalid_expression`, `missing_answer_tag`, and `truncated`.
+Problem and candidate IDs belong in `provenance`, not at the DPO top level.
 
 ## verl
 
@@ -73,8 +76,12 @@ data_source, prompt, ability, reward_model, extra_info
 mappings. `reward_model` is exactly `{style, ground_truth}`, and
 `ground_truth` is exactly `{numbers, target}` with the same Countdown
 integer constraints as normalized source data. `extra_info` is restricted
-to recursively JSON/Arrow-friendly values; bytes, tuples, Fraction objects,
-NaN, and infinities are rejected.
+to recursively Arrow-friendly values. Lists may contain nulls, mergeable
+integer/float values, one primitive type, recursively compatible lists, or
+mappings with the same keys and recursively compatible field types. Mixed
+lists such as `[1, "x"]`, incompatible mapping schemas, bytes, tuples,
+Fraction objects, NaN, and infinities are rejected. This Arrow restriction
+does not apply to ordinary SFT/RFT/DPO provenance, which remains JSON-only.
 
 ## Artifact Boundary
 
