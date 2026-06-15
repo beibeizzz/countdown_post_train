@@ -1,61 +1,32 @@
 # Open Questions
 
-The environment baseline and its Level 1 acceptance contract are resolved.
-Core distributed training behavior still requires the decisions below.
+The core-development questions previously tracked in this file are resolved.
+The authoritative decisions are frozen in:
 
-## Resolved Decisions
+- `docs/superpowers/specs/2026-06-15-post-train-v2-core-development-design.md`
 
-- Runtime: Python 3.11.15, PyTorch 2.7 cu128, Flash Attention 2.7.4.post1,
-  vLLM 0.9.1, and base verl 0.6.0.
-- Environment: independent `post_train_v2/.venv`; do not mutate AgentFlow.
-- Teacher topology: two concurrent independent TP1 vLLM engines, one per GPU.
-- Trainer launcher: two-rank `torchrun` DDP is the canonical first
-  implementation.
-- GRPO KL coefficient: zero for the current baseline.
-- Acceptance: Level 1 covers runtime/existing paths; Level 2 covers a real
-  verl FSDP2 plus vLLM optimizer update after its integration files exist.
+No blocking design question remains before writing the phase implementation
+plans.
 
-## Blocking Training Decisions
+New questions discovered during implementation must be added here only when
+they change an approved external contract, training semantic, artifact
+schema, or acceptance criterion. Ordinary implementation details should be
+resolved within the relevant phase plan.
 
-1. **Effective batch preservation**
+## Resolved Baseline
 
-   Should two-GPU DDP preserve the old global batch exactly for comparison, or
-   increase it using the available memory?
-
-2. **GRPO policy-update semantics**
-
-   Should two policy updates per rollout map directly to two actor epochs in
-   verl 0.6.0, or should the first baseline use the release's conservative
-   default?
-
-3. **Checkpoint compatibility**
-
-   Confirm which existing artifacts V2 must load: full Hugging Face models,
-   LoRA adapters, DPO checkpoints, legacy GRPO exports, and/or Trainer
-   optimizer continuation checkpoints.
-
-4. **CLI compatibility**
-
-   Confirm whether V2 must preserve current flags such as `--config`,
-   `--max-steps`, `--limit`, and repository-relative path behavior.
-
-5. **verl ground-truth encoding**
-
-   Confirm through a v0.6.0 integration fixture whether
-   `reward_model.ground_truth` should be a nested Arrow struct or a JSON
-   string.
-
-## Important Non-Blocking Decisions
-
-6. Gradient checkpointing default after 0.6B memory benchmarking.
-7. Explicit versus implicit DPO reference-model handling in TRL 0.19.1.
-8. Synchronous rank-0 fixed evaluation versus an asynchronous evaluator.
-9. Best-checkpoint metric and tie-break rule.
-10. Periodic checkpoint retention and post-training optimizer-state cleanup.
-11. W&B project/group naming, mode, sample tables, and artifact upload policy.
-12. V2 manifest schema and compatibility reading for legacy manifests.
-13. Atomic generation progress flush frequency.
-14. Treatment of zero-standard-deviation GRPO groups.
-15. GRPO evaluation and Hugging Face export cadence.
-16. Whether V2 may read legacy data/output paths while writing only to its
-    own output tree by default.
+- Two-rank `torchrun` DDP for Full SFT, LoRA, RFT training, and DPO.
+- Old effective global batches are preserved for the first distributed run.
+- Two independent TP1 Qwen3-8B vLLM workers for offline generation.
+- GRPO uses verl 0.6.0, FSDP2, vLLM, `ppo_epochs=2`, and zero KL.
+- V2 can read compatible legacy data and model artifacts but writes only to
+  its own tree by default.
+- V2 guarantees training-state resume only for checkpoints created by V2.
+- Fixed rank-0 evaluation runs every 100 optimizer steps and at the final
+  step.
+- Gradient checkpointing is enabled by default and configurable per stage.
+- W&B uses one logical run per stage and does not upload model or dataset
+  artifacts by default.
+- Manifest V2, deterministic data selection, checkpoint retention, recovery,
+  final evaluation, and four verification levels are defined by the core
+  design.

@@ -1,11 +1,19 @@
 # Countdown Post-Training V2
 
-`post_train_v2` is the planning workspace for rewriting the distributed
-post-training pipeline currently implemented under `post_train`.
+`post_train_v2` is the staged rewrite of the distributed post-training
+pipeline currently implemented under `post_train`.
 
-This directory does not yet contain runnable training code. The first phase
-only defines architecture, migration boundaries, execution order, data
-contracts, and unresolved decisions.
+The runtime environment and dual-GPU Teacher generation entrypoint are
+implemented. The remaining core training stages are governed by the approved
+design below and are implemented through separately reviewed phase plans.
+
+The authoritative core design is:
+
+- `docs/superpowers/specs/2026-06-15-post-train-v2-core-development-design.md`
+
+Older planning documents are retained as historical analysis. When a
+numerical default or status statement conflicts with the core design, the
+core design takes precedence.
 
 ## Confirmed Scope
 
@@ -84,9 +92,9 @@ post_train_v2/
   docs/
 ```
 
-The empty subdirectories are placeholders. No training entrypoint in this
-tree should be treated as implemented until a later implementation plan is
-approved.
+Most training subdirectories remain placeholders. An entrypoint is runnable
+only when its phase plan and README mark it implemented and its applicable
+verification gate has passed.
 
 ## Intended Pipeline
 
@@ -106,11 +114,14 @@ raw Countdown data
 
 ## Documents
 
+- `docs/superpowers/specs/2026-06-15-post-train-v2-core-development-design.md`:
+  authoritative core-development contract.
 - `analysis.md`: inventory and behavioral analysis of the existing project.
-- `migration_plan.md`: recommended distributed and verl migration design.
+- `migration_plan.md`: historical migration analysis superseded by the core
+  design where the two conflict.
 - `environment.md`: pinned runtime baseline and remote installation checks.
-- `open_questions.md`: decisions that must be confirmed before core
-  implementation.
+- `open_questions.md`: resolved baseline and policy for recording any newly
+  discovered contract-level questions.
 
 ## Runtime Baseline
 

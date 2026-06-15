@@ -148,8 +148,9 @@ Module rules:
 ```text
 raw_train.parquet / raw_test.json
   -> normalized source JSONL
-  -> val_200 and fixed_eval_50
-  -> Qwen3-8B teacher accepted pool of 20k
+  -> stratified val_200 and fixed_eval_50
+  -> remaining training candidates
+  -> Qwen3-8B teacher accepted pool of the earliest 20k correct candidates
   -> stratified SFT 8k and GRPO 4k
   -> RFT accepted data
   -> approximately 6k DPO pairs
@@ -159,6 +160,15 @@ raw_train.parquet / raw_test.json
 All prompts use the common Countdown prompt and chat-message builders.
 Thinking mode is disabled for the teacher and target model. Generation is
 limited to 256 new tokens.
+
+The validation split is frozen before Teacher generation:
+
+- sample `val_200` from the complete normalized and solvable source set by
+  stratifying on number count and solver-expression complexity;
+- remove all 200 validation IDs from every training-candidate pool;
+- sample the fixed evaluation set of 50 from `val_200` using the same
+  stratification dimensions;
+- preserve the selected IDs and their source order in the manifest.
 
 ### 5.1 Canonical Schemas
 
@@ -241,15 +251,26 @@ The default global seed is `42`, configurable per run.
 Data splitting, stratified sampling, fixed validation selection, and fixed
 evaluation selection must be exactly reproducible.
 
-Per-sample generation seeds are stably derived from:
+Offline Teacher, RFT, and DPO per-sample generation seeds are stably derived
+from:
 
 ```text
 global seed + stage name + sample ID + rollout index
 ```
 
-Python, NumPy, PyTorch, Trainer, DistributedSampler, and verl receive
-documented derived seeds. Checkpoints restore supported RNG state and the
-training data position.
+vLLM 0.9.1 offline generation must pass one `SamplingParams` object per
+prompt so that each request receives its derived seed. This keeps a sample's
+random stream independent of worker assignment and batching.
+
+Python, NumPy, PyTorch, Trainer, and DistributedSampler receive documented
+derived seeds. Checkpoints restore supported RNG state and the training data
+position.
+
+verl 0.6.0 vLLM rollout uses an engine-level seed rather than the offline
+per-request seed contract. GRPO therefore guarantees deterministic dataset
+order and a recorded run-level rollout seed only under the same worker
+topology. It does not promise that changing Ray placement, rollout batching,
+or the GPU topology preserves sample-level generations.
 
 The project does not promise bitwise equality across CUDA kernels, Flash
 Attention, or vLLM. It promises stable ordering and statistically
@@ -267,6 +288,7 @@ The shared generation system provides:
 - deterministic assignment by stable record ID;
 - isolated per-worker cache and output directories;
 - one chat conversation per prompt;
+- per-prompt `SamplingParams` with the stable derived seed;
 - `enable_thinking=false`;
 - batch-level atomic progress publication;
 - per-record deduplication;
@@ -276,8 +298,16 @@ The shared generation system provides:
   differ;
 - isolated shard rebuild after corruption.
 
-Teacher generation rolls out each candidate once and continues until 20,000
-solver-verified correct responses have been accepted.
+Teacher generation rolls out each training candidate once. Work is dispatched
+in ordered waves. A wave is complete only after both workers have returned
+all assigned positions, after which responses are merged by original source
+position and validated.
+
+The stopping rule is based on the completed source-order prefix, not worker
+completion time. Generation may stop only when that prefix contains at least
+20,000 correct responses. The accepted pool is the earliest 20,000 correct
+records in original candidate order. Later completed records are not allowed
+to displace earlier records.
 
 ## 8. Supervised Training Stack
 
@@ -300,6 +330,12 @@ Both ranks enter a barrier before evaluation. Rank 0 evaluates and writes
 artifacts while rank 1 waits. Both ranks enter a second barrier before
 training resumes.
 
+Rank 0 must not execute generation through the DDP wrapper while the other
+rank is waiting. It evaluates with the unwrapped underlying module obtained
+through the Trainer or Accelerate unwrapping API, under inference mode, with
+the previous train/eval state restored afterward. The Level 1 distributed
+test must fail if evaluation invokes the DDP wrapper's forward path.
+
 ### 8.1 Effective Batch Preservation
 
 The first distributed baseline preserves the old effective global batches:
@@ -321,6 +357,10 @@ Trainer state, global step, and supported RNG state.
 
 Periodic checkpoints are saved every 100 optimizer steps and only the latest
 two are retained. `best/` and `final/` are retained independently.
+
+The final optimizer step always triggers checkpoint publication, fixed-50
+evaluation, and final export even when it is not divisible by 100. If the
+final step is also a periodic step, the actions run once.
 
 The best checkpoint is selected by:
 
@@ -349,9 +389,11 @@ The teacher performs four rollouts for each prompt in the SFT 8k set using:
 - thinking disabled.
 
 Only responses accepted by the exact Countdown validator are retained.
-Normalized complete responses are deduplicated within each question.
-Responses with the same expression but meaningfully different reasoning text
-may remain distinct.
+For deduplication, complete responses are normalized only by converting line
+endings to LF and stripping leading and trailing whitespace from the complete
+response. Exact normalized duplicates within the same question are removed.
+Responses with the same final expression but different normalized complete
+response text remain distinct.
 
 At most two accepted responses are retained per prompt. The accepted pool is
 then stratified by number count and solver-expression complexity. The stage
@@ -384,9 +426,26 @@ The final stratified targets are:
 | `truncated` | 2% |
 
 Within each category, generation routes are balanced when supply permits.
-If a category is undersupplied, sampling backfills from the closest
-higher-quality category. Mathematical and structural filters are never
-relaxed merely to reach the target count.
+Candidate ordering within a category and route is determined by a stable
+seeded hash of the question ID and candidate ID.
+
+Selection first fills each category's integer quota. All deficits are then
+filled from the remaining valid candidates in the strict global priority
+order:
+
+```text
+wrong_value
+  -> number_mismatch
+  -> invalid_expression
+  -> missing_answer_tag
+  -> truncated
+```
+
+This second pass may use lower-priority categories only after all remaining
+higher-priority candidates have been exhausted. If fewer than 6,000 valid
+candidates exist in total, the output is smaller and the manifest records the
+unfilled count. Mathematical and structural filters are never relaxed merely
+to reach the target count.
 
 By default each question contributes at most one DPO pair.
 
@@ -449,10 +508,16 @@ GRPO uses:
 - 16 trajectories per optimizer iteration;
 - maximum prompt length 256;
 - maximum response length 256;
+- `data.apply_chat_template_kwargs.enable_thinking=false`;
 - one pass over the 4k prompt set;
 - deterministic epoch shuffle;
+- a recorded engine-level rollout seed for the fixed two-GPU topology;
 - `ppo_epochs=2` for two actor-update passes over each rollout batch;
 - no rollout reuse across optimizer iterations.
+
+The converted Parquet and GRPO launch configuration must be exercised by a
+tokenization fixture proving that Qwen's thinking mode is disabled and that
+the rendered prompt ends in the expected generation prompt.
 
 ### 11.3 Reward
 
@@ -479,9 +544,15 @@ The adapter returns a score dictionary with diagnostics including:
 - `score`;
 - `format_ok`;
 - `answer_correct`;
-- error category;
+- `error`, which is `null` for a correct response or one of
+  `missing_answer_tag`, `invalid_expression`, `number_mismatch`, and
+  `wrong_value`;
 - extracted expression;
-- exact evaluated value when available.
+- `value`, serialized as a reduced `"numerator/denominator"` string when
+  evaluation succeeds, including denominator `1` for integers.
+
+All reward diagnostics must be JSON-, Arrow-, and W&B-serializable primitive
+values.
 
 Zero-standard-deviation groups are retained. They produce zero effective
 group-relative advantage and are not resampled.
@@ -510,6 +581,10 @@ Every 100 optimizer iterations:
 - export a Hugging Face actor snapshot;
 - evaluate the fixed 50 records with the common evaluator.
 
+The final optimizer iteration performs the same checkpoint, export, and
+evaluation actions even when it is not divisible by 100. Duplicate work is
+suppressed when the final iteration is already a periodic boundary.
+
 Only `best/` and `final/` Hugging Face exports are retained permanently.
 They must pass direct Transformers loading.
 
@@ -520,7 +595,7 @@ training. Failure to save the continuation checkpoint stops training.
 
 The common evaluator supports complete Hugging Face models and LoRA adapters.
 It applies the Qwen chat template with thinking disabled and generates no
-more than 256 new tokens.
+more than 256 new tokens. Fixed evaluation uses deterministic decoding.
 
 The final evaluation matrix includes:
 
@@ -559,7 +634,7 @@ receive an automatic timestamp and short Git-revision suffix.
 
 Trainer stages log loss at every optimizer step. GRPO logs all metrics listed
 in Section 11.4 at every optimizer iteration. Fixed evaluation results and
-the 50 sample traces are logged every 100 steps.
+the 50 sample traces are logged every 100 steps and at the final step.
 
 W&B does not upload complete model checkpoints or datasets as Artifacts by
 default. It records configuration, local paths, artifact IDs, and manifest
@@ -604,6 +679,7 @@ Use CPU/Gloo to validate:
 - deterministic distributed sampling;
 - barriers;
 - main-rank-only side effects;
+- evaluation through the unwrapped module rather than the DDP wrapper;
 - resume state;
 - failure propagation.
 
@@ -616,6 +692,7 @@ On the target two-GPU host:
 - perform one GRPO iteration with four prompts, four rollouts each, and two
   actor update epochs;
 - verify Flash Attention 2 for Transformers training;
+- verify Qwen thinking mode is disabled in verl tokenization;
 - verify one W&B run per stage;
 - save, resume, export, and directly load checkpoints.
 
@@ -647,4 +724,3 @@ Each implementation phase must update:
 
 No phase is considered complete until its applicable verification level
 passes and the produced model or data artifact satisfies Manifest V2.
-

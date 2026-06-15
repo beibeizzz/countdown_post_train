@@ -1,5 +1,11 @@
 # Next Full Workflow
 
+> Historical pre-core-development runbook. The approved architecture and
+> training contracts are defined in
+> `superpowers/specs/2026-06-15-post-train-v2-core-development-design.md`.
+> This file remains useful for environment and legacy-flow context, but its
+> phase status and numerical defaults are not authoritative.
+
 This document defines the execution order after the current environment,
 Flash Attention loader, and V2 dual-GPU Teacher generation work. It
 deliberately separates implemented V2 generation from validation of the

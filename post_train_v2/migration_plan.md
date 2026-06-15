@@ -1,5 +1,11 @@
 # Distributed and verl Migration Plan
 
+> Historical planning document. The approved and authoritative implementation
+> contract is
+> `docs/superpowers/specs/2026-06-15-post-train-v2-core-development-design.md`.
+> Numerical defaults, open choices, and status statements below are retained
+> for analysis only and must not be used when they conflict with that design.
+
 ## 1. Target Architecture
 
 V2 uses a hybrid architecture selected by training-stage requirements.
