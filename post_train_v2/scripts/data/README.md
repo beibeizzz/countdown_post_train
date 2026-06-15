@@ -91,7 +91,25 @@ the two samples may overlap. Completion is published last in
 
 Both modes hash every data and manifest input before reading and verify those
 fixed hashes before revoking an old completion manifest, then again after
-publishing data and before building the new manifest. Parent hashes come
-directly from the initial snapshots and are never reread after validation.
-If publication or the second unchanged check fails after revocation, partial
-files are non-consumable because the completion manifest remains absent.
+publishing data, and once more after building the new manifest immediately
+before publication. Parent hashes come directly from the initial snapshots
+and are never reread after validation. If publication or a late unchanged
+check fails after revocation, partial files are non-consumable because the
+completion manifest remains absent.
+
+Each mode holds an exclusive `.build_splits.lock` in the output directory for
+the complete read, sample, and publish transaction. A second writer fails
+before touching data or completion markers. The lock is removed on success
+and ordinary failure; a lock left by a terminated process must be inspected
+and removed manually before retrying.
+
+Manifest `created_at` records the actual split build time. Stable identity is
+provided by `artifact_id`, which excludes creation time. Paths inside the
+repository are recorded relative to the repository root, regardless of
+whether the config supplied a relative or absolute spelling; external paths
+remain absolute so the logical configuration remains replayable.
+
+The Phase 1 implementation loads and validates each JSONL artifact in memory.
+This is acceptable for the current 117k source rows and 20k Teacher pool.
+Larger future warehouses should replace this with an indexed or streaming
+selection implementation without changing the published schemas.

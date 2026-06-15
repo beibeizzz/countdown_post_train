@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -324,7 +325,6 @@ def test_validation_is_deterministic_excludes_val_and_restores_source_order(
             "val_200.jsonl",
             "eval_50.jsonl",
             "train_candidates.jsonl",
-            "validation_manifest.json",
         )
     }
     second = run_validation_splits(config_path)
@@ -500,7 +500,6 @@ def test_accepted_samples_independently_with_separate_seeds_and_can_overlap(
         for name in (
             "sft_train_8k.jsonl",
             "grpo_train_4k.jsonl",
-            "accepted_splits_manifest.json",
         )
     }
     second = run_accepted_splits(config_path)
@@ -1002,8 +1001,6 @@ def test_parent_uses_initial_manifest_snapshot_digest_after_late_change(
         config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         input_manifest = Path(config["teacher_manifest"])
         runner = run_accepted_splits
-    expected_manifest = load_manifest(input_manifest)
-    expected_digest = sha256_file(input_manifest)
     real_artifact_file = splits_module._artifact_file
     mutated = False
 
@@ -1015,20 +1012,17 @@ def test_parent_uses_initial_manifest_snapshot_digest_after_late_change(
             mutated = True
         return result
 
-    def inspect_then_abort(path, manifest):
-        parent = next(
-            item
-            for item in manifest.parents
-            if item.artifact_id == expected_manifest.artifact_id
-        )
-        assert parent.sha256 == expected_digest
-        raise OSError("stop after parent inspection")
-
     monkeypatch.setattr(splits_module, "_artifact_file", mutate_during_output_metadata)
-    monkeypatch.setattr(splits_module, "publish_manifest", inspect_then_abort)
 
-    with pytest.raises(OSError, match="parent inspection"):
+    with pytest.raises(ValueError, match="changed during"):
         runner(config_path)
+
+    output_manifest = (
+        output_dir / "validation_manifest.json"
+        if mode == "validation"
+        else output_dir / "accepted_splits_manifest.json"
+    )
+    assert not output_manifest.exists()
 
 
 def test_accepted_manifest_records_teacher_and_validation_parents(tmp_path: Path):
@@ -1099,3 +1093,162 @@ def test_cli_help_works_from_arbitrary_cwd(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     assert "{validation,accepted}" in result.stdout
+
+
+@pytest.mark.parametrize("mode", ["validation", "accepted"])
+def test_split_build_rejects_concurrent_writer_before_touching_outputs(
+    tmp_path: Path, mode: str
+):
+    if mode == "validation":
+        source_path, source_manifest, output_dir = write_source_fixture(tmp_path)
+        config_path = write_validation_config(
+            tmp_path, source_path, source_manifest, output_dir
+        )
+        runner = run_validation_splits
+        manifest_name = "validation_manifest.json"
+    else:
+        config_path, output_dir, _ = prepare_accepted(tmp_path)
+        runner = run_accepted_splits
+        manifest_name = "accepted_splits_manifest.json"
+
+    runner(config_path)
+    original_manifest = (output_dir / manifest_name).read_bytes()
+    lock_path = output_dir / ".build_splits.lock"
+    lock_path.write_text('{"pid":999999,"owner_token":"other"}\n', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="split output lock"):
+        runner(config_path)
+
+    assert (output_dir / manifest_name).read_bytes() == original_manifest
+    assert lock_path.exists()
+
+
+@pytest.mark.parametrize("mode", ["validation", "accepted"])
+def test_split_build_releases_output_lock_after_success_and_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+):
+    if mode == "validation":
+        source_path, source_manifest, output_dir = write_source_fixture(tmp_path)
+        config_path = write_validation_config(
+            tmp_path, source_path, source_manifest, output_dir
+        )
+        runner = run_validation_splits
+    else:
+        config_path, output_dir, _ = prepare_accepted(tmp_path)
+        runner = run_accepted_splits
+
+    runner(config_path)
+    assert not (output_dir / ".build_splits.lock").exists()
+
+    monkeypatch.setattr(
+        splits_module,
+        "publish_jsonl",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("publish failed")),
+    )
+    with pytest.raises(OSError, match="publish failed"):
+        runner(config_path)
+    assert not (output_dir / ".build_splits.lock").exists()
+
+
+def test_split_output_lock_removes_owned_file_when_metadata_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_dir = tmp_path / "output"
+    real_dump = splits_module.json.dump
+
+    def fail_dump(*args, **kwargs):
+        raise OSError("lock metadata failed")
+
+    monkeypatch.setattr(splits_module.json, "dump", fail_dump)
+    with pytest.raises(OSError, match="lock metadata failed"):
+        with splits_module._split_output_lock(
+            output_dir,
+            config_path=tmp_path / "config.yaml",
+            mode="validation",
+        ):
+            pytest.fail("lock body must not run")
+    monkeypatch.setattr(splits_module.json, "dump", real_dump)
+
+    assert not (output_dir / ".build_splits.lock").exists()
+
+
+@pytest.mark.parametrize("mode", ["validation", "accepted"])
+def test_split_manifest_uses_actual_creation_time(
+    tmp_path: Path, mode: str
+):
+    before = datetime.now(timezone.utc)
+    if mode == "validation":
+        source_path, source_manifest, output_dir = write_source_fixture(tmp_path)
+        config_path = write_validation_config(
+            tmp_path, source_path, source_manifest, output_dir
+        )
+        parent_created_at = load_manifest(source_manifest).created_at
+        manifest = run_validation_splits(config_path)
+    else:
+        config_path, output_dir, _ = prepare_accepted(tmp_path)
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        parent_created_at = load_manifest(config["teacher_manifest"]).created_at
+        manifest = run_accepted_splits(config_path)
+    after = datetime.now(timezone.utc)
+
+    created_at = datetime.fromisoformat(manifest.created_at)
+    assert before <= created_at <= after
+    assert manifest.created_at != parent_created_at
+
+
+@pytest.mark.parametrize("mode", ["validation", "accepted"])
+def test_input_change_after_manifest_build_prevents_completion_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+):
+    if mode == "validation":
+        source_path, source_manifest, output_dir = write_source_fixture(tmp_path)
+        config_path = write_validation_config(
+            tmp_path, source_path, source_manifest, output_dir
+        )
+        changed_path = source_manifest
+        runner = run_validation_splits
+        manifest_name = "validation_manifest.json"
+    else:
+        config_path, output_dir, _ = prepare_accepted(tmp_path)
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        changed_path = Path(config["teacher_manifest"])
+        runner = run_accepted_splits
+        manifest_name = "accepted_splits_manifest.json"
+
+    real_build = ManifestV2.build
+
+    def mutate_after_build(*args, **kwargs):
+        manifest = real_build(*args, **kwargs)
+        changed_path.write_bytes(changed_path.read_bytes() + b"\n")
+        return manifest
+
+    monkeypatch.setattr(
+        "post_train_v2.src.data.splits.ManifestV2.build",
+        mutate_after_build,
+    )
+
+    with pytest.raises(ValueError, match="changed during"):
+        runner(config_path)
+
+    assert not (output_dir / manifest_name).exists()
+
+
+def test_logical_config_paths_are_replayable_and_equivalent_inside_repo(
+    tmp_path: Path,
+):
+    relative = "post_train_v2/data/processed/solvable_train.jsonl"
+    absolute = str((REPO_ROOT / relative).resolve())
+
+    assert splits_module._logical_path(
+        relative,
+        (REPO_ROOT / "post_train_v2/configs/data").resolve(),
+        "source_data",
+    ) == relative
+    assert splits_module._logical_path(
+        absolute,
+        tmp_path.resolve(),
+        "source_data",
+    ) == relative

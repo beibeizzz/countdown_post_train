@@ -6,7 +6,9 @@ import errno
 import hashlib
 import json
 import os
+import uuid
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +21,12 @@ from post_train_v2.src.artifacts.manifest import (
     load_manifest,
     publish_manifest,
 )
-from post_train_v2.src.config.loading import load_yaml, require_keys, resolve_repo_path
+from post_train_v2.src.config.loading import (
+    REPO_ROOT,
+    load_yaml,
+    require_keys,
+    resolve_repo_path,
+)
 from post_train_v2.src.countdown.sampling import exclude_ids, stratified_sample
 from post_train_v2.src.data.schema import (
     validate_normalized_source,
@@ -110,18 +117,14 @@ def _positive_int(value: Any, name: str) -> int:
     return normalized
 
 
-def _logical_path(value: Any, config_dir: Path, field: str) -> str:
+def _logical_path(value: Any, _config_dir: Path, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} must be a nonempty path string")
-    path = Path(value)
-    if not path.is_absolute():
-        return path.as_posix()
+    path = resolve_repo_path(value)
     try:
-        return Path(os.path.relpath(path, start=config_dir)).as_posix()
-    except ValueError as error:
-        raise ValueError(
-            f"{field} absolute path must share a filesystem root with config"
-        ) from error
+        return path.relative_to(REPO_ROOT.resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
 
 
 def _load_config(config_path: str | Path) -> tuple[Path, dict[str, Any], dict[str, Any]]:
@@ -335,6 +338,64 @@ def _revoke_manifest(path: Path) -> None:
     _fsync_directory(path.parent)
 
 
+@contextmanager
+def _split_output_lock(
+    output_dir: Path,
+    *,
+    config_path: Path,
+    mode: str,
+):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = output_dir / ".build_splits.lock"
+    owner_token = uuid.uuid4().hex
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+    except FileExistsError as error:
+        raise RuntimeError(
+            f"split output lock already exists: {lock_path}"
+        ) from error
+
+    metadata_written = False
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "pid": os.getpid(),
+                    "owner_token": owner_token,
+                    "config_path": str(config_path.resolve()),
+                    "output_dir": str(output_dir.resolve()),
+                    "mode": mode,
+                },
+                handle,
+                sort_keys=True,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        metadata_written = True
+        _fsync_directory(output_dir)
+        yield
+    finally:
+        if not metadata_written:
+            lock_path.unlink(missing_ok=True)
+            _fsync_directory(output_dir)
+        else:
+            try:
+                metadata = json.loads(lock_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, UnicodeError, json.JSONDecodeError):
+                metadata = None
+            if isinstance(metadata, Mapping) and metadata.get(
+                "owner_token"
+            ) == owner_token:
+                lock_path.unlink(missing_ok=True)
+                _fsync_directory(output_dir)
+
+
 def _snapshot(paths: list[Path]) -> dict[Path, str]:
     return {path: sha256_file(path) for path in paths}
 
@@ -355,7 +416,19 @@ def _parent(manifest: ManifestV2, digest: str) -> ParentArtifact:
 def run_validation_splits(config_path: str | Path) -> ManifestV2:
     """Publish validation, fixed-eval, and train-candidate source splits."""
 
-    _, config, logical_config = _load_config(config_path)
+    resolved_config, config, logical_config = _load_config(config_path)
+    with _split_output_lock(
+        config["output_dir"],
+        config_path=resolved_config,
+        mode="validation",
+    ):
+        return _run_validation_splits_locked(config, logical_config)
+
+
+def _run_validation_splits_locked(
+    config: Mapping[str, Any],
+    logical_config: Mapping[str, Any],
+) -> ManifestV2:
     source_path = config["source_data"]
     source_manifest_path = config["source_manifest"]
     output_dir = config["output_dir"]
@@ -416,7 +489,6 @@ def run_validation_splits(config_path: str | Path) -> ManifestV2:
         config=logical_config,
         global_seed=config["seed"],
         seed_derivation_version=SEED_DERIVATION_VERSION,
-        created_at=source_manifest.created_at,
         stage_metadata={
             "completed": True,
             "counts": {
@@ -440,6 +512,7 @@ def run_validation_splits(config_path: str | Path) -> ManifestV2:
             },
         },
     )
+    _require_unchanged(snapshots, "validation")
     publish_manifest(manifest_path, manifest)
     return manifest
 
@@ -500,7 +573,19 @@ def _validation_ids(
 def run_accepted_splits(config_path: str | Path) -> ManifestV2:
     """Publish independently sampled SFT and GRPO splits from accepted rows."""
 
-    _, config, logical_config = _load_config(config_path)
+    resolved_config, config, logical_config = _load_config(config_path)
+    with _split_output_lock(
+        config["output_dir"],
+        config_path=resolved_config,
+        mode="accepted",
+    ):
+        return _run_accepted_splits_locked(config, logical_config)
+
+
+def _run_accepted_splits_locked(
+    config: Mapping[str, Any],
+    logical_config: Mapping[str, Any],
+) -> ManifestV2:
     accepted_path = config["teacher_accepted"]
     teacher_manifest_path = config["teacher_manifest"]
     output_dir = config["output_dir"]
@@ -583,7 +668,6 @@ def run_accepted_splits(config_path: str | Path) -> ManifestV2:
     publish_jsonl(output_dir / "grpo_train_4k.jsonl", grpo_rows)
     _require_unchanged(snapshots, "accepted")
 
-    created_at = max(teacher_manifest.created_at, validation_manifest.created_at)
     manifest = ManifestV2.build(
         artifact_type="dataset",
         stage="build_accepted_splits",
@@ -608,7 +692,6 @@ def run_accepted_splits(config_path: str | Path) -> ManifestV2:
         config=logical_config,
         global_seed=config["seed"],
         seed_derivation_version=SEED_DERIVATION_VERSION,
-        created_at=created_at,
         stage_metadata={
             "completed": True,
             "counts": {
@@ -629,5 +712,6 @@ def run_accepted_splits(config_path: str | Path) -> ManifestV2:
             "validation_ids": sorted(val_ids),
         },
     )
+    _require_unchanged(snapshots, "accepted")
     publish_manifest(manifest_path, manifest)
     return manifest
