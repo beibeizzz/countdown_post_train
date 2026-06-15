@@ -309,6 +309,11 @@ completion time. Generation may stop only when that prefix contains at least
 records in original candidate order. Later completed records are not allowed
 to displace earlier records.
 
+If the candidate source is exhausted before 20,000 correct responses are
+accepted, the stage writes a partial failure manifest containing the actual
+accepted count and processed source range, exits non-zero, and does not
+publish a complete accepted-pool artifact.
+
 ## 8. Supervised Training Stack
 
 Full SFT, LoRA, and RFT training use:
@@ -324,6 +329,9 @@ Full SFT, LoRA, and RFT training use:
 - gradient checkpointing enabled by default and configurable per stage;
 - complete response supervision with prompt-token labels masked;
 - maximum total sequence length of 256;
+- `logging_strategy="steps"`;
+- `logging_steps=1`;
+- `logging_first_step=true`;
 - synchronous main-rank fixed evaluation every 100 optimizer steps.
 
 Both ranks enter a barrier before evaluation. Rank 0 evaluates and writes
@@ -395,10 +403,12 @@ response. Exact normalized duplicates within the same question are removed.
 Responses with the same final expression but different normalized complete
 response text remain distinct.
 
-At most two accepted responses are retained per prompt. The accepted pool is
-then stratified by number count and solver-expression complexity. The stage
-does not lower validation standards or synthesize records to reach a fixed
-size. Its manifest records the actual accepted count and question coverage.
+At most two accepted responses are retained per prompt. When more than two
+normalized, distinct, correct responses remain for one prompt, the two with
+the earliest `rollout_index` are retained. The accepted pool is then
+stratified by number count and solver-expression complexity. The stage does
+not lower validation standards or synthesize records to reach a fixed size.
+Its manifest records the actual accepted count and question coverage.
 
 RFT trains Qwen3-0.6B base so it remains an independently comparable
 rejection-sampling baseline.
@@ -474,7 +484,9 @@ if remote memory measurements require it. It is not the baseline.
 ### 11.1 Data Conversion
 
 The fixed stratified GRPO 4k JSONL set is converted to train Parquet. The
-fixed validation data is converted separately.
+fixed 50-record evaluation set is converted separately for periodic native
+verl validation. The complete `val_200` remains a final common-evaluation
+dataset and is not used for periodic GRPO validation.
 
 The converter:
 
@@ -491,29 +503,39 @@ GRPO uses:
 
 - Full SFT `best/` as actor initialization;
 - verl 0.6.0;
-- FSDP2 for actor training;
+- `actor_rollout_ref.actor.strategy=fsdp2`;
 - vLLM 0.9.1 for rollout;
 - one node and two GPUs;
 - no critic;
 - no learned reward model;
 - no reference model;
 - `algorithm.adv_estimator=grpo`;
-- `actor.use_kl_loss=false`;
+- `actor_rollout_ref.actor.use_kl_loss=false`;
 - `algorithm.use_kl_in_reward=false`;
 - KL coefficient and reported project KL equal to zero;
 - BF16;
 - gradient checkpointing enabled initially;
-- prompt batch 4;
-- rollout group size `n=4`;
-- 16 trajectories per optimizer iteration;
-- maximum prompt length 256;
-- maximum response length 256;
+- `data.train_batch_size=4`;
+- `actor_rollout_ref.actor.ppo_mini_batch_size=4`;
+- `actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2`;
+- `actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2`;
+- `actor_rollout_ref.rollout.tensor_model_parallel_size=1`;
+- `actor_rollout_ref.rollout.temperature=1.0`;
+- `actor_rollout_ref.rollout.top_p=0.95`;
+- `actor_rollout_ref.rollout.n=4`;
+- 16 trajectories per trainer iteration;
+- `data.max_prompt_length=256`;
+- `data.max_response_length=256`;
 - `data.apply_chat_template_kwargs.enable_thinking=false`;
-- one pass over the 4k prompt set;
+- `trainer.total_epochs=1`;
 - deterministic epoch shuffle;
 - a recorded engine-level rollout seed for the fixed two-GPU topology;
-- `ppo_epochs=2` for two actor-update passes over each rollout batch;
-- no rollout reuse across optimizer iterations.
+- `actor_rollout_ref.actor.ppo_epochs=2` for two actor-update passes over each
+  rollout batch;
+- no rollout reuse across trainer iterations.
+
+One GRPO trainer iteration consumes one four-prompt batch, produces four
+responses per prompt, and performs the configured two actor-update epochs.
 
 The converted Parquet and GRPO launch configuration must be exercised by a
 tokenization fixture proving that Qwen's thinking mode is disabled and that
@@ -559,7 +581,7 @@ group-relative advantage and are not resampled.
 
 ### 11.4 Metrics and Saving
 
-Every GRPO iteration records:
+Every GRPO trainer iteration records:
 
 - reward mean and standard deviation;
 - group reward standard deviation;
@@ -574,22 +596,46 @@ Every GRPO iteration records:
 - rollout and token throughput;
 - bucket-level reward and accuracy.
 
-Every 100 optimizer iterations:
+Every 100 trainer iterations:
 
-- save a verl continuation checkpoint;
-- retain the latest two continuation checkpoints;
-- export a Hugging Face actor snapshot;
-- evaluate the fixed 50 records with the common evaluator.
+- run native verl validation on the fixed 50-record validation Parquet and
+  dump complete generation records to a step-addressed JSONL file;
+- save a native verl continuation checkpoint containing actor model,
+  optimizer, scheduler, extra state, global step, supported RNG state, and
+  data position.
 
-The final optimizer iteration performs the same checkpoint, export, and
-evaluation actions even when it is not divisible by 100. Duplicate work is
+The initial launch configuration sets `trainer.test_freq=100`,
+`trainer.save_freq=100`, `trainer.log_val_generations=50`, and a
+V2-controlled `trainer.validation_data_dir`. Native checkpoint pruning is
+disabled during training so every checkpoint referenced by a validation dump
+remains available for post-training selection.
+
+The final trainer iteration performs the same native validation and
+checkpoint actions even when it is not divisible by 100. Duplicate work is
 suppressed when the final iteration is already a periodic boundary.
 
-Only `best/` and `final/` Hugging Face exports are retained permanently.
-They must pass direct Transformers loading.
+All periodic continuation checkpoints are retained until post-training model
+selection finishes so an earlier best step cannot be pruned. The
+post-training selector recomputes `eval/accuracy` and `eval/format_rate` from
+each native validation JSONL dump using the common evaluator rules and
+selects:
 
-An evaluation or Hugging Face export failure is recorded and does not stop
-training. Failure to save the continuation checkpoint stops training.
+1. highest fixed-50 `eval/accuracy`;
+2. highest `eval/format_rate`;
+3. earlier optimizer step.
+
+After selection, V2 invokes the stock `verl.model_merger` entrypoint to merge
+the selected best actor checkpoint and the final actor checkpoint into
+directly loadable Hugging Face `best/` and `final/` exports. It then retains
+the latest two continuation checkpoints plus the selected best continuation
+checkpoint when that checkpoint is distinct. All other periodic continuation
+checkpoints may be removed only after both exports pass direct Transformers
+loading and their manifests are published.
+
+Native validation or continuation-checkpoint failure stops training. A
+post-training selection, merge, direct-load, or common-evaluation failure is
+recorded as a retryable post-processing failure and does not invalidate the
+native continuation checkpoints.
 
 ## 12. Common Evaluation
 
@@ -632,9 +678,13 @@ create additional runs. The default project is
 `countdown-post-train-v2`. Grouping uses an experiment-chain ID, and run names
 receive an automatic timestamp and short Git-revision suffix.
 
-Trainer stages log loss at every optimizer step. GRPO logs all metrics listed
-in Section 11.4 at every optimizer iteration. Fixed evaluation results and
-the 50 sample traces are logged every 100 steps and at the final step.
+Trainer stages log loss at every optimizer step through
+`logging_strategy="steps"`, `logging_steps=1`, and
+`logging_first_step=true`. GRPO logs all metrics listed in Section 11.4 at
+every trainer iteration. Native fixed-50 validation metrics and sampled
+generations are logged every 100 steps and at the final step. Complete
+fixed-50 generation traces are written locally, while W&B records the
+configured validation samples and the local trace path.
 
 W&B does not upload complete model checkpoints or datasets as Artifacts by
 default. It records configuration, local paths, artifact IDs, and manifest
@@ -655,6 +705,8 @@ V2 Trainer state.
 
 verl resumes from its native continuation checkpoint, restoring actor,
 optimizer, scheduler, global step, supported RNG state, and data position.
+GRPO post-processing can be rerun independently from the retained native
+validation dumps and continuation checkpoints.
 
 Temporary files are created beside their final destinations and promoted by
 atomic replacement.
@@ -694,7 +746,10 @@ On the target two-GPU host:
 - verify Flash Attention 2 for Transformers training;
 - verify Qwen thinking mode is disabled in verl tokenization;
 - verify one W&B run per stage;
-- save, resume, export, and directly load checkpoints.
+- save and resume native checkpoints;
+- select a best GRPO checkpoint from native validation dumps;
+- merge best and final GRPO actors with `verl.model_merger` and directly load
+  the resulting Hugging Face exports.
 
 ### Level 3: End-to-End Acceptance
 
