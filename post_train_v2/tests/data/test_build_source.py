@@ -1,0 +1,394 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+import yaml
+
+from post_train_v2.src.artifacts.hashing import (
+    sha256_canonical_json,
+    sha256_config,
+    sha256_file,
+)
+from post_train_v2.src.artifacts.manifest import ManifestV2, load_manifest
+from post_train_v2.src.countdown.bucketing import assign_bucket
+from post_train_v2.src.countdown.prompts import build_solution_prompt
+from post_train_v2.src.countdown.solver import solve_countdown
+from post_train_v2.src.data.schema import validate_normalized_source
+from post_train_v2.src.data.source import (
+    build_test_source,
+    build_train_source,
+    run_build_source,
+)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+SCRIPT = REPO_ROOT / "post_train_v2/scripts/data/build_source.py"
+DATA_FILENAMES = (
+    "source_all.jsonl",
+    "solvable_train.jsonl",
+    "unsolved_train.jsonl",
+    "test_solved.jsonl",
+)
+NORMALIZED_SCHEMA = {
+    "id": "string",
+    "source_index": "integer",
+    "numbers": "array[integer]",
+    "target": "integer",
+    "gold_expr": "string",
+    "prompt": "string",
+    "bucket": "object",
+}
+UNSOLVED_SCHEMA = {
+    "id": "string",
+    "source_index": "integer",
+    "numbers": "array[integer]",
+    "target": "integer",
+    "reason": "string",
+}
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+
+
+def write_fixture(
+    tmp_path: Path,
+    *,
+    train_rows: list[dict] | None = None,
+    test_rows: list[dict] | None = None,
+) -> tuple[Path, Path, Path, Path]:
+    train_path = tmp_path / "inputs" / "train.parquet"
+    test_path = tmp_path / "inputs" / "test.json"
+    output_dir = tmp_path / "outputs"
+    config_path = tmp_path / "configs" / "build_source.yaml"
+    train_path.parent.mkdir(parents=True)
+    config_path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        train_rows
+        or [
+            {"nums": [1, 2], "target": 3},
+            {"nums": np.array([3, 3, 8, 8]), "target": 24},
+        ]
+    ).to_parquet(train_path, index=False)
+    test_path.write_text(
+        json.dumps(
+            test_rows
+            or [
+                {"id": 7, "numbers": [1, 2], "target": 3},
+                {"id": 9, "numbers": "[3, 3, 8, 8]", "target": 24},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    config = {
+        "seed": 42,
+        "train_input": str(train_path),
+        "test_input": str(test_path),
+        "output_dir": str(output_dir),
+    }
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    return config_path, train_path, test_path, output_dir
+
+
+def test_build_train_and_test_source_preserve_ids_indexes_prompts_solver_and_bucket():
+    frame = pd.DataFrame(
+        [
+            {"nums": (1, 2), "target": 3},
+            {"nums": np.array([3, 3, 8, 8]), "target": 24},
+        ],
+        index=[40, 99],
+    )
+
+    solvable, unsolved = build_train_source(frame)
+    test_rows = build_test_source(
+        [{"id": 7, "numbers": "[1, 2]", "target": 3}]
+    )
+
+    assert unsolved == []
+    assert [row["id"] for row in solvable] == [
+        "train-000001",
+        "train-000002",
+    ]
+    assert [row["source_index"] for row in solvable] == [1, 2]
+    assert test_rows[0]["id"] == "test-000007"
+    assert test_rows[0]["source_index"] == 7
+    for row in [*solvable, *test_rows]:
+        assert row["gold_expr"] == solve_countdown(row["numbers"], row["target"])
+        assert row["prompt"] == build_solution_prompt(
+            row["numbers"], row["target"]
+        )
+        assert row["bucket"] == assign_bucket(row["numbers"], row["gold_expr"])
+        assert validate_normalized_source(row) == row
+
+
+def test_build_train_source_keeps_unsolved_rows_with_exact_contract():
+    solvable, unsolved = build_train_source(
+        pd.DataFrame(
+            [
+                {"nums": [1, 2], "target": 3},
+                {"nums": [1, 1], "target": 3},
+            ]
+        )
+    )
+
+    assert [row["id"] for row in solvable] == ["train-000001"]
+    assert unsolved == [
+        {
+            "id": "train-000002",
+            "source_index": 2,
+            "numbers": [1, 1],
+            "target": 3,
+            "reason": "no_solution",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("target", True),
+        ("target", 3.0),
+        ("target", "3"),
+        ("nums", [1, True]),
+        ("nums", [1, 2.0]),
+        ("nums", ["1", 2]),
+        ("nums", "not-json"),
+        ("nums", '{"not":"a-list"}'),
+        ("nums", []),
+        ("nums", [-1, 2]),
+    ],
+)
+def test_train_source_rejects_malformed_exact_integer_inputs(field, value):
+    row = {"nums": [1, 2], "target": 3}
+    row[field] = value
+
+    with pytest.raises(ValueError, match=field.replace("nums", "numbers")):
+        build_train_source(pd.DataFrame([row]))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("id", True),
+        ("id", 7.0),
+        ("id", "7"),
+        ("id", 0),
+        ("id", -1),
+        ("target", True),
+        ("target", "3"),
+        ("numbers", [1, 2.0]),
+    ],
+)
+def test_test_source_rejects_malformed_exact_integer_inputs(field, value):
+    row = {"id": 7, "numbers": [1, 2], "target": 3}
+    row[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        build_test_source([row])
+
+
+def test_build_test_source_rejects_duplicate_native_ids():
+    with pytest.raises(ValueError, match="duplicate.*7"):
+        build_test_source(
+            [
+                {"id": 7, "numbers": [1, 2], "target": 3},
+                {"id": 7, "numbers": [3, 4], "target": 7},
+            ]
+        )
+
+
+def test_run_build_source_limit_preserves_original_indexes_and_writes_unsolved(
+    tmp_path: Path,
+):
+    config_path, _, _, output_dir = write_fixture(
+        tmp_path,
+        train_rows=[
+            {"numbers": [1, 2], "target": 3},
+            {"numbers": [1, 1], "target": 3},
+            {"numbers": [2, 2], "target": 4},
+        ],
+    )
+
+    manifest = run_build_source(config_path, limit=2)
+
+    assert [row["source_index"] for row in read_jsonl(
+        output_dir / "source_all.jsonl"
+    )] == [1]
+    assert read_jsonl(output_dir / "unsolved_train.jsonl") == [
+        {
+            "id": "train-000002",
+            "source_index": 2,
+            "numbers": [1, 1],
+            "target": 3,
+            "reason": "no_solution",
+        }
+    ]
+    assert manifest.stage_metadata["limit"] == 2
+    assert manifest.stage_metadata["counts"] == {
+        "train_input": 2,
+        "solvable_train": 1,
+        "unsolved_train": 1,
+        "test_solved": 2,
+    }
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5, "1"])
+def test_run_build_source_rejects_invalid_limits(tmp_path: Path, limit):
+    config_path, _, _, output_dir = write_fixture(tmp_path)
+
+    with pytest.raises(ValueError, match="limit"):
+        run_build_source(config_path, limit=limit)
+
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("preexisting_manifest", [False, True])
+def test_unsolved_test_fails_without_publishing_or_overwriting_manifest(
+    tmp_path: Path,
+    preexisting_manifest: bool,
+):
+    config_path, _, _, output_dir = write_fixture(
+        tmp_path,
+        test_rows=[{"id": 7, "numbers": [1, 1], "target": 3}],
+    )
+    manifest_path = output_dir / "manifest.json"
+    original = b'{"existing":true}'
+    if preexisting_manifest:
+        output_dir.mkdir(parents=True)
+        manifest_path.write_bytes(original)
+
+    with pytest.raises(ValueError, match="test-000007.*no solution"):
+        run_build_source(config_path, limit=None)
+
+    if preexisting_manifest:
+        assert manifest_path.read_bytes() == original
+    else:
+        assert not manifest_path.exists()
+    assert all(not (output_dir / name).exists() for name in DATA_FILENAMES)
+
+
+def test_run_build_source_manifest_has_exact_files_parents_config_and_metadata(
+    tmp_path: Path,
+):
+    config_path, train_path, test_path, output_dir = write_fixture(tmp_path)
+    config_snapshot = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    manifest = run_build_source(config_path, limit=None)
+    loaded = load_manifest(output_dir / "manifest.json")
+
+    assert loaded == manifest
+    assert manifest.stage == "build_source"
+    assert manifest.artifact_type == "dataset"
+    assert manifest.config == config_snapshot
+    assert manifest.config_sha256 == sha256_config(config_snapshot)
+    assert manifest.global_seed == 42
+    expected_parent_hashes = {
+        str(train_path.resolve()): sha256_file(train_path),
+        str(test_path.resolve()): sha256_file(test_path),
+    }
+    assert {
+        parent.artifact_id: parent.sha256 for parent in manifest.parents
+    } == {
+        sha256_canonical_json(
+            {"kind": kind, "path": path, "sha256": sha256}
+        ): sha256
+        for kind, (path, sha256) in zip(
+            ("raw_train", "raw_test"),
+            expected_parent_hashes.items(),
+            strict=True,
+        )
+    }
+    assert [item.relative_path for item in manifest.files] == list(DATA_FILENAMES)
+    expected_rows = {
+        "source_all.jsonl": 2,
+        "solvable_train.jsonl": 2,
+        "unsolved_train.jsonl": 0,
+        "test_solved.jsonl": 2,
+    }
+    for item in manifest.files:
+        path = output_dir / item.relative_path
+        assert item.sha256 == sha256_file(path)
+        assert item.byte_size == path.stat().st_size
+        assert item.row_count == expected_rows[item.relative_path]
+        assert item.field_schema == (
+            UNSOLVED_SCHEMA
+            if item.relative_path == "unsolved_train.jsonl"
+            else NORMALIZED_SCHEMA
+        )
+    assert manifest.stage_metadata == {
+        "completed": True,
+        "counts": {
+            "train_input": 2,
+            "solvable_train": 2,
+            "unsolved_train": 0,
+            "test_solved": 2,
+        },
+        "limit": None,
+        "resolved_inputs": {
+            "train": str(train_path.resolve()),
+            "test": str(test_path.resolve()),
+        },
+        "resolved_output": str(output_dir.resolve()),
+    }
+
+
+def test_run_build_source_repeated_build_has_deterministic_data_and_artifact_id(
+    tmp_path: Path,
+):
+    config_path, _, _, output_dir = write_fixture(tmp_path)
+
+    first = run_build_source(config_path, limit=None)
+    first_bytes = {
+        name: (output_dir / name).read_bytes() for name in DATA_FILENAMES
+    }
+    second = run_build_source(config_path, limit=None)
+
+    assert second.artifact_id == first.artifact_id
+    assert {
+        name: (output_dir / name).read_bytes() for name in DATA_FILENAMES
+    } == first_bytes
+    assert second.created_at != ""
+
+
+def test_default_config_has_approved_phase1_values():
+    config = yaml.safe_load(
+        (
+            REPO_ROOT / "post_train_v2/configs/data/build_source.yaml"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert config == {
+        "seed": 42,
+        "train_input": "datasets/raw_train.parquet",
+        "test_input": "datasets/raw_test.json",
+        "output_dir": "post_train_v2/data/processed",
+    }
+
+
+def test_cli_help_succeeds_from_other_cwd(tmp_path: Path):
+    env = dict(os.environ)
+    env["PYTHONPATH"] = ""
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--help"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--config" in result.stdout
+    assert "--limit" in result.stdout
