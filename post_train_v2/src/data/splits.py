@@ -246,13 +246,17 @@ def _teacher_completion_counts(
     target_count = _metadata_count(
         metadata, "target_accepted_count", "teacher"
     )
+    if target_count == 0:
+        raise ValueError(
+            "teacher metadata target_accepted_count must be a positive exact integer"
+        )
     if accepted_count != teacher_file.row_count:
         raise ValueError(
             "teacher accepted_count must equal teacher file row_count"
         )
-    if accepted_count < target_count:
+    if accepted_count != target_count:
         raise ValueError(
-            "teacher completed target_accepted_count exceeds accepted_count"
+            "teacher completed accepted_count must equal target_accepted_count"
         )
     return accepted_count, target_count
 

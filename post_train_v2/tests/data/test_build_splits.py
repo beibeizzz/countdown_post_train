@@ -575,6 +575,14 @@ def test_accepted_samples_independently_with_separate_seeds_and_can_overlap(
             {
                 "completed": True,
                 "accepted_count": 12,
+                "target_accepted_count": 0,
+            },
+            "target_accepted_count",
+        ),
+        (
+            {
+                "completed": True,
+                "accepted_count": 12,
                 "target_accepted_count": True,
             },
             "target_accepted_count",
@@ -612,7 +620,7 @@ def test_accepted_requires_strict_teacher_completion_contract(
     assert not (output_dir / "accepted_splits_manifest.json").exists()
 
 
-def test_accepted_allows_completed_pool_above_target_count(tmp_path: Path):
+def test_accepted_rejects_completed_pool_above_target_count(tmp_path: Path):
     config_path, output_dir, teacher_rows = prepare_accepted(tmp_path)
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     rebuild_manifest(
@@ -624,10 +632,10 @@ def test_accepted_allows_completed_pool_above_target_count(tmp_path: Path):
         },
     )
 
-    manifest = run_accepted_splits(config_path)
+    with pytest.raises(ValueError, match="accepted_count.*target_accepted_count"):
+        run_accepted_splits(config_path)
 
-    assert manifest.stage_metadata["counts"]["accepted_pool"] == len(teacher_rows)
-    assert (output_dir / "accepted_splits_manifest.json").exists()
+    assert not (output_dir / "accepted_splits_manifest.json").exists()
 
 
 @pytest.mark.parametrize(

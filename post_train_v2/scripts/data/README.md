@@ -76,13 +76,15 @@ python post_train_v2/scripts/data/build_splits.py --config post_train_v2/configs
 ```
 
 The accepted mode requires explicit `completed: true`, `accepted_count`, and
-`target_accepted_count` Teacher metadata. Both counts are exact nonnegative
-integers, `accepted_count` must equal the manifest file count and actual row
-count, and it must be at least the target. The mode also rejects manifest
-file hash/count/schema mismatches, validation-ID leakage, and Teacher parent
-mismatches. It reads and validates `val_200.jsonl`, requiring its file count,
-actual rows, selected IDs, manifest count, and configured `val_size` to
-agree. It validates every canonical SFT row and independently samples
+`target_accepted_count` Teacher metadata. `accepted_count` is an exact
+nonnegative integer, while the target is a positive exact integer. A
+completed pool must have `accepted_count == target_accepted_count`, and that
+count must also equal the manifest file count and actual row count. The mode
+also rejects manifest file hash/count/schema mismatches, validation-ID
+leakage, and Teacher parent mismatches. It reads and validates
+`val_200.jsonl`, requiring its file count, actual rows, selected IDs,
+manifest count, and configured `val_size` to agree. It validates every
+canonical SFT row and independently samples
 `sft_train_8k.jsonl` and `grpo_train_4k.jsonl` with separate derived seeds;
 the two samples may overlap. Completion is published last in
 `accepted_splits_manifest.json`.
