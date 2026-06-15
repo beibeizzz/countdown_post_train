@@ -18,6 +18,14 @@ from post_train_v2.src.artifacts.hashing import (
 
 SCHEMA_VERSION = 2
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+WINDOWS_INVALID_COMPONENT_CHARACTERS = frozenset('<>:"|?*')
+WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+    | {f"COM{index}" for index in "¹²³"}
+    | {f"LPT{index}" for index in "¹²³"}
+)
 MANIFEST_KEYS = {
     "schema_version",
     "artifact_type",
@@ -36,6 +44,40 @@ MANIFEST_KEYS = {
     "runtime_versions",
     "stage_metadata",
 }
+
+
+def _windows_path_key(value: str) -> str:
+    return "/".join(part.casefold() for part in PurePosixPath(value).parts)
+
+
+def _validate_windows_component(component: str) -> None:
+    if component.endswith((".", " ")):
+        raise ValueError(
+            "artifact relative path component has a trailing dot or space"
+        )
+    if any(
+        ord(character) < 32
+        or character in WINDOWS_INVALID_COMPONENT_CHARACTERS
+        for character in component
+    ):
+        raise ValueError(
+            "artifact relative path component must be Windows-safe"
+        )
+    try:
+        utf16_units = len(component.encode("utf-16-le")) // 2
+    except UnicodeEncodeError as error:
+        raise ValueError(
+            "artifact relative path component must be Windows-safe"
+        ) from error
+    if utf16_units > 255:
+        raise ValueError(
+            "artifact relative path component must be Windows-safe"
+        )
+    device_name = component.split(".", 1)[0].upper()
+    if device_name in WINDOWS_RESERVED_DEVICE_NAMES:
+        raise ValueError(
+            "artifact relative path uses a reserved Windows device name"
+        )
 
 
 def _require_nonempty_string(value: Any, field_name: str) -> str:
@@ -111,6 +153,8 @@ def _validate_relative_path(value: Any) -> str:
         raise ValueError(
             "artifact relative path must use canonical POSIX syntax"
         )
+    for component in posix_path.parts:
+        _validate_windows_component(component)
     return value
 
 
@@ -299,8 +343,10 @@ class ManifestV2:
             raise ValueError("files must contain ArtifactFile values")
         if any(not isinstance(item, ParentArtifact) for item in parents):
             raise ValueError("parents must contain ParentArtifact values")
-        file_paths = [item.relative_path for item in files]
-        if len(file_paths) != len(set(file_paths)):
+        file_path_keys = [
+            _windows_path_key(item.relative_path) for item in files
+        ]
+        if len(file_path_keys) != len(set(file_path_keys)):
             raise ValueError("duplicate file relative path")
         parent_ids = [item.artifact_id for item in parents]
         if len(parent_ids) != len(set(parent_ids)):

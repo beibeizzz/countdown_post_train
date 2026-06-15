@@ -196,6 +196,28 @@ def test_manifest_rejects_duplicate_file_paths():
         build_manifest(files=[artifact_file, artifact_file])
 
 
+def test_manifest_rejects_windows_case_insensitive_duplicate_file_paths():
+    with pytest.raises(ValueError, match="duplicate file"):
+        build_manifest(
+            files=[
+                ArtifactFile(
+                    "nested/source.jsonl",
+                    FILE_HASH,
+                    4,
+                    1,
+                    {"id": "string"},
+                ),
+                ArtifactFile(
+                    "nested/SOURCE.jsonl",
+                    "b" * 64,
+                    4,
+                    1,
+                    {"id": "string"},
+                ),
+            ]
+        )
+
+
 @pytest.mark.parametrize("sha256", ("abc", "g" * 64, "A" * 64, 123))
 def test_artifact_file_rejects_invalid_sha256(sha256):
     with pytest.raises(ValueError, match="SHA-256"):
@@ -235,6 +257,68 @@ def test_artifact_file_rejects_unsafe_relative_paths(relative_path):
 )
 def test_artifact_file_rejects_noncanonical_posix_paths(relative_path):
     with pytest.raises(ValueError, match="canonical POSIX"):
+        ArtifactFile(relative_path, FILE_HASH, 4, 1, {"id": "string"})
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "CON",
+        "con.jsonl",
+        "nested/AUX",
+        "nested/prn.txt",
+        "NUL.jsonl",
+        "COM1",
+        "nested/com9.bin",
+        "LPT1.txt",
+        "nested/lpt9",
+        "COM¹.txt",
+        "nested/lpt³.log",
+    ),
+)
+def test_artifact_file_rejects_windows_reserved_device_names(relative_path):
+    with pytest.raises(ValueError, match="reserved Windows device"):
+        ArtifactFile(relative_path, FILE_HASH, 4, 1, {"id": "string"})
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "source.",
+        "source ",
+        "nested/name. /source.jsonl",
+        "nested/name /source.jsonl",
+    ),
+)
+def test_artifact_file_rejects_windows_trailing_dot_or_space(relative_path):
+    with pytest.raises(ValueError, match="trailing dot or space"):
+        ArtifactFile(relative_path, FILE_HASH, 4, 1, {"id": "string"})
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "nested/a<b.jsonl",
+        "nested/a>b.jsonl",
+        'nested/a"b.jsonl',
+        "nested/a:b.jsonl",
+        "nested/a|b.jsonl",
+        "nested/a?b.jsonl",
+        "nested/a*b.jsonl",
+        "nested/control\x1f.jsonl",
+    ),
+)
+def test_artifact_file_rejects_windows_invalid_component_characters(
+    relative_path,
+):
+    with pytest.raises(ValueError, match="Windows-safe"):
+        ArtifactFile(relative_path, FILE_HASH, 4, 1, {"id": "string"})
+
+
+def test_artifact_file_rejects_windows_component_over_255_utf16_units():
+    relative_path = f"nested/{'a' * 256}.jsonl"
+
+    with pytest.raises(ValueError, match="Windows-safe"):
         ArtifactFile(relative_path, FILE_HASH, 4, 1, {"id": "string"})
 
 
