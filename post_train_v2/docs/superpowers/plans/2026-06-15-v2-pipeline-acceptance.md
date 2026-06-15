@@ -340,4 +340,3 @@ no stage writes below `post_train/`.
 git add post_train_v2/docs post_train_v2/README.md
 git commit -m "docs: record v2 acceptance workflow"
 ```
-

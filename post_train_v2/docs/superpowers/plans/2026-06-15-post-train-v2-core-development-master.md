@@ -180,4 +180,3 @@ python scripts/pipeline/run_pipeline.py \
 The production command is added only in Phase 5. It must refuse to run when
 Level 1 runtime gates are not recorded as passed in the configured runtime
 acceptance file.
-
