@@ -105,6 +105,7 @@ def write_source_fixture(
     *,
     count: int = 12,
     rows: list[dict] | None = None,
+    stage_metadata: dict | None = None,
 ) -> tuple[Path, Path, Path]:
     input_dir = tmp_path / "source"
     output_dir = tmp_path / "output"
@@ -119,7 +120,16 @@ def write_source_fixture(
         parents=[],
         config={"seed": 1},
         global_seed=1,
-        stage_metadata={"completed": True, "counts": {"solvable_train": len(selected)}},
+        stage_metadata=stage_metadata
+        or {
+            "completed": True,
+            "counts": {
+                "train_input": len(selected),
+                "solvable_train": len(selected),
+                "unsolved_train": 0,
+            },
+            "limit": None,
+        },
         git_revision="fixture",
         created_at="2026-06-15T00:00:00Z",
     )
@@ -140,11 +150,64 @@ def refresh_source_manifest_for_raw_file(
         parents=[],
         config={"seed": 1},
         global_seed=1,
-        stage_metadata={"completed": True, "counts": {"solvable_train": row_count}},
+        stage_metadata={
+            "completed": True,
+            "counts": {
+                "train_input": row_count,
+                "solvable_train": row_count,
+                "unsolved_train": 0,
+            },
+            "limit": None,
+        },
         git_revision="fixture",
         created_at="2026-06-15T00:00:00Z",
     )
     publish_manifest(manifest_path, manifest)
+
+
+def rebuild_manifest(
+    path: Path,
+    *,
+    stage_metadata: dict | None = None,
+    files: list[ArtifactFile] | None = None,
+    parents: list[ParentArtifact] | None = None,
+) -> ManifestV2:
+    original = load_manifest(path)
+    rebuilt = ManifestV2.build(
+        artifact_type=original.artifact_type,
+        stage=original.stage,
+        files=files if files is not None else original.files,
+        parents=parents if parents is not None else original.parents,
+        config=original.config,
+        global_seed=original.global_seed,
+        seed_derivation_version=original.seed_derivation_version,
+        git_revision=original.git_revision,
+        runtime_versions=original.runtime_versions,
+        stage_metadata=(
+            stage_metadata
+            if stage_metadata is not None
+            else original.stage_metadata
+        ),
+        created_at=original.created_at,
+    )
+    publish_manifest(path, rebuilt)
+    return rebuilt
+
+
+def reparent_teacher_to_validation(config_path: Path, output_dir: Path) -> None:
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    teacher_manifest_path = Path(config["teacher_manifest"])
+    validation_manifest_path = output_dir / "validation_manifest.json"
+    validation_manifest = load_manifest(validation_manifest_path)
+    rebuild_manifest(
+        teacher_manifest_path,
+        parents=[
+            ParentArtifact(
+                validation_manifest.artifact_id,
+                sha256_file(validation_manifest_path),
+            )
+        ],
+    )
 
 
 def write_validation_config(
@@ -182,6 +245,7 @@ def write_teacher_fixture(
     completed: bool = True,
     stage: str = "teacher_accepted_pool",
     parents: list[ParentArtifact] | None = None,
+    stage_metadata: dict | None = None,
 ) -> tuple[Path, Path]:
     teacher_dir = tmp_path / "teacher"
     accepted_path = teacher_dir / "teacher_accepted_20k.jsonl"
@@ -194,7 +258,12 @@ def write_teacher_fixture(
         parents=parents or [],
         config={"seed": 9},
         global_seed=9,
-        stage_metadata={"completed": completed, "counts": {"accepted": len(rows)}},
+        stage_metadata=stage_metadata
+        or {
+            "completed": completed,
+            "accepted_count": len(rows),
+            "target_accepted_count": len(rows),
+        },
         git_revision="fixture",
         created_at="2026-06-15T00:00:00Z",
     )
@@ -328,6 +397,98 @@ def test_validation_manifest_records_parent_files_counts_and_independent_seeds(
         assert item.field_schema == SOURCE_SCHEMA
 
 
+@pytest.mark.parametrize(
+    ("stage_metadata", "match"),
+    [
+        (
+            {
+                "completed": True,
+                "counts": {
+                    "train_input": 12,
+                    "solvable_train": 12,
+                    "unsolved_train": 0,
+                },
+                "limit": 12,
+            },
+            "limit",
+        ),
+        (
+            {
+                "completed": True,
+                "counts": {
+                    "train_input": 12,
+                    "solvable_train": 12,
+                    "unsolved_train": 0,
+                },
+            },
+            "limit",
+        ),
+        ({"completed": True, "limit": None}, "counts"),
+        (
+            {
+                "completed": True,
+                "counts": {
+                    "train_input": 12,
+                    "solvable_train": 12,
+                },
+                "limit": None,
+            },
+            "unsolved_train",
+        ),
+        (
+            {
+                "completed": True,
+                "counts": {
+                    "train_input": True,
+                    "solvable_train": 12,
+                    "unsolved_train": 0,
+                },
+                "limit": None,
+            },
+            "train_input",
+        ),
+        (
+            {
+                "completed": True,
+                "counts": {
+                    "train_input": 13,
+                    "solvable_train": 12,
+                    "unsolved_train": 0,
+                },
+                "limit": None,
+            },
+            "train_input",
+        ),
+        (
+            {
+                "completed": True,
+                "counts": {
+                    "train_input": 12,
+                    "solvable_train": 11,
+                    "unsolved_train": 1,
+                },
+                "limit": None,
+            },
+            "solvable_train",
+        ),
+    ],
+)
+def test_validation_requires_complete_production_source_manifest(
+    tmp_path: Path, stage_metadata: dict, match: str
+):
+    source_path, source_manifest, output_dir = write_source_fixture(
+        tmp_path, stage_metadata=stage_metadata
+    )
+    config_path = write_validation_config(
+        tmp_path, source_path, source_manifest, output_dir
+    )
+
+    with pytest.raises(ValueError, match=match):
+        run_validation_splits(config_path)
+
+    assert not (output_dir / "validation_manifest.json").exists()
+
+
 def test_accepted_samples_independently_with_separate_seeds_and_can_overlap(
     tmp_path: Path,
 ):
@@ -365,6 +526,159 @@ def test_accepted_samples_independently_with_separate_seeds_and_can_overlap(
     assert first_bytes == {
         name: (output_dir / name).read_bytes() for name in first_bytes
     }
+
+
+@pytest.mark.parametrize(
+    ("metadata", "match"),
+    [
+        ({"accepted_count": 12, "target_accepted_count": 12}, "completed"),
+        (
+            {
+                "completed": False,
+                "accepted_count": 12,
+                "target_accepted_count": 12,
+            },
+            "completed",
+        ),
+        (
+            {
+                "completed": 1,
+                "accepted_count": 12,
+                "target_accepted_count": 12,
+            },
+            "completed",
+        ),
+        (
+            {
+                "completed": True,
+                "target_accepted_count": 12,
+            },
+            "accepted_count",
+        ),
+        (
+            {
+                "completed": True,
+                "accepted_count": True,
+                "target_accepted_count": 12,
+            },
+            "accepted_count",
+        ),
+        (
+            {
+                "completed": True,
+                "accepted_count": 11,
+                "target_accepted_count": 11,
+            },
+            "accepted_count",
+        ),
+        (
+            {
+                "completed": True,
+                "accepted_count": 12,
+                "target_accepted_count": True,
+            },
+            "target_accepted_count",
+        ),
+        (
+            {
+                "completed": True,
+                "accepted_count": 12,
+                "target_accepted_count": 13,
+            },
+            "target_accepted_count",
+        ),
+        (
+            {
+                "completed": True,
+                "counts": {"accepted": 12},
+            },
+            "accepted_count",
+        ),
+    ],
+)
+def test_accepted_requires_strict_teacher_completion_contract(
+    tmp_path: Path, metadata: dict, match: str
+):
+    config_path, output_dir, _ = prepare_accepted(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    rebuild_manifest(
+        Path(config["teacher_manifest"]),
+        stage_metadata=metadata,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        run_accepted_splits(config_path)
+
+    assert not (output_dir / "accepted_splits_manifest.json").exists()
+
+
+def test_accepted_allows_completed_pool_above_target_count(tmp_path: Path):
+    config_path, output_dir, teacher_rows = prepare_accepted(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    rebuild_manifest(
+        Path(config["teacher_manifest"]),
+        stage_metadata={
+            "completed": True,
+            "accepted_count": len(teacher_rows),
+            "target_accepted_count": len(teacher_rows) - 1,
+        },
+    )
+
+    manifest = run_accepted_splits(config_path)
+
+    assert manifest.stage_metadata["counts"]["accepted_pool"] == len(teacher_rows)
+    assert (output_dir / "accepted_splits_manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    "mismatch", ["hash", "file_count", "selected_count", "metadata_count"]
+)
+def test_accepted_validates_validation_manifest_against_val_artifact_and_config(
+    tmp_path: Path, mismatch: str
+):
+    config_path, output_dir, _ = prepare_accepted(tmp_path)
+    validation_manifest_path = output_dir / "validation_manifest.json"
+    val_path = output_dir / "val_200.jsonl"
+    validation_manifest = load_manifest(validation_manifest_path)
+
+    if mismatch == "hash":
+        val_path.write_bytes(val_path.read_bytes() + b"\n")
+    elif mismatch == "file_count":
+        files = [
+            ArtifactFile(
+                relative_path=item.relative_path,
+                sha256=item.sha256,
+                byte_size=item.byte_size,
+                row_count=(
+                    item.row_count + 1
+                    if item.relative_path == "val_200.jsonl"
+                    else item.row_count
+                ),
+                field_schema=item.field_schema,
+            )
+            for item in validation_manifest.files
+        ]
+        rebuild_manifest(validation_manifest_path, files=files)
+        reparent_teacher_to_validation(config_path, output_dir)
+    elif mismatch == "selected_count":
+        metadata = dict(validation_manifest.stage_metadata)
+        metadata["selected_ids"] = dict(metadata["selected_ids"])
+        metadata["selected_ids"]["validation"] = metadata["selected_ids"][
+            "validation"
+        ][:-1]
+        rebuild_manifest(validation_manifest_path, stage_metadata=metadata)
+        reparent_teacher_to_validation(config_path, output_dir)
+    else:
+        metadata = dict(validation_manifest.stage_metadata)
+        metadata["counts"] = dict(metadata["counts"])
+        metadata["counts"]["validation"] += 1
+        rebuild_manifest(validation_manifest_path, stage_metadata=metadata)
+        reparent_teacher_to_validation(config_path, output_dir)
+
+    with pytest.raises(ValueError, match="validation|val_200|count|hash"):
+        run_accepted_splits(config_path)
+
+    assert not (output_dir / "accepted_splits_manifest.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -617,6 +931,96 @@ def test_old_manifest_is_revoked_before_any_output_publish_failure(
         runner(config_path)
 
     assert not (output_dir / manifest_name).exists()
+
+
+@pytest.mark.parametrize(
+    ("mode", "manifest_name", "output_count"),
+    [
+        ("validation", "validation_manifest.json", 3),
+        ("accepted", "accepted_splits_manifest.json", 2),
+    ],
+)
+def test_manifest_change_after_data_publish_fails_second_unchanged_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    manifest_name: str,
+    output_count: int,
+):
+    if mode == "validation":
+        source_path, source_manifest, output_dir = write_source_fixture(tmp_path)
+        config_path = write_validation_config(
+            tmp_path, source_path, source_manifest, output_dir
+        )
+        changed_manifest = source_manifest
+        runner = run_validation_splits
+    else:
+        config_path, output_dir, _ = prepare_accepted(tmp_path)
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        changed_manifest = Path(config["teacher_manifest"])
+        runner = run_accepted_splits
+    runner(config_path)
+
+    real_publish = splits_module.publish_jsonl
+    calls = 0
+
+    def mutate_after_last_data_publish(path, rows):
+        nonlocal calls
+        calls += 1
+        real_publish(path, rows)
+        if calls == output_count:
+            changed_manifest.write_bytes(changed_manifest.read_bytes() + b"\n")
+
+    monkeypatch.setattr(splits_module, "publish_jsonl", mutate_after_last_data_publish)
+
+    with pytest.raises(ValueError, match="changed during"):
+        runner(config_path)
+
+    assert not (output_dir / manifest_name).exists()
+
+
+@pytest.mark.parametrize("mode", ["validation", "accepted"])
+def test_parent_uses_initial_manifest_snapshot_digest_after_late_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+):
+    if mode == "validation":
+        source_path, input_manifest, output_dir = write_source_fixture(tmp_path)
+        config_path = write_validation_config(
+            tmp_path, source_path, input_manifest, output_dir
+        )
+        runner = run_validation_splits
+    else:
+        config_path, output_dir, _ = prepare_accepted(tmp_path)
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        input_manifest = Path(config["teacher_manifest"])
+        runner = run_accepted_splits
+    expected_manifest = load_manifest(input_manifest)
+    expected_digest = sha256_file(input_manifest)
+    real_artifact_file = splits_module._artifact_file
+    mutated = False
+
+    def mutate_during_output_metadata(*args, **kwargs):
+        nonlocal mutated
+        result = real_artifact_file(*args, **kwargs)
+        if not mutated:
+            input_manifest.write_bytes(input_manifest.read_bytes() + b"\n")
+            mutated = True
+        return result
+
+    def inspect_then_abort(path, manifest):
+        parent = next(
+            item
+            for item in manifest.parents
+            if item.artifact_id == expected_manifest.artifact_id
+        )
+        assert parent.sha256 == expected_digest
+        raise OSError("stop after parent inspection")
+
+    monkeypatch.setattr(splits_module, "_artifact_file", mutate_during_output_metadata)
+    monkeypatch.setattr(splits_module, "publish_manifest", inspect_then_abort)
+
+    with pytest.raises(OSError, match="parent inspection"):
+        runner(config_path)
 
 
 def test_accepted_manifest_records_teacher_and_validation_parents(tmp_path: Path):

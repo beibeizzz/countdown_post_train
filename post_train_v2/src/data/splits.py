@@ -201,6 +201,62 @@ def _require_completed(manifest: ManifestV2, label: str) -> None:
         raise ValueError(f"{label} manifest must have completed=true")
 
 
+def _metadata_count(metadata: Mapping[str, Any], key: str, label: str) -> int:
+    if key not in metadata:
+        raise ValueError(f"{label} metadata missing {key}")
+    value = metadata[key]
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{label} metadata {key} must be an exact integer")
+    return value
+
+
+def _require_complete_source_manifest(
+    manifest: ManifestV2,
+    source_file: ArtifactFile,
+) -> None:
+    metadata = manifest.stage_metadata
+    if "limit" not in metadata or metadata["limit"] is not None:
+        raise ValueError("source manifest limit must be None")
+    counts = metadata.get("counts")
+    if not isinstance(counts, Mapping):
+        raise ValueError("source manifest counts must be an object")
+    train_input = _metadata_count(counts, "train_input", "source counts")
+    solvable = _metadata_count(counts, "solvable_train", "source counts")
+    unsolved = _metadata_count(counts, "unsolved_train", "source counts")
+    if train_input != solvable + unsolved:
+        raise ValueError(
+            "source counts train_input must equal "
+            "solvable_train + unsolved_train"
+        )
+    if source_file.row_count != solvable:
+        raise ValueError(
+            "source file row_count must equal source counts solvable_train"
+        )
+
+
+def _teacher_completion_counts(
+    manifest: ManifestV2,
+    teacher_file: ArtifactFile,
+) -> tuple[int, int]:
+    metadata = manifest.stage_metadata
+    _require_completed(manifest, "teacher")
+    accepted_count = _metadata_count(
+        metadata, "accepted_count", "teacher"
+    )
+    target_count = _metadata_count(
+        metadata, "target_accepted_count", "teacher"
+    )
+    if accepted_count != teacher_file.row_count:
+        raise ValueError(
+            "teacher accepted_count must equal teacher file row_count"
+        )
+    if accepted_count < target_count:
+        raise ValueError(
+            "teacher completed target_accepted_count exceeds accepted_count"
+        )
+    return accepted_count, target_count
+
+
 def _require_unique_ids(rows: list[dict[str, Any]], label: str) -> None:
     seen: set[str] = set()
     for row in rows:
@@ -285,10 +341,10 @@ def _require_unchanged(snapshot: dict[Path, str], label: str) -> None:
             raise ValueError(f"{label} input changed during split build: {path}")
 
 
-def _parent(manifest: ManifestV2, manifest_path: Path) -> ParentArtifact:
+def _parent(manifest: ManifestV2, digest: str) -> ParentArtifact:
     return ParentArtifact(
         artifact_id=manifest.artifact_id,
-        sha256=sha256_file(manifest_path),
+        sha256=digest,
     )
 
 
@@ -310,6 +366,7 @@ def run_validation_splits(config_path: str | Path) -> ManifestV2:
         source_path,
         expected_schema=SOURCE_FIELD_SCHEMA,
     )
+    _require_complete_source_manifest(source_manifest, source_file)
     rows = read_jsonl_strict(source_path, validate_normalized_source)
     _require_unique_ids(rows, "source")
     _require_row_count(source_file, rows)
@@ -332,6 +389,7 @@ def run_validation_splits(config_path: str | Path) -> ManifestV2:
     publish_jsonl(output_dir / "val_200.jsonl", val_rows)
     publish_jsonl(output_dir / "eval_50.jsonl", eval_rows)
     publish_jsonl(output_dir / "train_candidates.jsonl", train_rows)
+    _require_unchanged(snapshots, "validation")
 
     manifest = ManifestV2.build(
         artifact_type="dataset",
@@ -350,7 +408,7 @@ def run_validation_splits(config_path: str | Path) -> ManifestV2:
                 SOURCE_FIELD_SCHEMA,
             ),
         ],
-        parents=[_parent(source_manifest, source_manifest_path)],
+        parents=[_parent(source_manifest, snapshots[source_manifest_path])],
         config=logical_config,
         global_seed=config["seed"],
         seed_derivation_version=SEED_DERIVATION_VERSION,
@@ -382,7 +440,12 @@ def run_validation_splits(config_path: str | Path) -> ManifestV2:
     return manifest
 
 
-def _validation_ids(manifest: ManifestV2) -> set[str]:
+def _validation_ids(
+    manifest: ManifestV2,
+    validation_file: ArtifactFile,
+    validation_rows: list[dict[str, Any]],
+    configured_size: int,
+) -> set[str]:
     if manifest.stage != "build_validation_splits":
         raise ValueError(
             "validation manifest stage must be build_validation_splits"
@@ -400,6 +463,33 @@ def _validation_ids(manifest: ManifestV2) -> set[str]:
         )
     if len(values) != len(set(values)):
         raise ValueError("validation manifest contains duplicate validation ids")
+    counts = manifest.stage_metadata.get("counts")
+    if not isinstance(counts, Mapping):
+        raise ValueError("validation manifest counts must be an object")
+    validation_count = _metadata_count(
+        counts, "validation", "validation counts"
+    )
+    if validation_count != configured_size:
+        raise ValueError(
+            "validation counts.validation must equal configured val_size"
+        )
+    if len(values) != validation_count:
+        raise ValueError(
+            "validation selected_ids count must equal counts.validation"
+        )
+    if validation_file.row_count != validation_count:
+        raise ValueError(
+            "val_200 file row_count must equal counts.validation"
+        )
+    if len(validation_rows) != validation_count:
+        raise ValueError(
+            "val_200 actual row count must equal counts.validation"
+        )
+    row_ids = {row["id"] for row in validation_rows}
+    if set(values) != row_ids:
+        raise ValueError(
+            "validation selected_ids must match val_200 row ids"
+        )
     return set(values)
 
 
@@ -411,8 +501,14 @@ def run_accepted_splits(config_path: str | Path) -> ManifestV2:
     teacher_manifest_path = config["teacher_manifest"]
     output_dir = config["output_dir"]
     validation_manifest_path = output_dir / "validation_manifest.json"
+    validation_path = output_dir / "val_200.jsonl"
     snapshots = _snapshot(
-        [accepted_path, teacher_manifest_path, validation_manifest_path]
+        [
+            accepted_path,
+            teacher_manifest_path,
+            validation_manifest_path,
+            validation_path,
+        ]
     )
 
     teacher_manifest = load_manifest(teacher_manifest_path)
@@ -424,15 +520,37 @@ def run_accepted_splits(config_path: str | Path) -> ManifestV2:
         accepted_path,
         expected_schema=SFT_FIELD_SCHEMA,
     )
+    accepted_count, _ = _teacher_completion_counts(
+        teacher_manifest, teacher_file
+    )
     validation_manifest = load_manifest(validation_manifest_path)
-    val_ids = _validation_ids(validation_manifest)
+    validation_file = _manifest_file(
+        validation_manifest,
+        validation_path,
+        expected_schema=SOURCE_FIELD_SCHEMA,
+    )
+    validation_rows = read_jsonl_strict(
+        validation_path, validate_normalized_source
+    )
+    _require_unique_ids(validation_rows, "validation")
+    _require_row_count(validation_file, validation_rows)
+    val_ids = _validation_ids(
+        validation_manifest,
+        validation_file,
+        validation_rows,
+        config["val_size"],
+    )
     teacher_manifest.require_parent(
         validation_manifest.artifact_id,
-        sha256_file(validation_manifest_path),
+        snapshots[validation_manifest_path],
     )
     rows = read_jsonl_strict(accepted_path, validate_sft_record)
     _require_unique_ids(rows, "accepted")
     _require_row_count(teacher_file, rows)
+    if len(rows) != accepted_count:
+        raise ValueError(
+            "teacher accepted_count must equal actual accepted rows"
+        )
     overlap = sorted(row["id"] for row in rows if row["id"] in val_ids)
     if overlap:
         raise ValueError(f"accepted pool contains validation id: {overlap[0]}")
@@ -459,6 +577,7 @@ def run_accepted_splits(config_path: str | Path) -> ManifestV2:
     _revoke_manifest(manifest_path)
     publish_jsonl(output_dir / "sft_train_8k.jsonl", sft_rows)
     publish_jsonl(output_dir / "grpo_train_4k.jsonl", grpo_rows)
+    _require_unchanged(snapshots, "accepted")
 
     created_at = max(teacher_manifest.created_at, validation_manifest.created_at)
     manifest = ManifestV2.build(
@@ -476,8 +595,11 @@ def run_accepted_splits(config_path: str | Path) -> ManifestV2:
             ),
         ],
         parents=[
-            _parent(teacher_manifest, teacher_manifest_path),
-            _parent(validation_manifest, validation_manifest_path),
+            _parent(teacher_manifest, snapshots[teacher_manifest_path]),
+            _parent(
+                validation_manifest,
+                snapshots[validation_manifest_path],
+            ),
         ],
         config=logical_config,
         global_seed=config["seed"],
