@@ -10,11 +10,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
+from post_train_v2.src.generation.vllm_client import (
+    GenerationConfig,
+    GenerationRequest,
+    VLLMGenerator,
+)
+
 
 @dataclass(frozen=True)
 class PositionedPrompt:
     position: int
     prompt: str
+    seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -228,8 +235,6 @@ def _validate_worker_ready(message: WorkerReady, spec: WorkerSpec) -> None:
 
 
 def _default_generator_factory(**kwargs):
-    from post_train.src.countdown.generation import VLLMGenerator
-
     return VLLMGenerator(**kwargs)
 
 
@@ -252,8 +257,6 @@ def worker_main(
         os.environ["CUDA_VISIBLE_DEVICES"] = str(spec.device)
         os.environ["VLLM_CACHE_ROOT"] = spec.cache_root
         Path(spec.cache_root).mkdir(parents=True, exist_ok=True)
-
-        from post_train.src.countdown.generation import GenerationConfig
 
         factory = generator_factory or _default_generator_factory
         generator = factory(
@@ -293,9 +296,15 @@ def worker_main(
                 batch_id = None
                 continue
 
-            prompt_texts = [item.prompt for item in message.items]
+            generation_requests = [
+                GenerationRequest(prompt=item.prompt, seed=item.seed)
+                for item in message.items
+            ]
             generate_started_at = time.monotonic()
-            responses = generator.generate(prompt_texts, generation_config)
+            responses = generator.generate(
+                generation_requests,
+                generation_config,
+            )
             latency_seconds = time.monotonic() - generate_started_at
             if len(responses) != len(message.items):
                 raise ValueError(

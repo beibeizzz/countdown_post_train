@@ -1,5 +1,5 @@
 model_path: post_train/model/qwen/qwen3-8b
-input_path: post_train/data/processed/train_pool.jsonl
+input_path: post_train_v2/data/fixtures/teacher_smoke_candidates.jsonl
 output_dir: /tmp/post_train_v2_teacher_smoke
 devices: [0, 1]
 topology: dual_tp1
@@ -14,4 +14,4 @@ seed: 0
 enable_thinking: false
 stop_after_accepted: 8
 cache_root: /tmp/countdown_teacher_vllm_smoke
-schema_version: 1
+schema_version: 2
