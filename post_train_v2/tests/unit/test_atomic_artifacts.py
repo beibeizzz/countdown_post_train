@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -56,6 +58,68 @@ def test_atomic_publication_removes_temp_file_when_replace_fails(
     assert not list(tmp_path.glob("*.tmp"))
 
 
+def test_atomic_publication_flushes_and_replaces_from_destination_directory(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "nested" / "artifact.json"
+    events = []
+    original_named_temporary_file = tempfile.NamedTemporaryFile
+    original_fsync = os.fsync
+    original_replace = os.replace
+
+    class FlushedTemporaryFile:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            self.handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+        def flush(self):
+            events.append(("flush", Path(self.handle.name)))
+            return self.handle.flush()
+
+    def named_temporary_file(*args, **kwargs):
+        events.append(("tempdir", Path(kwargs["dir"])))
+        return FlushedTemporaryFile(
+            original_named_temporary_file(*args, **kwargs)
+        )
+
+    def fsync(file_descriptor):
+        events.append(("fsync", file_descriptor))
+        return original_fsync(file_descriptor)
+
+    def replace(source, destination):
+        events.append(("replace", Path(source), Path(destination)))
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(
+        "post_train_v2.src.artifacts.atomic.tempfile.NamedTemporaryFile",
+        named_temporary_file,
+    )
+    monkeypatch.setattr("post_train_v2.src.artifacts.atomic.os.fsync", fsync)
+    monkeypatch.setattr("post_train_v2.src.artifacts.atomic.os.replace", replace)
+
+    publish_json(path, {"value": 1})
+
+    assert events[0] == ("tempdir", path.parent)
+    assert [event[0] for event in events] == [
+        "tempdir",
+        "flush",
+        "fsync",
+        "replace",
+    ]
+    assert events[1][1].parent == path.parent
+    assert events[3][1].parent == path.parent
+    assert events[3][2] == path
+
+
 def test_hashing_uses_canonical_json_and_file_bytes(tmp_path):
     expected_bytes = b'{"a":1,"z":"\xe9\x9b\xaa"}'
     path = tmp_path / "payload.json"
@@ -69,3 +133,8 @@ def test_hashing_uses_canonical_json_and_file_bytes(tmp_path):
     assert sha256_config({"z": "雪", "a": 1}) == sha256_canonical_json(
         {"a": 1, "z": "雪"}
     )
+
+
+def test_canonical_json_rejects_nan():
+    with pytest.raises(ValueError, match="Out of range float values"):
+        canonical_json_bytes({"value": float("nan")})

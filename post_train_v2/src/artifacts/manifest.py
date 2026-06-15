@@ -96,7 +96,11 @@ def _validate_relative_path(value: Any) -> str:
         raise ValueError("artifact relative path must be a non-empty string")
     posix_path = PurePosixPath(value)
     windows_path = PureWindowsPath(value)
-    if posix_path.is_absolute() or windows_path.is_absolute():
+    if (
+        posix_path.is_absolute()
+        or windows_path.is_absolute()
+        or windows_path.drive
+    ):
         raise ValueError("artifact relative path must not be absolute")
     if ".." in posix_path.parts or ".." in windows_path.parts:
         raise ValueError("artifact relative path must not traverse parents")
@@ -419,7 +423,7 @@ class ManifestV2:
         )
 
     @classmethod
-    def from_dict(cls, value: Any) -> ManifestV2:
+    def parse(cls, value: Any) -> ManifestV2:
         if not isinstance(value, Mapping):
             raise ValueError("manifest must be an object")
         _require_exact_keys(value, MANIFEST_KEYS, "manifest")
@@ -455,6 +459,10 @@ class ManifestV2:
             runtime_versions=dict(value["runtime_versions"]),
             stage_metadata=dict(value["stage_metadata"]),
         )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> ManifestV2:
+        return cls.parse(value)
 
     def identity_dict(self) -> dict[str, Any]:
         return _identity_payload(
@@ -519,4 +527,4 @@ def load_manifest(path: str | Path) -> ManifestV2:
         value = json.loads(Path(path).read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
         raise ValueError(f"manifest contains invalid JSON: {path}") from error
-    return ManifestV2.from_dict(value)
+    return ManifestV2.parse(value)

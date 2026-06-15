@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from post_train_v2.src.artifacts import ManifestV2 as PublicManifestV2
 from post_train_v2.src.artifacts.hashing import sha256_config
 from post_train_v2.src.artifacts.manifest import (
     ArtifactFile,
@@ -115,7 +116,13 @@ def test_manifest_parse_rejects_changed_artifact_identity():
     data["stage_metadata"]["num_source"] = 2
 
     with pytest.raises(ValueError, match="artifact_id"):
-        ManifestV2.from_dict(data)
+        ManifestV2.parse(data)
+
+
+def test_manifest_parse_is_public_and_preserves_contract():
+    manifest = build_manifest()
+
+    assert PublicManifestV2.parse(manifest.to_dict()) == manifest
 
 
 def test_require_parent_rejects_missing_parent():
@@ -185,6 +192,7 @@ def test_parent_artifact_rejects_invalid_sha256(sha256):
     (
         "/absolute/source.jsonl",
         "C:\\absolute\\source.jsonl",
+        "C:relative.jsonl",
         "../source.jsonl",
         "nested/../../source.jsonl",
         "",
