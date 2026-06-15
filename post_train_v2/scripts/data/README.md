@@ -48,3 +48,37 @@ an old manifest or writing any output. A changed train or test input aborts
 the run while preserving the previous manifest and data files. Parent
 artifacts use the fixed initial hashes rather than rereading inputs during
 manifest construction.
+
+## Deterministic Splits
+
+Freeze validation before Teacher generation:
+
+```text
+python post_train_v2/scripts/data/build_splits.py --config post_train_v2/configs/data/build_splits.yaml validation
+```
+
+This validates the complete canonical source artifact and its `build_source`
+Manifest V2, then writes `val_200.jsonl`, `eval_50.jsonl`, and
+`train_candidates.jsonl`. Validation is sampled first, evaluation is sampled
+from validation with a separate SHA-256-derived seed, and all published rows
+are restored to source order. Sampling-order IDs and source-order IDs are
+recorded in `validation_manifest.json`.
+
+After Task9 has produced a complete `teacher_accepted_pool` Manifest V2 whose
+parent is that validation artifact, build the training splits:
+
+```text
+python post_train_v2/scripts/data/build_splits.py --config post_train_v2/configs/data/build_splits.yaml accepted
+```
+
+The accepted mode rejects partial Teacher artifacts, manifest file
+hash/count/schema mismatches, validation-ID leakage, and Teacher parent
+mismatches. It validates every canonical SFT row and independently samples
+`sft_train_8k.jsonl` and `grpo_train_4k.jsonl` with separate derived seeds;
+the two samples may overlap. Completion is published last in
+`accepted_splits_manifest.json`.
+
+Both modes hash every data and manifest input before reading and verify those
+hashes again before revoking an old completion manifest or publishing data.
+If publication fails after revocation, partial files are non-consumable
+because the completion manifest remains absent.
