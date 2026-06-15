@@ -21,6 +21,7 @@ from post_train_v2.src.countdown.bucketing import assign_bucket
 from post_train_v2.src.countdown.prompts import build_solution_prompt
 from post_train_v2.src.countdown.solver import solve_countdown
 from post_train_v2.src.data.schema import validate_normalized_source
+from post_train_v2.src.data import source as source_module
 from post_train_v2.src.data.source import (
     build_test_source,
     build_train_source,
@@ -130,6 +131,47 @@ def test_build_train_and_test_source_preserve_ids_indexes_prompts_solver_and_buc
         )
         assert row["bucket"] == assign_bucket(row["numbers"], row["gold_expr"])
         assert validate_normalized_source(row) == row
+
+
+@pytest.mark.parametrize("column", ["nums", "numbers"])
+@pytest.mark.parametrize(
+    "numbers",
+    [
+        [1, 2],
+        (1, 2),
+        np.array([1, 2]),
+        "[1, 2]",
+    ],
+)
+def test_train_source_keeps_approved_column_and_numbers_container_compatibility(
+    column: str,
+    numbers,
+):
+    solvable, unsolved = build_train_source(
+        pd.DataFrame([{column: numbers, "target": 3}])
+    )
+
+    assert unsolved == []
+    assert solvable[0]["numbers"] == [1, 2]
+
+
+@pytest.mark.parametrize("column", ["nums", "numbers"])
+@pytest.mark.parametrize(
+    "numbers",
+    [
+        [1, 2],
+        (1, 2),
+        np.array([1, 2]),
+        "[1, 2]",
+    ],
+)
+def test_test_source_keeps_approved_column_and_numbers_container_compatibility(
+    column: str,
+    numbers,
+):
+    solved = build_test_source([{"id": 7, column: numbers, "target": 3}])
+
+    assert solved[0]["numbers"] == [1, 2]
 
 
 def test_build_train_source_keeps_unsolved_rows_with_exact_contract():
@@ -278,6 +320,69 @@ def test_unsolved_test_fails_without_publishing_or_overwriting_manifest(
     assert all(not (output_dir / name).exists() for name in DATA_FILENAMES)
 
 
+@pytest.mark.parametrize("failed_publish", [1, 2, 3, 4])
+def test_rebuild_revokes_old_manifest_before_each_possible_data_publish_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_publish: int,
+):
+    config_path, _, _, output_dir = write_fixture(tmp_path)
+    old_manifest = run_build_source(config_path, limit=None)
+    old_data = {
+        name: (output_dir / name).read_bytes() for name in DATA_FILENAMES
+    }
+    calls = 0
+    real_publish_jsonl = source_module.publish_jsonl
+
+    def failing_publish(path, rows):
+        nonlocal calls
+        calls += 1
+        if calls == failed_publish:
+            raise OSError(f"publish {failed_publish} failed")
+        real_publish_jsonl(path, rows)
+
+    monkeypatch.setattr(source_module, "publish_jsonl", failing_publish)
+
+    with pytest.raises(OSError, match=f"publish {failed_publish} failed"):
+        run_build_source(config_path, limit=None)
+
+    assert calls == failed_publish
+    assert not (output_dir / "manifest.json").exists()
+    for name in DATA_FILENAMES[: failed_publish - 1]:
+        assert (output_dir / name).read_bytes() == old_data[name]
+    assert old_manifest.artifact_id
+
+
+@pytest.mark.parametrize("failed_publish", [1, 2, 3, 4])
+def test_first_build_data_publish_failure_never_creates_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_publish: int,
+):
+    config_path, _, _, output_dir = write_fixture(tmp_path)
+    calls = 0
+    real_publish_jsonl = source_module.publish_jsonl
+
+    def failing_publish(path, rows):
+        nonlocal calls
+        calls += 1
+        if calls == failed_publish:
+            raise OSError(f"publish {failed_publish} failed")
+        real_publish_jsonl(path, rows)
+
+    monkeypatch.setattr(source_module, "publish_jsonl", failing_publish)
+
+    with pytest.raises(OSError, match=f"publish {failed_publish} failed"):
+        run_build_source(config_path, limit=None)
+
+    assert calls == failed_publish
+    assert not (output_dir / "manifest.json").exists()
+    assert all(
+        (output_dir / name).exists()
+        for name in DATA_FILENAMES[: failed_publish - 1]
+    )
+
+
 def test_run_build_source_manifest_has_exact_files_parents_config_and_metadata(
     tmp_path: Path,
 ):
@@ -293,21 +398,15 @@ def test_run_build_source_manifest_has_exact_files_parents_config_and_metadata(
     assert manifest.config == config_snapshot
     assert manifest.config_sha256 == sha256_config(config_snapshot)
     assert manifest.global_seed == 42
-    expected_parent_hashes = {
-        str(train_path.resolve()): sha256_file(train_path),
-        str(test_path.resolve()): sha256_file(test_path),
-    }
+    expected_parent_hashes = [
+        ("raw_train", sha256_file(train_path)),
+        ("raw_test", sha256_file(test_path)),
+    ]
     assert {
         parent.artifact_id: parent.sha256 for parent in manifest.parents
     } == {
-        sha256_canonical_json(
-            {"kind": kind, "path": path, "sha256": sha256}
-        ): sha256
-        for kind, (path, sha256) in zip(
-            ("raw_train", "raw_test"),
-            expected_parent_hashes.items(),
-            strict=True,
-        )
+        sha256_canonical_json({"kind": kind, "sha256": sha256}): sha256
+        for kind, sha256 in expected_parent_hashes
     }
     assert [item.relative_path for item in manifest.files] == list(DATA_FILENAMES)
     expected_rows = {
@@ -335,11 +434,74 @@ def test_run_build_source_manifest_has_exact_files_parents_config_and_metadata(
             "test_solved": 2,
         },
         "limit": None,
-        "resolved_inputs": {
-            "train": str(train_path.resolve()),
-            "test": str(test_path.resolve()),
+        "inputs": {
+            "train": "../inputs/train.parquet",
+            "test": "../inputs/test.json",
         },
-        "resolved_output": str(output_dir.resolve()),
+        "output": "../outputs",
+    }
+    metadata_text = json.dumps(manifest.stage_metadata, sort_keys=True)
+    assert str(tmp_path.resolve()) not in metadata_text
+    assert str(REPO_ROOT.resolve()) not in metadata_text
+
+
+def test_manifest_identity_is_stable_across_absolute_io_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    logical_config = {
+        "seed": 42,
+        "train_input": "logical/raw_train.parquet",
+        "test_input": "logical/raw_test.json",
+        "output_dir": "logical/processed",
+    }
+    config_path = tmp_path / "build_source.yaml"
+    config_path.write_text(
+        yaml.safe_dump(logical_config, sort_keys=False),
+        encoding="utf-8",
+    )
+    roots = [tmp_path / "checkout-a", tmp_path / "checkout-b"]
+    manifests = []
+    for root in roots:
+        train_path = root / logical_config["train_input"]
+        test_path = root / logical_config["test_input"]
+        train_path.parent.mkdir(parents=True)
+        pd.DataFrame([{"nums": [1, 2], "target": 3}]).to_parquet(
+            train_path,
+            index=False,
+        )
+        test_path.write_text(
+            json.dumps([{"id": 7, "numbers": [1, 2], "target": 3}]),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(
+            source_module,
+            "resolve_repo_path",
+            lambda value, root=root: (
+                Path(value).resolve()
+                if Path(value).is_absolute()
+                else (root / value).resolve()
+            ),
+        )
+        manifests.append(run_build_source(config_path, limit=None))
+
+    assert manifests[0].artifact_id == manifests[1].artifact_id
+    assert manifests[0].parents == manifests[1].parents
+    assert manifests[0].stage_metadata == manifests[1].stage_metadata == {
+        "completed": True,
+        "counts": {
+            "train_input": 1,
+            "solvable_train": 1,
+            "unsolved_train": 0,
+            "test_solved": 1,
+        },
+        "limit": None,
+        "inputs": {
+            "train": "logical/raw_train.parquet",
+            "test": "logical/raw_test.json",
+        },
+        "output": "logical/processed",
     }
 
 

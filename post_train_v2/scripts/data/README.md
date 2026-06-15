@@ -18,8 +18,25 @@ explicit semantic name used by downstream V2 stages. They are independently
 published and independently recorded in the manifest with their actual hash,
 byte size, row count, and schema.
 
+The raw compatibility layer accepts either `nums` or `numbers`. Number
+collections may be lists, tuples, NumPy arrays, or JSON list strings, but
+every member must be an exact nonnegative integer. Booleans, floats, and
+numeric strings are rejected rather than coerced.
+
 Unsolvable train rows are retained in `unsolved_train.jsonl` with
 `reason: "no_solution"`. Every test row must be solvable; an unsolvable test
 row fails the build before any new data files or completion manifest are
-published. The four JSONL files use atomic replacement, and `manifest.json` is
-published last as the completion marker.
+published.
+
+Before replacing any JSONL file, a rebuild removes and directory-syncs the
+old `manifest.json` completion marker. If any JSONL publish fails, completed
+files may remain, but the missing manifest makes that partial output
+non-consumable. The four JSONL files use atomic replacement, and a new
+`manifest.json` is published last as the completion marker.
+
+Configured paths are resolved to absolute paths only for local I/O. The full
+configuration snapshot is preserved, while manifest identity metadata uses
+the configured logical relative paths. Absolute fixture paths are normalized
+relative to the config directory. Raw parent IDs depend only on input kind
+and content SHA-256, so production relative configurations remain stable
+across checkout locations.

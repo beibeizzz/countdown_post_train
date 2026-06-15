@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -44,6 +46,8 @@ UNSOLVED_SOURCE_FIELD_SCHEMA = {
     "target": "integer",
     "reason": "string",
 }
+
+
 def _exact_nonnegative_int(value: Any, name: str, *, positive: bool = False) -> int:
     if type(value) is int:
         normalized = value
@@ -232,13 +236,59 @@ def _artifact_file(
 
 def _raw_parent(kind: str, path: Path) -> ParentArtifact:
     digest = sha256_file(path)
-    resolved = str(path.resolve())
     return ParentArtifact(
         artifact_id=sha256_canonical_json(
-            {"kind": kind, "path": resolved, "sha256": digest}
+            {"kind": kind, "sha256": digest}
         ),
         sha256=digest,
     )
+
+
+def _logical_manifest_path(value: Any, config_dir: Path, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} must be a nonempty path string")
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        return candidate.as_posix()
+    try:
+        return Path(os.path.relpath(candidate, start=config_dir)).as_posix()
+    except ValueError as error:
+        raise ValueError(
+            f"{field} absolute path must share a filesystem root with config"
+        ) from error
+
+
+def _fsync_directory(directory: Path) -> None:
+    if os.name == "nt":
+        return
+    unsupported = {
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    }
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(directory, flags)
+    except OSError as error:
+        if error.errno in unsupported:
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            if error.errno not in unsupported:
+                raise
+    finally:
+        os.close(descriptor)
+
+
+def _revoke_completion_manifest(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_directory(path.parent)
 
 
 def run_build_source(
@@ -248,7 +298,8 @@ def run_build_source(
     """Build and publish normalized source files, with manifest published last."""
 
     limit = _validate_limit(limit)
-    config = load_yaml(config_path)
+    resolved_config_path = resolve_repo_path(config_path)
+    config = load_yaml(resolved_config_path)
     require_keys(config, "seed", "train_input", "test_input", "output_dir")
     if set(config) != {"seed", "train_input", "test_input", "output_dir"}:
         raise ValueError("build_source config has unexpected keys")
@@ -256,6 +307,21 @@ def run_build_source(
     train_input = resolve_repo_path(config["train_input"])
     test_input = resolve_repo_path(config["test_input"])
     output_dir = resolve_repo_path(config["output_dir"])
+    logical_train_input = _logical_manifest_path(
+        config["train_input"],
+        resolved_config_path.parent,
+        "train_input",
+    )
+    logical_test_input = _logical_manifest_path(
+        config["test_input"],
+        resolved_config_path.parent,
+        "test_input",
+    )
+    logical_output = _logical_manifest_path(
+        config["output_dir"],
+        resolved_config_path.parent,
+        "output_dir",
+    )
 
     train_frame = pd.read_parquet(train_input)
     if limit is not None:
@@ -264,6 +330,7 @@ def run_build_source(
     test_solved = build_test_source(_load_test_rows(test_input))
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    _revoke_completion_manifest(output_dir / "manifest.json")
     publish_jsonl(output_dir / "source_all.jsonl", solvable_train)
     publish_jsonl(output_dir / "solvable_train.jsonl", solvable_train)
     publish_jsonl(output_dir / "unsolved_train.jsonl", unsolved_train)
@@ -314,11 +381,11 @@ def run_build_source(
                 "test_solved": len(test_solved),
             },
             "limit": limit,
-            "resolved_inputs": {
-                "train": str(train_input),
-                "test": str(test_input),
+            "inputs": {
+                "train": logical_train_input,
+                "test": logical_test_input,
             },
-            "resolved_output": str(output_dir),
+            "output": logical_output,
         },
     )
     publish_manifest(output_dir / "manifest.json", manifest)
