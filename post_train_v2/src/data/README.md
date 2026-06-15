@@ -45,7 +45,11 @@ exactly `ok`, `value`, `used_numbers`, `expression`, and `error`.
 `24/1` or `-3/7`. The allowed error vocabulary is
 `missing_answer_tag`, `invalid_expression`, `number_mismatch`, and
 `wrong_value`. Success and failure fields must agree with each other and
-with the source numbers and target.
+with the source numbers and target. When `expression` is present, the
+validator reruns the V2 exact Countdown validator and requires the declared
+`ok`, `value`, `used_numbers`, and `error` fields to match its result
+exactly. A missing answer uses `expression: null`, null value, an empty
+used-number list, and `missing_answer_tag`.
 
 `provenance` is a recursively validated JSON mapping. It may contain null,
 booleans, exact integers, finite floats, strings, lists, and string-keyed
@@ -75,13 +79,16 @@ data_source, prompt, ability, reward_model, extra_info
 `prompt` is a nonempty list of exact `{role, content}` chat-message
 mappings. `reward_model` is exactly `{style, ground_truth}`, and
 `ground_truth` is exactly `{numbers, target}` with the same Countdown
-integer constraints as normalized source data. `extra_info` is restricted
-to recursively Arrow-friendly values. Lists may contain nulls, mergeable
-integer/float values, one primitive type, recursively compatible lists, or
-mappings with the same keys and recursively compatible field types. Mixed
-lists such as `[1, "x"]`, incompatible mapping schemas, bytes, tuples,
-Fraction objects, NaN, and infinities are rejected. This Arrow restriction
-does not apply to ordinary SFT/RFT/DPO provenance, which remains JSON-only.
+integer constraints plus the Arrow signed-int64 range. This range constraint
+is local to verl artifacts and does not narrow normalized source integers.
+`extra_info` is restricted to recursively Arrow-friendly values. Lists may
+contain nulls, mergeable integer/float values, one primitive type,
+recursively compatible lists, or mappings whose keys are unioned into a
+nullable Arrow struct. Types of shared mapping fields must remain
+compatible. Mixed lists such as `[1, "x"]`, incompatible shared fields,
+bytes, tuples, Fraction objects, NaN, and infinities are rejected. This
+Arrow restriction does not apply to ordinary SFT/RFT/DPO provenance, which
+remains JSON-only.
 
 ## Artifact Boundary
 

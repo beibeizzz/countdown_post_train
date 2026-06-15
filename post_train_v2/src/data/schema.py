@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import math
 import re
-from collections import Counter
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from fractions import Fraction
 from math import gcd
 from typing import Any
 
 from post_train_v2.src.countdown.bucketing import assign_bucket
-from post_train_v2.src.countdown.validation import validate_countdown_expression
+from post_train_v2.src.countdown.validation import (
+    serialize_fraction,
+    validate_countdown_expression,
+)
 
 
 NORMALIZED_SOURCE_KEYS = {
@@ -285,34 +286,40 @@ def _validate_validation(
                 "validation.error must be null or a canonical validation error"
             )
 
-    fraction = Fraction(fraction_text) if fraction_text is not None else None
-    source_numbers_match = Counter(used_numbers) == Counter(numbers)
-    if ok:
-        if error is not None or fraction is None or not expression:
-            raise ValueError(
-                "validation success requires value, expression, and null error"
-            )
-        if not source_numbers_match or fraction != target:
-            raise ValueError("validation success does not match source record")
-    elif error is None:
-        raise ValueError("validation failure requires a non-null error")
-    elif error == "missing_answer_tag":
-        if fraction is not None or used_numbers or expression is not None:
+    if expression is None:
+        expected_missing = {
+            "ok": False,
+            "value": None,
+            "used_numbers": [],
+            "error": "missing_answer_tag",
+        }
+        declared_missing = {
+            "ok": ok,
+            "value": fraction_text,
+            "used_numbers": used_numbers,
+            "error": error,
+        }
+        if declared_missing != expected_missing:
             raise ValueError("validation missing_answer_tag fields are incoherent")
-    elif error == "invalid_expression":
-        if fraction is not None or used_numbers or expression is None:
-            raise ValueError("validation invalid_expression fields are incoherent")
-    elif error == "number_mismatch":
-        if fraction is None or not expression or source_numbers_match:
-            raise ValueError("validation number_mismatch fields are incoherent")
-    elif error == "wrong_value":
-        if (
-            fraction is None
-            or not expression
-            or not source_numbers_match
-            or fraction == target
-        ):
-            raise ValueError("validation wrong_value fields are incoherent")
+    else:
+        actual = validate_countdown_expression(expression, numbers, target)
+        expected_fields = {
+            "ok": actual.ok,
+            "value": serialize_fraction(actual.value),
+            "used_numbers": actual.used_numbers,
+            "error": actual.error,
+        }
+        declared_fields = {
+            "ok": ok,
+            "value": fraction_text,
+            "used_numbers": used_numbers,
+            "error": error,
+        }
+        for field, expected in expected_fields.items():
+            if declared_fields[field] != expected:
+                raise ValueError(
+                    f"validation.{field} does not match actual expression result"
+                )
 
     return {
         "ok": ok,
@@ -353,10 +360,10 @@ def _validate_reward_model(value: Any) -> dict[str, Any]:
     _require_exact_keys(
         "reward_model.ground_truth", ground_truth, GROUND_TRUTH_KEYS
     )
-    numbers = _require_numbers(
+    numbers = _require_arrow_numbers(
         "reward_model.ground_truth.numbers", ground_truth["numbers"]
     )
-    target = _require_nonnegative_int(
+    target = _require_arrow_nonnegative_int(
         "reward_model.ground_truth.target", ground_truth["target"]
     )
     return {
@@ -437,8 +444,7 @@ def _merge_arrow_types(
     if left[0] == right[0] == "mapping":
         left_fields = dict(left[1])
         right_fields = dict(right[1])
-        if left_fields.keys() != right_fields.keys():
-            raise ValueError(f"{path} list mappings must share one Arrow schema")
+        field_names = sorted(left_fields.keys() | right_fields.keys())
         return (
             "mapping",
             tuple(
@@ -446,11 +452,11 @@ def _merge_arrow_types(
                     key,
                     _merge_arrow_types(
                         f"{path}.{key}",
-                        left_fields[key],
-                        right_fields[key],
+                        left_fields.get(key, ("null",)),
+                        right_fields.get(key, ("null",)),
                     ),
                 )
-                for key in sorted(left_fields)
+                for key in field_names
             ),
         )
     raise ValueError(f"{path} list elements do not share an Arrow type")
@@ -557,4 +563,19 @@ def _require_numbers(name: str, value: Any) -> list[int]:
     result = _require_exact_int_list(name, value, nonnegative=True)
     if not result:
         raise ValueError(f"{name} must be a nonempty list")
+    return result
+
+
+def _require_arrow_nonnegative_int(name: str, value: Any) -> int:
+    result = _require_nonnegative_int(name, value)
+    if result >= 2**63:
+        raise ValueError(f"{name} must fit Arrow signed int64")
+    return result
+
+
+def _require_arrow_numbers(name: str, value: Any) -> list[int]:
+    result = _require_numbers(name, value)
+    for item in result:
+        if item >= 2**63:
+            raise ValueError(f"{name} must contain Arrow signed int64 values")
     return result

@@ -202,6 +202,30 @@ def test_normalized_source_requires_gold_expr_to_be_a_correct_solution(
         validate_normalized_source(row)
 
 
+def test_normalized_source_is_not_restricted_to_arrow_int64():
+    large = 2**80
+    row = normalized_source()
+    row.update(
+        {
+            "numbers": [large, 1],
+            "target": large + 1,
+            "gold_expr": f"{large}+1",
+        }
+    )
+    row["bucket"] = {
+        "num_count": 2,
+        "expr_depth": 2,
+        "expr_len": len(row["gold_expr"]),
+        "has_division": False,
+        "has_subtraction": False,
+        "score": 1,
+        "complexity": "easy",
+        "bucket_key": "2_easy",
+    }
+
+    assert validate_normalized_source(row) == row
+
+
 def test_sft_record_returns_deep_canonical_copy():
     row = sft_record()
     before = deepcopy(row)
@@ -282,6 +306,71 @@ def test_sft_validation_rejects_wrong_primitive_types(field, value):
 
     with pytest.raises(ValueError, match=f"validation.{field}"):
         validate_sft_record(row)
+
+
+def test_sft_validation_rejects_expression_falsely_declared_correct():
+    row = sft_record()
+    row["validation"]["expression"] = "1*2"
+
+    with pytest.raises(ValueError, match="validation.*actual"):
+        validate_sft_record(row)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ok", True),
+        ("value", "9/1"),
+        ("used_numbers", [2, 1]),
+        ("error", "number_mismatch"),
+    ],
+)
+def test_sft_validation_declared_fields_must_match_expression_result(field, value):
+    row = sft_record()
+    row["validation"] = {
+        "ok": False,
+        "value": "2/1",
+        "used_numbers": [1, 2],
+        "expression": "1*2",
+        "error": "wrong_value",
+    }
+    row["validation"][field] = value
+
+    with pytest.raises(ValueError, match=f"validation.{field}.*actual"):
+        validate_sft_record(row)
+
+
+@pytest.mark.parametrize(
+    "validation",
+    [
+        {
+            "ok": False,
+            "value": "2/1",
+            "used_numbers": [1, 2],
+            "expression": "1*2",
+            "error": "wrong_value",
+        },
+        {
+            "ok": False,
+            "value": None,
+            "used_numbers": [],
+            "expression": "1+",
+            "error": "invalid_expression",
+        },
+        {
+            "ok": False,
+            "value": None,
+            "used_numbers": [],
+            "expression": None,
+            "error": "missing_answer_tag",
+        },
+    ],
+)
+def test_sft_validation_accepts_exact_v2_validator_results(validation):
+    row = sft_record()
+    row["validation"] = validation
+
+    assert validate_sft_record(row) == row
 
 
 @pytest.mark.parametrize(
@@ -406,11 +495,40 @@ def test_canonical_verl_record_converts_to_pyarrow_table():
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("numbers", [1, 2**80]),
+        ("target", 2**80),
+    ],
+)
+def test_verl_ground_truth_rejects_values_outside_arrow_int64(field, value):
+    row = verl_record()
+    row["reward_model"]["ground_truth"][field] = value
+
+    with pytest.raises(ValueError, match=f"ground_truth.{field}.*int64"):
+        validate_verl_record(row)
+
+
+def test_verl_ground_truth_int64_boundary_converts_with_pyarrow():
+    pyarrow = pytest.importorskip("pyarrow")
+    row = verl_record()
+    maximum = 2**63 - 1
+    row["reward_model"]["ground_truth"] = {
+        "numbers": [0, maximum],
+        "target": maximum,
+    }
+
+    canonical = validate_verl_record(row)
+    table = pyarrow.Table.from_pylist([canonical])
+
+    assert table.to_pylist() == [canonical]
+
+
+@pytest.mark.parametrize(
     "bad_value",
     [
         [1, "x"],
         [{"value": 1}, {"value": "x"}],
-        [{"left": 1}, {"right": 2}],
         [[1], ["x"]],
         [True, 1],
     ],
@@ -434,6 +552,20 @@ def test_verl_extra_info_accepts_arrow_mergeable_numeric_and_null_lists():
     result = validate_verl_record(row)
 
     assert result == row
+
+
+def test_verl_extra_info_merges_mapping_list_keys_as_nullable_arrow_struct():
+    pyarrow = pytest.importorskip("pyarrow")
+    row = verl_record()
+    row["extra_info"]["items"] = [{"left": 1}, {"right": 2}]
+
+    canonical = validate_verl_record(row)
+    table = pyarrow.Table.from_pylist([canonical])
+
+    assert table.to_pylist()[0]["extra_info"]["items"] == [
+        {"left": 1, "right": None},
+        {"left": None, "right": 2},
+    ]
 
 
 @pytest.mark.parametrize(
