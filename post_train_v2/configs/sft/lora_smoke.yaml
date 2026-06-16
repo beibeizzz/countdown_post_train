@@ -1,0 +1,16 @@
+model_path: post_train/model/qwen/qwen3-0.6b
+train_data: post_train_v2/data/processed/sft_train_8k.jsonl
+eval_data: post_train_v2/data/processed/eval_50.jsonl
+output_dir: post_train_v2/outputs/sft/lora_smoke
+learning_rate: 2.0e-5
+num_train_epochs: 1
+max_seq_len: 256
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+eval_every_steps: 100
+max_new_tokens: 256
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+gradient_checkpointing: true
+report_to: []
