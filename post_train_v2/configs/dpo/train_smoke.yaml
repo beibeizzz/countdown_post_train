@@ -1,0 +1,16 @@
+model_path: post_train_v2/outputs/sft/full/best
+train_data: post_train_v2/data/dpo_smoke/dpo_pairs.jsonl
+eval_data: post_train_v2/data/processed/eval_50.jsonl
+output_dir: post_train_v2/outputs/dpo_smoke
+learning_rate: 5.0e-7
+num_train_epochs: 1
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 2
+max_length: 256
+beta: 0.05
+eval_every_steps: 100
+max_new_tokens: 256
+export_kind: full_model
+report_to: []
+tracking:
+  enabled: false
