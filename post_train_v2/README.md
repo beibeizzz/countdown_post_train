@@ -217,6 +217,9 @@ raw Countdown data
 
 - `docs/superpowers/specs/2026-06-15-post-train-v2-core-development-design.md`:
   authoritative core-development contract.
+- `docs/runbooks/full_pipeline.md`: end-to-end smoke and production workflow.
+- `docs/runbooks/recovery.md`: stale artifact, resume, and rebuild behavior.
+- `docs/runbooks/final_evaluation.md`: final model comparison matrix.
 - `analysis.md`: inventory and behavioral analysis of the existing project.
 - `migration_plan.md`: historical migration analysis superseded by the core
   design where the two conflict.
