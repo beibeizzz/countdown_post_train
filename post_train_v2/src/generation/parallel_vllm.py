@@ -15,6 +15,11 @@ from post_train_v2.src.generation.vllm_client import (
     GenerationRequest,
     VLLMGenerator,
 )
+from post_train_v2.src.generation.metadata import (
+    GenerationRecord,
+    classify_truncation,
+    generation_record_from_mapping,
+)
 
 
 @dataclass(frozen=True)
@@ -38,6 +43,13 @@ class WorkerSpec:
 class WorkerRequest:
     batch_id: int
     items: tuple[PositionedPrompt, ...]
+    include_metadata: bool = False
+
+
+@dataclass(frozen=True)
+class WorkerGeneration:
+    position: int
+    record: GenerationRecord
 
 
 @dataclass(frozen=True)
@@ -52,7 +64,7 @@ class WorkerReady:
 class WorkerResult:
     worker_index: int
     batch_id: int
-    items: tuple[tuple[int, str], ...]
+    items: tuple[tuple[int, str] | WorkerGeneration, ...]
     latency_seconds: float = 0.0
 
 
@@ -106,26 +118,19 @@ def merge_worker_results(
     if len(set(expected)) != len(expected):
         raise ValueError("expected positions contain duplicates")
 
-    merged: list[tuple[int, str]] = []
+    merged: list[tuple[int, str] | WorkerGeneration] = []
     seen_positions: set[int] = set()
     actual_positions: dict[int, tuple[int, ...]] = {}
     for worker_index in (0, 1):
         result = results[worker_index]
         worker_positions: list[int] = []
         for item in result.items:
-            if (
-                not isinstance(item, tuple)
-                or len(item) != 2
-                or not isinstance(item[0], int)
-                or not isinstance(item[1], str)
-            ):
-                raise ValueError(f"malformed positioned response: {item!r}")
-            position, text = item
+            position = _position_from_worker_item(item)
             if position in seen_positions:
                 raise ValueError(f"duplicate position in worker results: {position}")
             seen_positions.add(position)
             worker_positions.append(position)
-            merged.append((position, text))
+            merged.append(item)
         actual_positions[worker_index] = tuple(worker_positions)
 
     expected_set = set(expected)
@@ -158,6 +163,19 @@ def merge_worker_results(
             )
 
     return [*results[0].items, *results[1].items]
+
+
+def _position_from_worker_item(item: tuple[int, str] | WorkerGeneration) -> int:
+    if isinstance(item, WorkerGeneration):
+        return item.position
+    if (
+        not isinstance(item, tuple)
+        or len(item) != 2
+        or not isinstance(item[0], int)
+        or not isinstance(item[1], str)
+    ):
+        raise ValueError(f"malformed positioned response: {item!r}")
+    return item[0]
 
 
 def _validate_worker_message(
@@ -301,20 +319,38 @@ def worker_main(
                 for item in message.items
             ]
             generate_started_at = time.monotonic()
-            responses = generator.generate(
-                generation_requests,
-                generation_config,
-            )
+            if message.include_metadata:
+                responses = [
+                    classify_truncation(
+                        generation_record_from_mapping(record),
+                        max_new_tokens=max_new_tokens,
+                    )
+                    for record in generator.generate_with_metadata(
+                        generation_requests,
+                        generation_config,
+                    )
+                ]
+            else:
+                responses = generator.generate(
+                    generation_requests,
+                    generation_config,
+                )
             latency_seconds = time.monotonic() - generate_started_at
             if len(responses) != len(message.items):
                 raise ValueError(
                     "response count mismatch: "
                     f"received {len(responses)}, expected {len(message.items)}"
                 )
-            positioned = tuple(
-                (item.position, response)
-                for item, response in zip(message.items, responses, strict=True)
-            )
+            if message.include_metadata:
+                positioned = tuple(
+                    WorkerGeneration(item.position, response)
+                    for item, response in zip(message.items, responses, strict=True)
+                )
+            else:
+                positioned = tuple(
+                    (item.position, response)
+                    for item, response in zip(message.items, responses, strict=True)
+                )
             response_queue.put(
                 WorkerResult(
                     spec.worker_index,
@@ -499,7 +535,9 @@ class ParallelVLLMEngine:
         self,
         batch_id: int,
         items: Sequence[PositionedPrompt],
-    ) -> list[tuple[int, str]]:
+        *,
+        include_metadata: bool = False,
+    ) -> list[tuple[int, str]] | list[tuple[int, GenerationRecord]]:
         if not self._started or self._closed:
             raise RuntimeError("ParallelVLLMEngine is not started")
         self._last_worker_latencies = None
@@ -519,7 +557,7 @@ class ParallelVLLMEngine:
                 self._request_queues, shards, strict=True
             ):
                 self._raise_if_deadline_expired(deadline, f"batch {batch_id}")
-                request_queue.put(WorkerRequest(batch_id, shard))
+                request_queue.put(WorkerRequest(batch_id, shard, include_metadata))
                 self._raise_if_deadline_expired(deadline, f"batch {batch_id}")
 
             messages: list[WorkerResult] = []
@@ -549,15 +587,33 @@ class ParallelVLLMEngine:
             )
             self._last_worker_nonempty_counts = (
                 sum(
-                    bool(response.strip())
-                    for _, response in results_by_worker[0].items
+                    bool(_worker_item_text(item).strip())
+                    for item in results_by_worker[0].items
                 ),
                 sum(
-                    bool(response.strip())
-                    for _, response in results_by_worker[1].items
+                    bool(_worker_item_text(item).strip())
+                    for item in results_by_worker[1].items
                 ),
             )
-            return merged
+            if include_metadata:
+                if any(not isinstance(item, WorkerGeneration) for item in merged):
+                    raise ValueError("metadata generation result mixed protocols")
+                return [
+                    (
+                        item.position,
+                        classify_truncation(
+                            item.record,
+                            max_new_tokens=self.max_new_tokens,
+                        ),
+                    )
+                    for item in merged
+                ]
+            if any(isinstance(item, WorkerGeneration) for item in merged):
+                raise ValueError("string generation result mixed protocols")
+            return [
+                item
+                for item in merged
+            ]
         except Exception as exc:
             self._close_after_failure(exc)
             raise
@@ -745,6 +801,12 @@ class ParallelVLLMEngine:
                 join_thread()
             except Exception as exc:
                 cleanup_errors.append(f"failed to join queue thread: {exc}")
+
+
+def _worker_item_text(item: tuple[int, str] | WorkerGeneration) -> str:
+    if isinstance(item, WorkerGeneration):
+        return item.record.text
+    return item[1]
 
 
 def _format_worker_error(error: WorkerError) -> str:
