@@ -1,0 +1,40 @@
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+actor_rollout_ref:
+  model:
+    path: post_train_v2/outputs/sft/full/best
+    enable_gradient_checkpointing: true
+    override_config:
+      attn_implementation: flash_attention_2
+  actor:
+    strategy: fsdp2
+    use_kl_loss: false
+    ppo_mini_batch_size: 4
+    ppo_micro_batch_size_per_gpu: 2
+    ppo_epochs: 2
+  rollout:
+    tensor_model_parallel_size: 1
+    log_prob_micro_batch_size_per_gpu: 2
+    n: 4
+    temperature: 1.0
+    top_p: 0.95
+data:
+  train_files: [post_train_v2/data/verl/train.parquet]
+  validation_files: [post_train_v2/data/verl/validation.parquet]
+  train_batch_size: 4
+  max_prompt_length: 256
+  max_response_length: 256
+  apply_chat_template_kwargs:
+    enable_thinking: false
+trainer:
+  nnodes: 1
+  n_gpus_per_node: 2
+  total_epochs: 1
+  save_freq: 100
+  test_freq: 100
+  log_val_generations: 50
+  max_actor_ckpt_to_keep:
+  rollout_data_dir: post_train_v2/outputs/grpo/smoke/rollouts
+  validation_data_dir: post_train_v2/outputs/grpo/smoke/validation
+  default_local_dir: post_train_v2/outputs/grpo/smoke/checkpoints
