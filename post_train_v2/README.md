@@ -6,8 +6,8 @@ pipeline currently implemented under `post_train`.
 The runtime environment, V2 Countdown/data foundations, dual-GPU Teacher
 generation, deterministic split builders, common evaluation, Manifest V2,
 rank-aware tracking utilities, two-GPU supervised SFT entrypoints, LoRA SFT,
-RFT data/training entrypoints, and DPO data/training entrypoints are
-implemented. GRPO training remains a later phase.
+RFT data/training entrypoints, DPO data/training entrypoints, and the verl
+GRPO conversion/reward/launch/export entrypoints are implemented.
 
 The authoritative core design is:
 
@@ -177,6 +177,25 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
 ```
 
 Smoke commands and output checks are in `docs/runbooks/dpo.md`.
+
+## Implemented Phase 4 Flow
+
+After Phase 2 Full SFT has produced `post_train_v2/outputs/sft/full/best` and
+the GRPO 4k split exists, run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python post_train_v2/scripts/grpo/convert_to_parquet.py \
+  --train-jsonl post_train_v2/data/processed/grpo_train_4k.jsonl \
+  --val-jsonl post_train_v2/data/processed/eval_50.jsonl \
+  --output-dir post_train_v2/data/verl
+
+CUDA_VISIBLE_DEVICES=0,1 python post_train_v2/scripts/grpo/train_grpo.py \
+  --config post_train_v2/verl/configs/grpo_smoke.yaml \
+  --max-steps 1
+```
+
+For a full run, use `post_train_v2/verl/configs/grpo.yaml`, then select and
+export best/final actors as described in `docs/runbooks/grpo.md`.
 
 ## Intended Pipeline
 
