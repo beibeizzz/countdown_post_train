@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+
+import pytest
+
+from post_train_v2.src.training.model_selection import (
+    EvaluationResult,
+    publish_model_export,
+    select_best,
+)
+
+
+def result(step: int, *, accuracy: float, format_rate: float) -> EvaluationResult:
+    return EvaluationResult(
+        step=step,
+        metrics={"accuracy": accuracy, "format_rate": format_rate},
+    )
+
+
+@dataclass
+class FakePublisher:
+    files: tuple[str, ...]
+
+    def save_pretrained(self, path):
+        for filename in self.files:
+            (path / filename).write_text(filename, encoding="utf-8")
+
+
+def test_select_best_orders_by_accuracy_format_then_earliest_step():
+    assert select_best(
+        [
+            result(100, accuracy=0.5, format_rate=0.9),
+            result(200, accuracy=0.5, format_rate=0.95),
+            result(300, accuracy=0.5, format_rate=0.95),
+        ]
+    ).step == 200
+
+
+def test_publish_full_model_export_requires_direct_load_before_manifest(tmp_path):
+    checked = []
+
+    manifest = publish_model_export(
+        model=FakePublisher(("config.json",)),
+        tokenizer=FakePublisher(("tokenizer.json",)),
+        output_dir=tmp_path,
+        export_name="best",
+        export_kind="full_model",
+        direct_load_check=lambda path: checked.append(path),
+    )
+
+    export_dir = tmp_path / "best"
+    assert checked == [export_dir]
+    assert manifest["export_kind"] == "full_model"
+    assert manifest["direct_loadable"] is True
+    assert json.loads((export_dir / "export_manifest.json").read_text()) == manifest
+
+
+def test_publish_full_model_export_does_not_publish_manifest_when_check_fails(tmp_path):
+    with pytest.raises(RuntimeError, match="cannot load"):
+        publish_model_export(
+            model=FakePublisher(("config.json",)),
+            tokenizer=FakePublisher(("tokenizer.json",)),
+            output_dir=tmp_path,
+            export_name="best",
+            export_kind="full_model",
+            direct_load_check=lambda path: (_ for _ in ()).throw(
+                RuntimeError("cannot load")
+            ),
+        )
+
+    assert not (tmp_path / "best" / "export_manifest.json").exists()
+
+
+def test_publish_lora_best_is_adapter_not_direct_loadable(tmp_path):
+    manifest = publish_model_export(
+        model=FakePublisher(("adapter_config.json",)),
+        tokenizer=FakePublisher(("tokenizer.json",)),
+        output_dir=tmp_path,
+        export_name="best",
+        export_kind="lora_adapter",
+    )
+
+    assert manifest["export_kind"] == "lora_adapter"
+    assert manifest["direct_loadable"] is False
