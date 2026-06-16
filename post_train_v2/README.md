@@ -5,8 +5,9 @@ pipeline currently implemented under `post_train`.
 
 The runtime environment, V2 Countdown/data foundations, dual-GPU Teacher
 generation, deterministic split builders, common evaluation, Manifest V2,
-and rank-aware tracking utilities are implemented. SFT, RFT, DPO, and GRPO
-training entrypoints remain later phases.
+rank-aware tracking utilities, two-GPU supervised SFT entrypoints, LoRA SFT,
+and RFT data/training entrypoints are implemented. DPO and GRPO training
+entrypoints remain later phases.
 
 The authoritative core design is:
 
@@ -113,9 +114,9 @@ post_train_v2/
       plans/
 ```
 
-Most training subdirectories remain placeholders. An entrypoint is runnable
-only when its phase plan and README mark it implemented and its applicable
-verification gate has passed.
+Some later training subdirectories remain placeholders. An entrypoint is
+runnable only when its phase plan and README mark it implemented and its
+applicable verification gate has passed.
 
 ## Implemented Phase 1 Flow
 
@@ -136,6 +137,30 @@ python post_train_v2/scripts/eval/evaluate_model.py \
 The Teacher command requires the pinned remote GPU environment and two
 working GPUs. Detailed artifact checks and resume commands are in
 `docs/runbooks/data_and_evaluation.md`.
+
+## Implemented Phase 2 Flow
+
+After Phase 1 has produced `sft_train_8k.jsonl` and `eval_50.jsonl`, run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  post_train_v2/scripts/sft/train_full.py \
+  --config post_train_v2/configs/sft/full.yaml
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  post_train_v2/scripts/sft/train_lora.py \
+  --config post_train_v2/configs/sft/lora.yaml
+
+CUDA_VISIBLE_DEVICES=0,1 python post_train_v2/scripts/sft/build_rft_data.py \
+  --config post_train_v2/configs/sft/rft_rollout.yaml
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  post_train_v2/scripts/sft/train_rft.py \
+  --config post_train_v2/configs/sft/rft_train.yaml
+```
+
+Smoke commands and output checks are in
+`docs/runbooks/supervised_and_rft.md`.
 
 ## Intended Pipeline
 
