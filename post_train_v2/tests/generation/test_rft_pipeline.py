@@ -1,29 +1,26 @@
 from __future__ import annotations
 
+from post_train_v2.src.countdown.bucketing import assign_bucket
+from post_train_v2.src.countdown.prompts import build_solution_prompt
 from post_train_v2.src.generation.rft import (
     build_rollout_requests,
+    normalize_rollout_sources,
     select_rft_rows,
 )
 
 
 def source_row():
+    numbers = [1, 1, 1, 1]
+    target = 4
+    gold_expr = "1+1+1+1"
     return {
         "id": "source-1",
         "source_index": 7,
-        "numbers": [1, 1, 1, 1],
-        "target": 4,
-        "gold_expr": "1+1+1+1",
-        "prompt": "Using the numbers [1, 1, 1, 1], create an equation that equals 4.",
-        "bucket": {
-            "num_count": 4,
-            "expr_depth": 1,
-            "expr_len": 7,
-            "has_division": False,
-            "has_subtraction": False,
-            "score": 1,
-            "complexity": "easy",
-            "bucket_key": "easy:4:1",
-        },
+        "numbers": numbers,
+        "target": target,
+        "gold_expr": gold_expr,
+        "prompt": build_solution_prompt(numbers, target),
+        "bucket": assign_bucket(numbers, gold_expr),
     }
 
 
@@ -67,3 +64,20 @@ def test_select_rft_rows_keeps_expression_equivalent_distinct_responses():
 
     assert len(accepted) == 2
     assert rejected == []
+
+
+def test_normalize_rollout_sources_accepts_sft_records():
+    row = {
+        **source_row(),
+        "response": "<answer>1+1+1+1</answer>",
+        "validation": {
+            "ok": True,
+            "value": "4/1",
+            "used_numbers": [1, 1, 1, 1],
+            "expression": "1+1+1+1",
+            "error": None,
+        },
+        "provenance": {"stage": "teacher"},
+    }
+
+    assert normalize_rollout_sources([row]) == [source_row()]

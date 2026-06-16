@@ -14,7 +14,11 @@ from post_train_v2.src.countdown.validation import (
     serialize_fraction,
     validate_countdown_response,
 )
-from post_train_v2.src.data.schema import validate_normalized_source
+from post_train_v2.src.data.schema import (
+    NORMALIZED_SOURCE_KEYS,
+    validate_normalized_source,
+    validate_sft_record,
+)
 from post_train_v2.src.data.splits import read_jsonl_strict
 from post_train_v2.src.generation.parallel_vllm import (
     ParallelVLLMEngine,
@@ -58,6 +62,21 @@ def build_rollout_requests(
                 )
             )
     return requests
+
+
+def normalize_rollout_sources(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized = []
+    for row in rows:
+        if set(row) == NORMALIZED_SOURCE_KEYS:
+            normalized.append(validate_normalized_source(row))
+        else:
+            sft_row = validate_sft_record(row)
+            normalized.append(
+                {key: sft_row[key] for key in NORMALIZED_SOURCE_KEYS}
+            )
+    return normalized
 
 
 def select_rft_rows(
@@ -107,10 +126,11 @@ def select_rft_rows(
 
 def run_rft_rollout(config_path: str | Path, *, limit: int | None = None) -> dict[str, Any]:
     config = load_yaml(config_path)
-    source_rows = read_jsonl_strict(
+    raw_rows = read_jsonl_strict(
         resolve_repo_path(config["input_path"]),
-        validate_normalized_source,
+        lambda row: dict(row),
     )
+    source_rows = normalize_rollout_sources(raw_rows)
     if limit is not None:
         source_rows = source_rows[:limit]
     requests = build_rollout_requests(
