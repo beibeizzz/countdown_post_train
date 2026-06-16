@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from post_train_v2.verl.export import merge_actor
 from post_train_v2.verl.export.merge_actor import (
     build_model_merger_command,
     export_grpo_actors,
@@ -99,6 +100,33 @@ def test_export_grpo_actors_does_not_prune_if_direct_load_fails(tmp_path: Path) 
         )
 
     assert (run_dir / "checkpoints/global_step_50").exists()
+
+
+def test_export_grpo_actors_default_check_uses_common_model_loader(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    run_dir = _write_run(tmp_path)
+    loaded: list[Path] = []
+
+    def runner(command: list[str]) -> int:
+        if "merge" in command:
+            Path(command[command.index("--target_dir") + 1]).mkdir(parents=True)
+        return 0
+
+    def fake_load_model_and_tokenizer(path: Path):
+        loaded.append(path)
+        return object(), object()
+
+    monkeypatch.setattr(
+        merge_actor,
+        "load_model_and_tokenizer",
+        fake_load_model_and_tokenizer,
+    )
+
+    export_grpo_actors(run_dir, runner=runner)
+
+    assert loaded == [run_dir / "export/best", run_dir / "export/final"]
 
 
 def _write_run(tmp_path: Path) -> Path:

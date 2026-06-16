@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from post_train_v2.src.artifacts.atomic import publish_json
+from post_train_v2.src.evaluation.model_loading import load_model_and_tokenizer
 
 Runner = Callable[[list[str]], int]
 DirectLoadCheck = Callable[[Path], None]
@@ -145,15 +146,7 @@ def _run_or_raise(runner: Runner, command: list[str]) -> None:
 
 
 def _require_direct_loadable(path: Path) -> None:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    AutoTokenizer.from_pretrained(path, local_files_only=True, trust_remote_code=True)
-    AutoModelForCausalLM.from_pretrained(
-        path,
-        local_files_only=True,
-        trust_remote_code=True,
-        device_map="cpu",
-    )
+    load_model_and_tokenizer(path)
 
 
 def _retained_checkpoint_steps(run_dir: Path, *, best_step: int) -> set[int]:
