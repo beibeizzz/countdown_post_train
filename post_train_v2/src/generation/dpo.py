@@ -4,12 +4,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from pathlib import Path
 from typing import Any, Literal
 
+from post_train_v2.src.artifacts.atomic import publish_jsonl
+from post_train_v2.src.artifacts.hashing import sha256_file
+from post_train_v2.src.artifacts.manifest import ArtifactFile, ManifestV2, publish_manifest
+from post_train_v2.src.config.loading import load_yaml, resolve_repo_path
+from post_train_v2.src.countdown.prompts import build_dpo_forced_wrong_prompt
 from post_train_v2.src.countdown.validation import (
     serialize_fraction,
     validate_countdown_response,
 )
+from post_train_v2.src.data.schema import DPO_REJECTED_CATEGORIES, validate_dpo_record, validate_sft_record
+from post_train_v2.src.data.splits import read_jsonl_strict
+from post_train_v2.src.generation.parallel_vllm import ParallelVLLMEngine, PositionedPrompt, WorkerSpec
+from post_train_v2.src.generation.seeding import derive_request_seed
 from post_train_v2.src.generation.metadata import GenerationRecord
 
 GenerationRoute = Literal["forced_wrong", "high_temp"]
@@ -42,6 +52,23 @@ QUOTA_WEIGHTS = {
     "missing_answer_tag": 0.03,
     "truncated": 0.02,
 }
+DPO_CANDIDATE_SCHEMA = {
+    "source_id": "string",
+    "candidate_id": "string",
+    "generation_route": "string",
+    "rejected": "string",
+    "rejected_category": "string",
+    "validation": "object",
+    "rollout_index": "integer",
+}
+DPO_PAIR_SCHEMA = {
+    "prompt": "string",
+    "chosen": "string",
+    "rejected": "string",
+    "rejected_category": "string",
+    "generation_route": "string",
+    "provenance": "object",
+}
 
 
 @dataclass(frozen=True)
@@ -66,6 +93,14 @@ class DPOSelectionResult:
     category_counts: dict[str, int]
     route_counts: dict[str, int]
     shortfall: int
+
+
+@dataclass(frozen=True)
+class DPOGenerationRequest:
+    position: int
+    prompt: str
+    seed: int
+    metadata: dict[str, Any]
 
 
 def classify_dpo_candidate(
@@ -118,6 +153,170 @@ def classify_dpo_candidate(
         validation=validation,
         rollout_index=rollout_index,
     )
+
+
+def validate_chosen_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    chosen_rows = []
+    for row in rows:
+        try:
+            chosen_rows.append(validate_sft_record(row))
+        except ValueError as error:
+            raise ValueError("chosen response must validate") from error
+    for row in chosen_rows:
+        result = validate_countdown_response(
+            row["response"],
+            row["numbers"],
+            row["target"],
+        )
+        if not result.ok:
+            raise ValueError(f"chosen response must validate: {row['id']}")
+    return chosen_rows
+
+
+def build_dpo_generation_requests(
+    rows: list[dict[str, Any]],
+    *,
+    rollouts_per_route: int,
+    seed: int,
+) -> list[DPOGenerationRequest]:
+    if type(rollouts_per_route) is not int or rollouts_per_route <= 0:
+        raise ValueError("rollouts_per_route must be a positive integer")
+    requests: list[DPOGenerationRequest] = []
+    position = 0
+    for row in rows:
+        for route in ("forced_wrong", "high_temp"):
+            for rollout_index in range(rollouts_per_route):
+                prompt = (
+                    build_dpo_forced_wrong_prompt(
+                        row["numbers"],
+                        row["target"],
+                        row["response"],
+                    )
+                    if route == "forced_wrong"
+                    else row["prompt"]
+                )
+                requests.append(
+                    DPOGenerationRequest(
+                        position=position,
+                        prompt=prompt,
+                        seed=derive_request_seed(seed, "dpo", row["id"], position),
+                        metadata={
+                            "source_id": row["id"],
+                            "generation_route": route,
+                            "rollout_index": rollout_index,
+                        },
+                    )
+                )
+                position += 1
+    return requests
+
+
+def run_build_dpo_data(config_path: str | Path, *, limit: int | None = None) -> ManifestV2:
+    config = load_yaml(config_path)
+    rows = read_jsonl_strict(resolve_repo_path(config["input_path"]), validate_sft_record)
+    if limit is not None:
+        rows = rows[:limit]
+    rows = validate_chosen_rows(rows)
+    requests = build_dpo_generation_requests(
+        rows,
+        rollouts_per_route=int(config["rollouts_per_route"]),
+        seed=int(config["seed"]),
+    )
+    by_position = {request.position: request for request in requests}
+    worker_specs = [
+        WorkerSpec(index, int(device), str(Path(config["cache_root"]) / f"worker-{index}"))
+        for index, device in enumerate(config["devices"])
+    ]
+    with ParallelVLLMEngine(
+        model_path=str(resolve_repo_path(config["model_path"])),
+        worker_specs=worker_specs,
+        gpu_memory_utilization=float(config["gpu_memory_utilization"]),
+        max_model_len=int(config["max_model_len"]),
+        seed=int(config["seed"]),
+        max_new_tokens=int(config["max_new_tokens"]),
+        temperature=1.0,
+        top_p=float(config["top_p"]),
+        enable_thinking=False,
+        timeout_seconds=float(config["worker_timeout_seconds"]),
+    ).start() as engine:
+        positioned_records = engine.generate(
+            1,
+            [
+                PositionedPrompt(
+                    request.position,
+                    request.prompt,
+                    request.seed,
+                )
+                for request in requests
+            ],
+            include_metadata=True,
+        )
+    row_by_id = {row["id"]: row for row in rows}
+    candidates = []
+    for position, record in positioned_records:
+        request = by_position[position]
+        source = row_by_id[request.metadata["source_id"]]
+        candidate = classify_dpo_candidate(
+            source=source,
+            record=record,
+            generation_route=request.metadata["generation_route"],
+            rollout_index=request.metadata["rollout_index"],
+        )
+        candidates.append(_candidate_to_dict(candidate))
+    selection = select_dpo_pairs(
+        rows,
+        [
+            _candidate_from_dict(row)
+            for row in candidates
+        ],
+        target_size=int(config["target_pairs"]),
+        seed=int(config["seed"]),
+    )
+    return publish_dpo_outputs(
+        output_dir=resolve_repo_path(config["output_dir"]),
+        candidates=candidates,
+        pairs=selection.pairs,
+        config=config,
+        selection_summary={
+            "category_counts": selection.category_counts,
+            "route_counts": selection.route_counts,
+            "shortfall": selection.shortfall,
+        },
+    )
+
+
+def publish_dpo_outputs(
+    *,
+    output_dir: str | Path,
+    candidates: list[dict[str, Any]],
+    pairs: list[dict[str, Any]],
+    config: dict[str, Any],
+    selection_summary: dict[str, Any],
+) -> ManifestV2:
+    for candidate in candidates:
+        category = candidate["rejected_category"]
+        if category not in DPO_REJECTED_CATEGORIES:
+            raise ValueError(f"unexpected DPO rejected category: {category}")
+    pairs = [validate_dpo_record(pair) for pair in pairs]
+    output_dir = Path(output_dir)
+    publish_jsonl(output_dir / "dpo_candidates.jsonl", candidates)
+    publish_jsonl(output_dir / "dpo_pairs.jsonl", pairs)
+    files = (
+        _artifact_file(output_dir, "dpo_candidates.jsonl", len(candidates), DPO_CANDIDATE_SCHEMA),
+        _artifact_file(output_dir, "dpo_pairs.jsonl", len(pairs), DPO_PAIR_SCHEMA),
+    )
+    manifest = ManifestV2.build(
+        artifact_type="dpo_pairs",
+        stage="dpo_pair_build",
+        files=files,
+        parents=(),
+        config=dict(config),
+        model_path=str(config.get("model_path")) if config.get("model_path") else None,
+        seed_derivation_version="sha256-stage-v1",
+        stage_metadata=selection_summary,
+    )
+    publish_manifest(output_dir / "manifest.json", manifest)
+    return manifest
 
 
 def compute_category_quotas(target_size: int) -> dict[str, int]:
@@ -264,3 +463,43 @@ def _counts(values) -> dict[str, int]:
     for value in values:
         counts[value] = counts.get(value, 0) + 1
     return counts
+
+
+def _candidate_to_dict(candidate: DPOCandidate) -> dict[str, Any]:
+    return {
+        "source_id": candidate.source_id,
+        "candidate_id": candidate.candidate_id,
+        "generation_route": candidate.generation_route,
+        "rejected": candidate.rejected,
+        "rejected_category": candidate.rejected_category,
+        "validation": candidate.validation,
+        "rollout_index": candidate.rollout_index,
+    }
+
+
+def _candidate_from_dict(row: dict[str, Any]) -> DPOCandidate:
+    return DPOCandidate(
+        source_id=row["source_id"],
+        candidate_id=row["candidate_id"],
+        generation_route=row["generation_route"],
+        rejected=row["rejected"],
+        rejected_category=row["rejected_category"],
+        validation=row["validation"],
+        rollout_index=row["rollout_index"],
+    )
+
+
+def _artifact_file(
+    output_dir: Path,
+    filename: str,
+    row_count: int,
+    schema: dict[str, str],
+) -> ArtifactFile:
+    path = output_dir / filename
+    return ArtifactFile(
+        relative_path=filename,
+        sha256=sha256_file(path),
+        byte_size=path.stat().st_size,
+        row_count=row_count,
+        field_schema=schema,
+    )
