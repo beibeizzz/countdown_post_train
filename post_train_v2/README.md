@@ -3,9 +3,10 @@
 `post_train_v2` is the staged rewrite of the distributed post-training
 pipeline currently implemented under `post_train`.
 
-The runtime environment and dual-GPU Teacher generation entrypoint are
-implemented. The remaining core training stages are governed by the approved
-design below and are implemented through separately reviewed phase plans.
+The runtime environment, V2 Countdown/data foundations, dual-GPU Teacher
+generation, deterministic split builders, common evaluation, Manifest V2,
+and rank-aware tracking utilities are implemented. SFT, RFT, DPO, and GRPO
+training entrypoints remain later phases.
 
 The authoritative core design is:
 
@@ -115,6 +116,26 @@ post_train_v2/
 Most training subdirectories remain placeholders. An entrypoint is runnable
 only when its phase plan and README mark it implemented and its applicable
 verification gate has passed.
+
+## Implemented Phase 1 Flow
+
+Run these commands from the repository root:
+
+```bash
+python post_train_v2/scripts/data/build_source.py
+python post_train_v2/scripts/data/build_splits.py \
+  --config post_train_v2/configs/data/build_splits.yaml validation
+python post_train_v2/scripts/generation/build_teacher_pool.py \
+  --config post_train_v2/configs/generation/teacher_rollout_2gpu.yaml
+python post_train_v2/scripts/data/build_splits.py \
+  --config post_train_v2/configs/data/build_splits.yaml accepted
+python post_train_v2/scripts/eval/evaluate_model.py \
+  --model-path post_train_v2/outputs/sft/full/best
+```
+
+The Teacher command requires the pinned remote GPU environment and two
+working GPUs. Detailed artifact checks and resume commands are in
+`docs/runbooks/data_and_evaluation.md`.
 
 ## Intended Pipeline
 
