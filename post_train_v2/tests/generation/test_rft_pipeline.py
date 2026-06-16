@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from post_train_v2.src.countdown.bucketing import assign_bucket
 from post_train_v2.src.countdown.prompts import build_solution_prompt
+from post_train_v2.src.artifacts.manifest import load_manifest
 from post_train_v2.src.generation.rft import (
     build_rollout_requests,
     normalize_rollout_sources,
+    publish_rft_outputs,
     select_rft_rows,
 )
 
@@ -81,3 +83,26 @@ def test_normalize_rollout_sources_accepts_sft_records():
     }
 
     assert normalize_rollout_sources([row]) == [source_row()]
+
+
+def test_publish_rft_outputs_writes_manifest_v2(tmp_path):
+    source = source_row()
+    accepted, rejected = select_rft_rows(
+        [source],
+        [(0, "<answer>1+1+1+1</answer>"), (1, "<answer>1+1+1-1</answer>")],
+        rollouts_per_prompt=2,
+    )
+
+    manifest = publish_rft_outputs(
+        output_dir=tmp_path,
+        accepted=accepted,
+        rejected=rejected,
+        config={"seed": 123, "model_path": "teacher"},
+    )
+
+    loaded = load_manifest(tmp_path / "manifest.json")
+    assert loaded.artifact_id == manifest.artifact_id
+    assert loaded.schema_version == 2
+    assert loaded.stage == "rft_rollout"
+    assert loaded.stage_metadata["accepted_count"] == 1
+    assert loaded.stage_metadata["rejected_count"] == 1

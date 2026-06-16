@@ -8,7 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from post_train_v2.src.artifacts.atomic import publish_json, publish_jsonl
+from post_train_v2.src.artifacts.atomic import publish_jsonl
+from post_train_v2.src.artifacts.hashing import sha256_file
+from post_train_v2.src.artifacts.manifest import (
+    ArtifactFile,
+    ManifestV2,
+    publish_manifest,
+)
 from post_train_v2.src.config.loading import load_yaml, resolve_repo_path
 from post_train_v2.src.countdown.validation import (
     serialize_fraction,
@@ -26,6 +32,19 @@ from post_train_v2.src.generation.parallel_vllm import (
     WorkerSpec,
 )
 from post_train_v2.src.generation.seeding import derive_request_seed
+
+RFT_FIELD_SCHEMA = {
+    "id": "string",
+    "source_index": "integer",
+    "numbers": "array[integer]",
+    "target": "integer",
+    "gold_expr": "string",
+    "prompt": "string",
+    "bucket": "object",
+    "response": "string",
+    "validation": "object",
+    "provenance": "object",
+}
 
 
 @dataclass(frozen=True)
@@ -175,18 +194,56 @@ def run_rft_rollout(config_path: str | Path, *, limit: int | None = None) -> dic
         positioned_responses,
         rollouts_per_prompt=int(config["rollouts_per_prompt"]),
     )
-    output_dir = resolve_repo_path(config["output_dir"])
+    manifest = publish_rft_outputs(
+        output_dir=resolve_repo_path(config["output_dir"]),
+        accepted=accepted,
+        rejected=rejected,
+        config=config,
+    )
+    return manifest.to_dict()
+
+
+def publish_rft_outputs(
+    *,
+    output_dir: str | Path,
+    accepted: Sequence[Mapping[str, Any]],
+    rejected: Sequence[Mapping[str, Any]],
+    config: Mapping[str, Any],
+) -> ManifestV2:
+    output_dir = Path(output_dir)
     publish_jsonl(output_dir / "rft_accepted.jsonl", accepted)
     publish_jsonl(output_dir / "rft_rejected.jsonl", rejected)
-    manifest = {
-        "stage": "rft_rollout",
-        "accepted_count": len(accepted),
-        "rejected_count": len(rejected),
-        "question_coverage": len({row["id"] for row in accepted}),
-        "rollouts_per_prompt": int(config["rollouts_per_prompt"]),
-    }
-    publish_json(output_dir / "manifest.json", manifest)
+    files = (
+        _artifact_file(output_dir, "rft_accepted.jsonl", len(accepted)),
+        _artifact_file(output_dir, "rft_rejected.jsonl", len(rejected)),
+    )
+    manifest = ManifestV2.build(
+        artifact_type="rft_rollout",
+        stage="rft_rollout",
+        files=files,
+        parents=(),
+        config=dict(config),
+        model_path=str(config.get("model_path")) if config.get("model_path") else None,
+        seed_derivation_version="sha256-stage-v1",
+        stage_metadata={
+            "accepted_count": len(accepted),
+            "rejected_count": len(rejected),
+            "question_coverage": len({row["id"] for row in accepted}),
+        },
+    )
+    publish_manifest(output_dir / "manifest.json", manifest)
     return manifest
+
+
+def _artifact_file(output_dir: Path, filename: str, row_count: int) -> ArtifactFile:
+    path = output_dir / filename
+    return ArtifactFile(
+        relative_path=filename,
+        sha256=sha256_file(path),
+        byte_size=path.stat().st_size,
+        row_count=row_count,
+        field_schema=RFT_FIELD_SCHEMA,
+    )
 
 
 def _normalize_response(response: str) -> str:
