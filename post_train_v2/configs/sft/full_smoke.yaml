@@ -10,3 +10,4 @@ gradient_accumulation_steps: 1
 eval_every_steps: 100
 max_new_tokens: 256
 report_to: []
+export_kind: full_model

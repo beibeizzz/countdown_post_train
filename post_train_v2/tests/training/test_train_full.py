@@ -70,6 +70,11 @@ def test_full_sft_runner_trains_with_resume_and_expected_global_batch(monkeypatc
     )
     monkeypatch.setattr(supervised, "build_training_arguments", lambda cfg, max_steps: "args")
     monkeypatch.setattr(supervised, "FixedEvaluationCallback", lambda **kwargs: "eval-callback")
+    monkeypatch.setattr(
+        supervised,
+        "export_supervised_outputs",
+        lambda **kwargs: events.append(("export", kwargs)),
+    )
     monkeypatch.setattr(supervised, "import_module", lambda name: SimpleNamespace(Trainer=FakeTrainer))
     monkeypatch.setenv("WORLD_SIZE", "2")
 
@@ -80,7 +85,8 @@ def test_full_sft_runner_trains_with_resume_and_expected_global_batch(monkeypatc
     )
 
     assert summary["global_batch_size"] == 16
-    assert events[-1] == ("train", "checkpoint-100")
+    assert events[-2] == ("train", "checkpoint-100")
+    assert events[-1][0] == "export"
     trainer_kwargs = events[0][1]
     assert trainer_kwargs["model"] == "model"
     assert trainer_kwargs["args"] == "args"

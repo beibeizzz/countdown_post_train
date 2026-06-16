@@ -13,6 +13,10 @@ from post_train_v2.src.data.splits import read_jsonl_strict
 from post_train_v2.src.distributed.runtime import current_context
 from post_train_v2.src.training.fixed_eval import FixedEvaluationCallback
 from post_train_v2.src.training.model_loading import load_causal_lm_and_tokenizer
+from post_train_v2.src.training.model_selection import (
+    export_best_checkpoint,
+    export_final_model,
+)
 from post_train_v2.src.training.supervised_data import (
     SupervisedDataCollator,
     encode_prompt_response,
@@ -86,12 +90,45 @@ def run_supervised_training(
         ],
     )
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    export_supervised_outputs(
+        trainer=trainer,
+        tokenizer=tokenizer,
+        output_dir=output_dir,
+        export_kind=str(config.get("export_kind", "full_model")),
+    )
     return {
         "rank": context.rank,
         "world_size": context.world_size,
         "global_batch_size": global_batch_size(config, context.world_size),
         "output_dir": str(output_dir),
     }
+
+
+def export_supervised_outputs(
+    *,
+    trainer,
+    tokenizer,
+    output_dir: Path,
+    export_kind: str,
+) -> None:
+    direct_load_check = _direct_load_check if export_kind == "full_model" else None
+    export_final_model(
+        trainer=trainer,
+        tokenizer=tokenizer,
+        output_dir=output_dir,
+        export_kind=export_kind,
+        direct_load_check=direct_load_check,
+    )
+    export_best_checkpoint(
+        tokenizer=tokenizer,
+        output_dir=output_dir,
+        export_kind=export_kind,
+        direct_load_check=direct_load_check,
+    )
+
+
+def _direct_load_check(path: Path) -> None:
+    load_causal_lm_and_tokenizer(path, gradient_checkpointing=False)
 
 
 def _encode_rows(rows, tokenizer, max_seq_len: int) -> list[dict[str, list[int]]]:

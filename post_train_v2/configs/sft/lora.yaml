@@ -14,3 +14,4 @@ lora_alpha: 32
 lora_dropout: 0.05
 gradient_checkpointing: true
 report_to: []
+export_kind: lora_adapter

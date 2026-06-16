@@ -146,3 +146,9 @@ def test_merge_loads_adapter_over_base_and_merges(monkeypatch, tmp_path):
         ("model", tmp_path),
         ("tokenizer", tmp_path),
     ]
+
+
+def test_lora_config_marks_adapter_export_kind():
+    from post_train_v2.src.config.loading import load_yaml
+
+    assert load_yaml("post_train_v2/configs/sft/lora.yaml")["export_kind"] == "lora_adapter"
