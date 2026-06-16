@@ -1,0 +1,31 @@
+output_dir: post_train_v2/outputs/eval/final_matrix
+max_new_tokens: 256
+datasets:
+  - name: val_200
+    eval_data: post_train_v2/data/processed/val_200.jsonl
+    eval_manifest: post_train_v2/data/processed/validation_manifest.json
+    ranking_key: validation
+  - name: solved_test
+    eval_data: post_train_v2/data/processed/test_solved.jsonl
+    eval_manifest: post_train_v2/data/processed/source_manifest.json
+    ranking_key: test
+models:
+  - name: base
+    path: post_train/model/qwen/qwen3-0.6b
+  - name: full_sft_best
+    path: post_train_v2/outputs/sft/full/best
+  - name: lora_best
+    path: post_train_v2/outputs/sft/lora/best
+    base_model_path: post_train/model/qwen/qwen3-0.6b
+  - name: rft_best
+    path: post_train_v2/outputs/sft/rft/best
+  - name: dpo_best
+    path: post_train_v2/outputs/dpo/best
+  - name: grpo_best
+    path: post_train_v2/outputs/grpo/run/export/best
+  - name: teacher
+    path: post_train/model/qwen/qwen3-8b
+    optional: true
+ranking:
+  primary: test_accuracy
+  secondary: test_format_rate
