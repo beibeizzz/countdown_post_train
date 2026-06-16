@@ -227,30 +227,42 @@ def run_build_dpo_data(config_path: str | Path, *, limit: int | None = None) -> 
         WorkerSpec(index, int(device), str(Path(config["cache_root"]) / f"worker-{index}"))
         for index, device in enumerate(config["devices"])
     ]
-    with ParallelVLLMEngine(
-        model_path=str(resolve_repo_path(config["model_path"])),
-        worker_specs=worker_specs,
-        gpu_memory_utilization=float(config["gpu_memory_utilization"]),
-        max_model_len=int(config["max_model_len"]),
-        seed=int(config["seed"]),
-        max_new_tokens=int(config["max_new_tokens"]),
-        temperature=1.0,
-        top_p=float(config["top_p"]),
-        enable_thinking=False,
-        timeout_seconds=float(config["worker_timeout_seconds"]),
-    ).start() as engine:
-        positioned_records = engine.generate(
-            1,
-            [
-                PositionedPrompt(
-                    request.position,
-                    request.prompt,
-                    request.seed,
+    positioned_records = []
+    for route, temperature in (
+        ("forced_wrong", float(config["forced_temperature"])),
+        ("high_temp", float(config["high_temperature"])),
+    ):
+        route_requests = [
+            request
+            for request in requests
+            if request.metadata["generation_route"] == route
+        ]
+        with ParallelVLLMEngine(
+            model_path=str(resolve_repo_path(config["model_path"])),
+            worker_specs=worker_specs,
+            gpu_memory_utilization=float(config["gpu_memory_utilization"]),
+            max_model_len=int(config["max_model_len"]),
+            seed=int(config["seed"]),
+            max_new_tokens=int(config["max_new_tokens"]),
+            temperature=temperature,
+            top_p=float(config["top_p"]),
+            enable_thinking=False,
+            timeout_seconds=float(config["worker_timeout_seconds"]),
+        ).start() as engine:
+            positioned_records.extend(
+                engine.generate(
+                    1,
+                    [
+                        PositionedPrompt(
+                            request.position,
+                            request.prompt,
+                            request.seed,
+                        )
+                        for request in route_requests
+                    ],
+                    include_metadata=True,
                 )
-                for request in requests
-            ],
-            include_metadata=True,
-        )
+            )
     row_by_id = {row["id"]: row for row in rows}
     candidates = []
     for position, record in positioned_records:

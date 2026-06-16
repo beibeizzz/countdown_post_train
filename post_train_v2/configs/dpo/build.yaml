@@ -6,6 +6,8 @@ worker_timeout_seconds: 600
 gpu_memory_utilization: 0.8
 max_model_len: 1024
 max_new_tokens: 256
+forced_temperature: 0.3
+high_temperature: 1.0
 top_p: 0.95
 seed: 20260615
 enable_thinking: false

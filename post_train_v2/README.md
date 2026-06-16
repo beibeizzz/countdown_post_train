@@ -6,8 +6,8 @@ pipeline currently implemented under `post_train`.
 The runtime environment, V2 Countdown/data foundations, dual-GPU Teacher
 generation, deterministic split builders, common evaluation, Manifest V2,
 rank-aware tracking utilities, two-GPU supervised SFT entrypoints, LoRA SFT,
-and RFT data/training entrypoints are implemented. DPO and GRPO training
-entrypoints remain later phases.
+RFT data/training entrypoints, and DPO data/training entrypoints are
+implemented. GRPO training remains a later phase.
 
 The authoritative core design is:
 
@@ -161,6 +161,22 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
 
 Smoke commands and output checks are in
 `docs/runbooks/supervised_and_rft.md`.
+
+## Implemented Phase 3 Flow
+
+After Phase 2 Full SFT has produced `post_train_v2/outputs/sft/full/best`,
+run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python post_train_v2/scripts/dpo/build_dpo_data.py \
+  --config post_train_v2/configs/dpo/build.yaml
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  post_train_v2/scripts/dpo/train_dpo.py \
+  --config post_train_v2/configs/dpo/train.yaml
+```
+
+Smoke commands and output checks are in `docs/runbooks/dpo.md`.
 
 ## Intended Pipeline
 
