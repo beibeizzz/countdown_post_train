@@ -118,3 +118,37 @@ def test_fixed_eval_restores_eval_mode(tmp_path, monkeypatch):
     assert calls == [1]
     assert model.training is False
     assert model.events == ["eval"]
+
+
+def test_fixed_eval_uses_bound_accelerator_when_callback_kwargs_omit_it(
+    tmp_path,
+    monkeypatch,
+):
+    calls = []
+    model = FakeModel()
+    wrapper = SimpleNamespace()
+    accelerator = FakeAccelerator(model)
+    monkeypatch.setattr(
+        fixed_eval,
+        "evaluate_rows",
+        lambda rows, tokenizer, evaluated_model, *, max_new_tokens: calls.append(
+            evaluated_model
+        )
+        or [],
+    )
+    callback = FixedEvaluationCallback(
+        eval_rows=[{"id": "row-1", "prompt": "q", "numbers": [1], "target": 1}],
+        tokenizer=object(),
+        output_dir=tmp_path,
+        accelerator=accelerator,
+    )
+
+    callback.on_step_end(
+        args=None,
+        state=_state(100),
+        control=SimpleNamespace(),
+        model=wrapper,
+    )
+
+    assert calls == [model]
+    assert accelerator.calls == 1

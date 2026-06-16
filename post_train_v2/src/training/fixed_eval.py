@@ -22,6 +22,7 @@ class FixedEvaluationCallback:
         output_dir: str | Path,
         eval_every_steps: int = 100,
         max_new_tokens: int = 256,
+        accelerator=None,
     ) -> None:
         if type(eval_every_steps) is not int or eval_every_steps <= 0:
             raise ValueError("eval_every_steps must be a positive integer")
@@ -32,6 +33,7 @@ class FixedEvaluationCallback:
         self.output_dir = Path(output_dir)
         self.eval_every_steps = eval_every_steps
         self.max_new_tokens = max_new_tokens
+        self.accelerator = accelerator
 
     def on_step_end(self, args, state, control, **kwargs):
         step = int(getattr(state, "global_step", 0) or 0)
@@ -40,7 +42,7 @@ class FixedEvaluationCallback:
             return control
 
         model = kwargs.get("model")
-        accelerator = kwargs.get("accelerator")
+        accelerator = kwargs.get("accelerator", self.accelerator)
 
         def evaluate_once() -> dict[str, Any]:
             if model is None:

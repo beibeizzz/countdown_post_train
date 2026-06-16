@@ -73,22 +73,23 @@ def run_supervised_training(
     output_dir = resolve_repo_path(config["output_dir"])
     args = build_training_arguments(config, max_steps=max_steps)
     transformers = import_module("transformers")
+    eval_callback = FixedEvaluationCallback(
+        eval_rows=eval_rows,
+        tokenizer=tokenizer,
+        output_dir=output_dir / "eval",
+        eval_every_steps=int(config["eval_every_steps"]),
+        max_new_tokens=int(config["max_new_tokens"]),
+    )
     trainer = transformers.Trainer(
         model=model,
         args=args,
         train_dataset=train_dataset,
         data_collator=SupervisedDataCollator(),
         tokenizer=tokenizer,
-        callbacks=[
-            FixedEvaluationCallback(
-                eval_rows=eval_rows,
-                tokenizer=tokenizer,
-                output_dir=output_dir / "eval",
-                eval_every_steps=int(config["eval_every_steps"]),
-                max_new_tokens=int(config["max_new_tokens"]),
-            )
-        ],
+        callbacks=[eval_callback],
     )
+    if hasattr(trainer, "accelerator"):
+        eval_callback.accelerator = trainer.accelerator
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     export_supervised_outputs(
         trainer=trainer,
