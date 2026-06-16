@@ -8,6 +8,7 @@ from post_train_v2.src.artifacts.hashing import (
     sha256_config,
     sha256_file,
 )
+from post_train_v2.src.artifacts.lineage import ArtifactStatus, check_artifact_status
 from post_train_v2.src.artifacts.locking import exclusive_output_lock
 from post_train_v2.src.artifacts.manifest import (
     ArtifactFile,
@@ -19,9 +20,11 @@ from post_train_v2.src.artifacts.manifest import (
 
 __all__ = [
     "ArtifactFile",
+    "ArtifactStatus",
     "ManifestV2",
     "ParentArtifact",
     "canonical_json_bytes",
+    "check_artifact_status",
     "exclusive_output_lock",
     "load_manifest",
     "publish_json",
