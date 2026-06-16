@@ -1,6 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
+
+
+def _find_repo_root(script_path: Path) -> Path:
+    for parent in script_path.resolve().parents:
+        if (parent / "post_train_v2").is_dir() and (parent / ".git").exists():
+            return parent
+    raise RuntimeError(f"could not locate repository root from {script_path}")
+
+
+REPO_ROOT = _find_repo_root(Path(__file__))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from post_train_v2.src.config.loading import load_yaml
 from post_train_v2.src.training.supervised import run_supervised_training
