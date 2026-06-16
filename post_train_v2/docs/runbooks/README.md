@@ -10,3 +10,4 @@ Operational commands for implemented V2 phases live here.
 - `full_pipeline.md`: end-to-end orchestration.
 - `recovery.md`: resume and rebuild behavior.
 - `final_evaluation.md`: final model matrix evaluation.
+- `acceptance.md`: local and remote acceptance gates.
