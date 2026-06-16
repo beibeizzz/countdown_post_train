@@ -73,8 +73,10 @@ def run_pipeline(
             _write_events(events_path, events)
             raise PipelineRunError(f"stage {stage.name} is stale: {status.reason}")
 
+        command = _resolved_command(config, stage)
+        event["command"] = command
         started_at = _utc_now()
-        exit_code = runner(list(stage.command))
+        exit_code = runner(command)
         finished_at = _utc_now()
         event.update(
             {
@@ -108,6 +110,7 @@ def _load_config(path: Path) -> dict[str, Any]:
 def _load_stage_specs(config: Mapping[str, Any]) -> dict[str, StageSpec]:
     stages = []
     stage_configs: dict[str, Any] = {}
+    stage_resume: dict[str, Any] = {}
     for item in config["stages"]:
         if not isinstance(item, Mapping):
             raise ValueError("stage config must be a mapping")
@@ -123,7 +126,10 @@ def _load_stage_specs(config: Mapping[str, Any]) -> dict[str, StageSpec]:
         )
         if "expected_config" in item:
             stage_configs[name] = dict(item["expected_config"])
+        if "resume" in item:
+            stage_resume[name] = dict(item["resume"])
     config["stage_configs"] = stage_configs
+    config["stage_resume"] = stage_resume
     return validate_stage_specs(stages)
 
 
@@ -170,6 +176,40 @@ def _parent_manifest_paths(config: Mapping[str, Any], stage_name: str) -> list[P
     if not isinstance(parents, list):
         raise ValueError(f"parent_manifest_paths.{stage_name} must be a list")
     return [Path(item) for item in parents]
+
+
+def _resolved_command(config: Mapping[str, Any], stage: StageSpec) -> list[str]:
+    command = list(stage.command)
+    resume = config.get("stage_resume", {}).get(stage.name)
+    if not isinstance(resume, Mapping):
+        return command
+    checkpoint = _latest_checkpoint(
+        Path(resume["checkpoint_dir"]),
+        str(resume.get("glob", "checkpoint-*")),
+    )
+    if checkpoint is None:
+        return command
+    return [*command, str(resume.get("arg", "--resume-from-checkpoint")), str(checkpoint)]
+
+
+def _latest_checkpoint(checkpoint_dir: Path, pattern: str) -> Path | None:
+    if not checkpoint_dir.is_dir():
+        return None
+    candidates = [path for path in checkpoint_dir.glob(pattern) if path.is_dir()]
+    if not candidates:
+        return None
+    return max(candidates, key=_checkpoint_sort_key)
+
+
+def _checkpoint_sort_key(path: Path) -> tuple[int, str]:
+    suffix_digits = ""
+    for character in reversed(path.name):
+        if character.isdigit():
+            suffix_digits = character + suffix_digits
+        elif suffix_digits:
+            break
+    step = int(suffix_digits) if suffix_digits else -1
+    return step, path.name
 
 
 def _subprocess_runner(command: list[str]) -> int:
