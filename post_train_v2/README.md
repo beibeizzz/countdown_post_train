@@ -3,9 +3,11 @@
 `post_train_v2` is the staged rewrite of the distributed post-training
 pipeline currently implemented under `post_train`.
 
-The runtime environment and dual-GPU Teacher generation entrypoint are
-implemented. The remaining core training stages are governed by the approved
-design below and are implemented through separately reviewed phase plans.
+The runtime environment, V2 Countdown/data foundations, dual-GPU Teacher
+generation, deterministic split builders, common evaluation, Manifest V2,
+rank-aware tracking utilities, two-GPU supervised SFT entrypoints, LoRA SFT,
+RFT data/training entrypoints, DPO data/training entrypoints, and the verl
+GRPO conversion/reward/launch/export entrypoints are implemented.
 
 The authoritative core design is:
 
@@ -112,9 +114,88 @@ post_train_v2/
       plans/
 ```
 
-Most training subdirectories remain placeholders. An entrypoint is runnable
-only when its phase plan and README mark it implemented and its applicable
-verification gate has passed.
+Some later training subdirectories remain placeholders. An entrypoint is
+runnable only when its phase plan and README mark it implemented and its
+applicable verification gate has passed.
+
+## Implemented Phase 1 Flow
+
+Run these commands from the repository root:
+
+```bash
+python post_train_v2/scripts/data/build_source.py
+python post_train_v2/scripts/data/build_splits.py \
+  --config post_train_v2/configs/data/build_splits.yaml validation
+python post_train_v2/scripts/generation/build_teacher_pool.py \
+  --config post_train_v2/configs/generation/teacher_rollout_2gpu.yaml
+python post_train_v2/scripts/data/build_splits.py \
+  --config post_train_v2/configs/data/build_splits.yaml accepted
+python post_train_v2/scripts/eval/evaluate_model.py \
+  --model-path post_train_v2/outputs/sft/full/best
+```
+
+The Teacher command requires the pinned remote GPU environment and two
+working GPUs. Detailed artifact checks and resume commands are in
+`docs/runbooks/data_and_evaluation.md`.
+
+## Implemented Phase 2 Flow
+
+After Phase 1 has produced `sft_train_8k.jsonl` and `eval_50.jsonl`, run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  post_train_v2/scripts/sft/train_full.py \
+  --config post_train_v2/configs/sft/full.yaml
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  post_train_v2/scripts/sft/train_lora.py \
+  --config post_train_v2/configs/sft/lora.yaml
+
+CUDA_VISIBLE_DEVICES=0,1 python post_train_v2/scripts/sft/build_rft_data.py \
+  --config post_train_v2/configs/sft/rft_rollout.yaml
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  post_train_v2/scripts/sft/train_rft.py \
+  --config post_train_v2/configs/sft/rft_train.yaml
+```
+
+Smoke commands and output checks are in
+`docs/runbooks/supervised_and_rft.md`.
+
+## Implemented Phase 3 Flow
+
+After Phase 2 Full SFT has produced `post_train_v2/outputs/sft/full/best`,
+run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python post_train_v2/scripts/dpo/build_dpo_data.py \
+  --config post_train_v2/configs/dpo/build.yaml
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  post_train_v2/scripts/dpo/train_dpo.py \
+  --config post_train_v2/configs/dpo/train.yaml
+```
+
+Smoke commands and output checks are in `docs/runbooks/dpo.md`.
+
+## Implemented Phase 4 Flow
+
+After Phase 2 Full SFT has produced `post_train_v2/outputs/sft/full/best` and
+the GRPO 4k split exists, run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python post_train_v2/scripts/grpo/convert_to_parquet.py \
+  --train-jsonl post_train_v2/data/processed/grpo_train_4k.jsonl \
+  --val-jsonl post_train_v2/data/processed/eval_50.jsonl \
+  --output-dir post_train_v2/data/verl
+
+CUDA_VISIBLE_DEVICES=0,1 python post_train_v2/scripts/grpo/train_grpo.py \
+  --config post_train_v2/verl/configs/grpo_smoke.yaml \
+  --max-steps 1
+```
+
+For a full run, use `post_train_v2/verl/configs/grpo.yaml`, then select and
+export best/final actors as described in `docs/runbooks/grpo.md`.
 
 ## Intended Pipeline
 
@@ -136,6 +217,9 @@ raw Countdown data
 
 - `docs/superpowers/specs/2026-06-15-post-train-v2-core-development-design.md`:
   authoritative core-development contract.
+- `docs/runbooks/full_pipeline.md`: end-to-end smoke and production workflow.
+- `docs/runbooks/recovery.md`: stale artifact, resume, and rebuild behavior.
+- `docs/runbooks/final_evaluation.md`: final model comparison matrix.
 - `analysis.md`: inventory and behavioral analysis of the existing project.
 - `migration_plan.md`: historical migration analysis superseded by the core
   design where the two conflict.

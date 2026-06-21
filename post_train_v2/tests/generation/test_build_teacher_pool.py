@@ -17,6 +17,19 @@ import pytest
 from post_train.src.countdown.config import load_yaml_config
 from post_train.src.countdown.io import read_jsonl, write_jsonl, write_manifest
 from post_train_v2.src.generation.parallel_vllm import WorkerReady
+from post_train_v2.src.generation.seeding import derive_request_seed
+from post_train_v2.src.artifacts.hashing import sha256_file
+from post_train_v2.src.artifacts.manifest import (
+    ArtifactFile,
+    ManifestV2,
+    publish_manifest,
+)
+from post_train_v2.src.countdown.bucketing import assign_bucket
+from post_train_v2.src.countdown.prompts import build_solution_prompt
+from post_train_v2.src.data.schema import (
+    validate_normalized_source,
+    validate_sft_record,
+)
 from post_train_v2.src.generation.teacher_state import (
     ResumeState,
     TeacherGenerationConfig,
@@ -114,8 +127,8 @@ def test_production_and_smoke_configs_have_exact_approved_values() -> None:
     smoke = load_yaml_config(SMOKE_CONFIG)
     expected = {
         "model_path": "post_train/model/qwen/qwen3-8b",
-        "input_path": "post_train/data/processed/train_pool.jsonl",
-        "output_dir": "post_train/data/teacher_rollouts",
+        "input_path": "post_train_v2/data/processed/train_candidates.jsonl",
+        "output_dir": "post_train_v2/data/teacher_rollouts",
         "devices": [0, 1],
         "topology": "dual_tp1",
         "batch_size": 64,
@@ -129,16 +142,23 @@ def test_production_and_smoke_configs_have_exact_approved_values() -> None:
         "enable_thinking": False,
         "stop_after_accepted": 20_000,
         "cache_root": "/tmp/countdown_teacher_vllm",
-        "schema_version": 1,
+        "schema_version": 2,
     }
 
     assert production == expected
     assert smoke == {
         **expected,
+        "input_path": "post_train_v2/data/fixtures/teacher_smoke_candidates.jsonl",
         "output_dir": "/tmp/post_train_v2_teacher_smoke",
         "stop_after_accepted": 8,
         "cache_root": "/tmp/countdown_teacher_vllm_smoke",
     }
+    fixture_path = REPO_ROOT / smoke["input_path"]
+    fixture_rows = read_jsonl(fixture_path)
+    assert len(fixture_rows) == 8
+    assert [
+        validate_normalized_source(row) for row in fixture_rows
+    ] == fixture_rows
 
 
 @pytest.mark.parametrize(
@@ -221,14 +241,47 @@ def test_payload_retains_full_stripped_response_and_validation() -> None:
     )
 
     assert payload["response"] == "reasoning\n<answer> (7-3)*(8-2) </answer>"
-    assert payload["teacher_expr"] == "(7-3)*(8-2)"
-    assert payload["validation"] == {"ok": True, "error": None, "value": 24}
+    assert payload["validation"] == {
+        "ok": True,
+        "error": None,
+        "value": "24/1",
+        "used_numbers": [7, 3, 8, 2],
+        "expression": "(7-3)*(8-2)",
+    }
+    assert payload["provenance"] == {
+        "generator": "qwen3-8b-teacher",
+        "stage": "teacher",
+        "rollout_index": 0,
+    }
     empty = build_teacher_payload(source_row(), "")
     assert empty["validation"] == {
         "ok": False,
         "error": "missing_answer_tag",
         "value": None,
+        "used_numbers": [],
+        "expression": None,
     }
+
+
+def test_payload_from_canonical_source_is_a_valid_sft_record() -> None:
+    numbers = [7, 3, 8, 2]
+    gold_expr = "(7-3)*(8-2)"
+    source = {
+        "id": "train-000001",
+        "source_index": 1,
+        "numbers": numbers,
+        "target": 24,
+        "gold_expr": gold_expr,
+        "prompt": build_solution_prompt(numbers, 24),
+        "bucket": assign_bucket(numbers, gold_expr),
+    }
+
+    payload = build_teacher_payload(
+        source,
+        "Reasoning.\n<answer>(7-3)*(8-2)</answer>",
+    )
+
+    assert validate_sft_record(payload) == payload
 
 
 class FakeLock:
@@ -641,8 +694,13 @@ def test_source_hash_uses_exact_bytes_parsed_under_lock(tmp_path: Path) -> None:
         cuda_visible_devices=None,
     ) == 0
 
-    manifest = json.loads(store.manifest_path.read_text(encoding="utf-8"))
-    assert manifest["source_sha256"] == hashlib.sha256(source_bytes).hexdigest()
+    manifest = ManifestV2.parse(
+        json.loads(store.manifest_path.read_text(encoding="utf-8"))
+    )
+    assert (
+        manifest.stage_metadata["teacher_state"]["source_sha256"]
+        == hashlib.sha256(source_bytes).hexdigest()
+    )
 
 
 def test_source_mutation_during_state_load_fails_before_engine(tmp_path: Path) -> None:
@@ -763,6 +821,10 @@ def test_engine_receives_two_specs_runtime_and_absolute_positions(tmp_path: Path
     calls = engine_holder["engine"].calls
     assert [len(items) for _, items in calls] == [64, 1]
     assert [item.position for item in calls[0][1]] == list(range(64))
+    assert [item.seed for item in calls[0][1]] == [
+        derive_request_seed(0, "teacher", str(index), 0)
+        for index in range(64)
+    ]
     assert [batch_id for batch_id, _ in calls] == [1, 2]
     assert store.commits[-1]["manifest"]["completed"] is False
 
@@ -1398,6 +1460,87 @@ def test_initial_real_store_commit_materializes_empty_contract(tmp_path: Path) -
     assert accepted
     assert rejected == ""
     assert hashlib.sha256(b"").hexdigest() in manifest_text
+
+
+def test_exhausted_real_store_publishes_partial_manifest_v2(
+    tmp_path: Path,
+) -> None:
+    row = source_row()
+    config = make_config(tmp_path, stop_after_accepted=2)
+    write_jsonl(config.input_path, [row])
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    engine = FakeEngine([], [[(0, "")]])
+
+    assert run(
+        config_path,
+        engine_factory=lambda **kwargs: engine,
+        now=lambda: datetime(2026, 6, 14, tzinfo=timezone.utc),
+        cuda_visible_devices=None,
+    ) == 2
+
+    manifest = ManifestV2.parse(
+        json.loads(
+            (config.output_dir / "manifest.json").read_text(encoding="utf-8")
+        )
+    )
+    assert manifest.artifact_type == "partial_teacher_pool"
+    assert manifest.stage == "teacher_accepted_pool"
+    assert manifest.stage_metadata["completed"] is False
+    assert manifest.stage_metadata["accepted_count"] == 0
+    assert manifest.stage_metadata["target_accepted_count"] == 2
+    assert manifest.stage_metadata["teacher_state"]["completed"] is False
+    assert manifest.stage_metadata["teacher_state"]["accepted_count"] == 0
+    assert "accepted_pool_artifact_id" not in manifest.stage_metadata
+
+
+def test_complete_teacher_manifest_links_validation_parent(
+    tmp_path: Path,
+) -> None:
+    row = source_row()
+    config = make_config(tmp_path, stop_after_accepted=1)
+    write_jsonl(config.input_path, [row])
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, config)
+    validation_manifest_path = config.input_path.parent / "validation_manifest.json"
+    source_bytes = config.input_path.read_bytes()
+    validation_manifest = ManifestV2.build(
+        artifact_type="dataset_split",
+        stage="build_validation_splits",
+        files=(
+            ArtifactFile(
+                relative_path=config.input_path.name,
+                sha256=hashlib.sha256(source_bytes).hexdigest(),
+                byte_size=len(source_bytes),
+                row_count=1,
+                field_schema={},
+            ),
+        ),
+        parents=(),
+        config={"seed": 0},
+        stage_metadata={"completed": True},
+    )
+    publish_manifest(validation_manifest_path, validation_manifest)
+    engine = FakeEngine([], [[(0, "<answer>1+2</answer>")]])
+
+    assert run(
+        config_path,
+        engine_factory=lambda **kwargs: engine,
+        now=lambda: datetime(2026, 6, 14, tzinfo=timezone.utc),
+        cuda_visible_devices=None,
+    ) == 0
+
+    teacher_manifest = ManifestV2.parse(
+        json.loads(
+            (config.output_dir / "manifest.json").read_text(encoding="utf-8")
+        )
+    )
+    assert teacher_manifest.artifact_type == "teacher_accepted_pool"
+    assert teacher_manifest.stage_metadata["completed"] is True
+    assert teacher_manifest.parents[0].artifact_id == validation_manifest.artifact_id
+    assert teacher_manifest.parents[0].sha256 == sha256_file(
+        validation_manifest_path
+    )
 
 
 def test_script_help_imports_without_vllm() -> None:

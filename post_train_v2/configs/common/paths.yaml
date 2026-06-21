@@ -1,0 +1,5 @@
+student_model: post_train/model/qwen/qwen3-0.6b
+teacher_model: post_train/model/qwen/qwen3-8b
+processed_data: post_train_v2/data/processed
+teacher_rollouts: post_train_v2/data/teacher_rollouts
+outputs: post_train_v2/outputs

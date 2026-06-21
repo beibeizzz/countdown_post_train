@@ -12,6 +12,12 @@ from post_train_v2.src.generation.parallel_vllm import (
     split_contiguous,
     worker_main,
 )
+from post_train_v2.src.generation.seeding import derive_request_seed
+from post_train_v2.src.generation.vllm_client import (
+    GenerationConfig,
+    GenerationRequest,
+    VLLMGenerator,
+)
 
 __all__ = [
     "ParallelVLLMEngine",
@@ -21,6 +27,10 @@ __all__ = [
     "WorkerRequest",
     "WorkerResult",
     "WorkerSpec",
+    "GenerationConfig",
+    "GenerationRequest",
+    "VLLMGenerator",
+    "derive_request_seed",
     "merge_worker_results",
     "split_contiguous",
     "worker_main",

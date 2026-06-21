@@ -1,0 +1,115 @@
+# V2 Source Data Builder
+
+`build_source.py` reads raw Countdown train Parquet and test JSON inputs,
+normalizes them with the V2 exact solver, validates every solved record, and
+publishes four JSONL data files plus `manifest.json`.
+
+Run from any current working directory:
+
+```text
+python post_train_v2/scripts/data/build_source.py
+python post_train_v2/scripts/data/build_source.py --limit 100
+```
+
+`source_all.jsonl` and `solvable_train.jsonl` intentionally contain the same
+solved train records in source order. `source_all.jsonl` is the compatibility
+name used by earlier workflow descriptions; `solvable_train.jsonl` is the
+explicit semantic name used by downstream V2 stages. They are independently
+published and independently recorded in the manifest with their actual hash,
+byte size, row count, and schema.
+
+The raw compatibility layer accepts either `nums` or `numbers`. Number
+collections may be lists, tuples, NumPy arrays, or JSON list strings, but
+every member must be an exact nonnegative integer. Booleans, floats, and
+numeric strings are rejected rather than coerced.
+
+Unsolvable train rows are retained in `unsolved_train.jsonl` with
+`reason: "no_solution"`. Every test row must be solvable; an unsolvable test
+row fails the build before any new data files or completion manifest are
+published.
+
+Before replacing any JSONL file, a rebuild removes and directory-syncs the
+old `manifest.json` completion marker. If any JSONL publish fails, completed
+files may remain, but the missing manifest makes that partial output
+non-consumable. The four JSONL files use atomic replacement, and a new
+`manifest.json` is published last as the completion marker.
+
+Configured paths are resolved to absolute paths only for local I/O. The full
+four-field manifest configuration snapshot is canonicalized with the
+validated seed and logical train, test, and output paths. Absolute fixture
+paths are normalized relative to the config directory, so neither the
+manifest config hash nor artifact identity contains the checkout root. Raw
+parent IDs depend only on input kind and content SHA-256, so production
+relative configurations remain stable across checkout locations.
+
+The builder hashes both raw inputs before reading either dataset. After all
+rows are normalized and solved, it hashes both inputs again before removing
+an old manifest or writing any output. A changed train or test input aborts
+the run while preserving the previous manifest and data files. Parent
+artifacts use the fixed initial hashes rather than rereading inputs during
+manifest construction.
+
+## Deterministic Splits
+
+Freeze validation before Teacher generation:
+
+```text
+python post_train_v2/scripts/data/build_splits.py --config post_train_v2/configs/data/build_splits.yaml validation
+```
+
+This validates the complete canonical source artifact and its unrestricted
+production `build_source` Manifest V2. The source manifest must have
+`limit: null`; its exact integer counts must satisfy
+`train_input == solvable_train + unsolved_train`; and the configured source
+file count must equal `solvable_train`. The command then writes
+`val_200.jsonl`, `eval_50.jsonl`, and `train_candidates.jsonl`. Validation is
+sampled first, evaluation is sampled from validation with a separate
+SHA-256-derived seed, and all published rows are restored to source order.
+Sampling-order IDs and source-order IDs are recorded in
+`validation_manifest.json`.
+
+After Task9 has produced a complete `teacher_accepted_pool` Manifest V2 whose
+parent is that validation artifact, build the training splits:
+
+```text
+python post_train_v2/scripts/data/build_splits.py --config post_train_v2/configs/data/build_splits.yaml accepted
+```
+
+The accepted mode requires explicit `completed: true`, `accepted_count`, and
+`target_accepted_count` Teacher metadata. `accepted_count` is an exact
+nonnegative integer, while the target is a positive exact integer. A
+completed pool must have `accepted_count == target_accepted_count`, and that
+count must also equal the manifest file count and actual row count. The mode
+also rejects manifest file hash/count/schema mismatches, validation-ID
+leakage, and Teacher parent mismatches. It reads and validates
+`val_200.jsonl`, requiring its file count, actual rows, selected IDs,
+manifest count, and configured `val_size` to agree. It validates every
+canonical SFT row and independently samples
+`sft_train_8k.jsonl` and `grpo_train_4k.jsonl` with separate derived seeds;
+the two samples may overlap. Completion is published last in
+`accepted_splits_manifest.json`.
+
+Both modes hash every data and manifest input before reading and verify those
+fixed hashes before revoking an old completion manifest, then again after
+publishing data, and once more after building the new manifest immediately
+before publication. Parent hashes come directly from the initial snapshots
+and are never reread after validation. If publication or a late unchanged
+check fails after revocation, partial files are non-consumable because the
+completion manifest remains absent.
+
+Each mode holds an exclusive `.build_splits.lock` in the output directory for
+the complete read, sample, and publish transaction. A second writer fails
+before touching data or completion markers. The lock is removed on success
+and ordinary failure; a lock left by a terminated process must be inspected
+and removed manually before retrying.
+
+Manifest `created_at` records the actual split build time. Stable identity is
+provided by `artifact_id`, which excludes creation time. Paths inside the
+repository are recorded relative to the repository root, regardless of
+whether the config supplied a relative or absolute spelling; external paths
+remain absolute so the logical configuration remains replayable.
+
+The Phase 1 implementation loads and validates each JSONL artifact in memory.
+This is acceptable for the current 117k source rows and 20k Teacher pool.
+Larger future warehouses should replace this with an indexed or streaming
+selection implementation without changing the published schemas.

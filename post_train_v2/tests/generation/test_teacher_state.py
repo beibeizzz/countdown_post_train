@@ -12,6 +12,7 @@ import pytest
 
 import post_train_v2.src.generation.teacher_state as teacher_state
 from post_train.src.countdown.io import read_jsonl, write_jsonl, write_manifest
+from post_train_v2.src.artifacts.manifest import ManifestV2
 from post_train_v2.src.generation.teacher_state import (
     TeacherGenerationConfig,
     TeacherStateStore,
@@ -829,7 +830,10 @@ def test_initial_empty_commit_materializes_exact_files_and_hashes(
 
     assert store.accepted_path.read_bytes() == b""
     assert store.rejected_path.read_bytes() == b""
-    committed = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+    published = ManifestV2.parse(
+        json.loads(store.manifest_path.read_text(encoding="utf-8"))
+    )
+    committed = published.stage_metadata["teacher_state"]
     empty_hash = hashlib.sha256(b"").hexdigest()
     assert committed == {
         **manifest,
@@ -861,10 +865,10 @@ def test_initial_commit_allows_updated_at_equal_created_at(tmp_path: Path) -> No
         manifest=manifest,
     )
 
-    assert read_json(store.manifest_path)["updated_at"] == timestamp
+    assert read_teacher_state(store.manifest_path)["updated_at"] == timestamp
 
 
-def test_has_v2_manifest_requires_nonempty_fingerprint(tmp_path: Path) -> None:
+def test_has_v2_manifest_requires_valid_manifest_v2(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     store = TeacherStateStore(config.output_dir)
 
@@ -876,10 +880,22 @@ def test_has_v2_manifest_requires_nonempty_fingerprint(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert store.has_v2_manifest() is False
+    store.manifest_path.unlink()
 
-    store.manifest_path.write_text(
-        json.dumps({"generation_contract_fingerprint": "fingerprint"}) + "\n",
-        encoding="utf-8",
+    manifest = manifest_for_rows(
+        config,
+        [],
+        [],
+        created_at="2026-06-13T00:00:00+00:00",
+        updated_at="2026-06-13T00:00:00+00:00",
+    )
+    store.commit(
+        batch_id=0,
+        submitted_start=0,
+        submitted_stop=0,
+        accepted=[],
+        rejected=[],
+        manifest=manifest,
     )
     assert store.has_v2_manifest() is True
 
@@ -932,7 +948,7 @@ def test_commit_materializes_manifest_over_nonempty_legacy_snapshots(
 
     assert store.accepted_path.read_bytes() == accepted_bytes
     assert store.rejected_path.read_bytes() == rejected_bytes
-    assert read_json(store.manifest_path) == manifest
+    assert read_teacher_state(store.manifest_path) == manifest
     assert store.has_v2_manifest() is True
     assert not store.transaction_path.exists()
 
@@ -955,7 +971,7 @@ def test_commit_materializes_manifest_over_preexisting_empty_snapshots(
 
     assert store.accepted_path.read_bytes() == b""
     assert store.rejected_path.read_bytes() == b""
-    assert read_json(store.manifest_path) == manifest
+    assert read_teacher_state(store.manifest_path) == manifest
 
 
 @pytest.mark.parametrize(
@@ -1083,7 +1099,7 @@ def test_commit_materializes_v2_manifest_over_validated_legacy_manifest(
         manifest=v2_manifest,
     )
 
-    assert read_json(store.manifest_path) == v2_manifest
+    assert read_teacher_state(store.manifest_path) == v2_manifest
     assert read_json(store.manifest_path) != legacy_manifest
     assert store.has_v2_manifest() is True
 
@@ -1498,6 +1514,10 @@ def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def read_teacher_state(path: Path) -> dict:
+    return ManifestV2.parse(read_json(path)).stage_metadata["teacher_state"]
+
+
 def leave_failed_transaction(
     tmp_path: Path,
 ) -> tuple[TeacherGenerationConfig, TeacherStateStore, dict]:
@@ -1533,7 +1553,7 @@ def test_recovery_rolls_back_when_all_replacements_finished_but_journal_remains(
     tmp_path: Path,
 ) -> None:
     _, store, old_manifest = leave_failed_transaction(tmp_path)
-    assert read_json(store.manifest_path)["processed_count"] == 2
+    assert read_teacher_state(store.manifest_path)["processed_count"] == 2
 
     store = TeacherStateStore(store.output_dir)
     store.recover_transaction()
@@ -1604,10 +1624,12 @@ def test_recovery_fully_validates_embedded_pre_manifest(
 ) -> None:
     _, store, _ = leave_failed_transaction(tmp_path)
     journal = read_json(store.transaction_path)
-    journal["manifest"]["payload"]["max_worker_batch_size"] = 1
+    journal["manifest"]["payload"]["stage_metadata"]["teacher_state"][
+        "max_worker_batch_size"
+    ] = 1
     store.transaction_path.write_text(json.dumps(journal) + "\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="max_worker_batch_size"):
+    with pytest.raises(ValueError, match="artifact_id"):
         TeacherStateStore(store.output_dir).recover_transaction()
 
     assert store.transaction_path.exists()
@@ -1867,7 +1889,12 @@ def test_non_initial_commit_accepts_strictly_later_updated_at(
         updated_at="2026-06-13T01:00:01+00:00",
     )
 
-    assert committed["updated_at"] == "2026-06-13T01:00:01+00:00"
+    assert (
+        ManifestV2.parse(committed).stage_metadata["teacher_state"][
+            "updated_at"
+        ]
+        == "2026-06-13T01:00:01+00:00"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1963,18 +1990,17 @@ def test_commit_rejects_immutable_model_and_source_path_transition(
 
 
 @pytest.mark.parametrize(
-    ("mutation", "match"),
+    "mutation",
     (
-        ({"processed_count": 0}, "processed_count"),
-        ({"accepted_count": 0}, "accepted_count"),
-        ({"accepted_sha256": "0" * 64}, "accepted_sha256"),
-        ({"stage": "wrong-stage"}, "stage"),
+        {"processed_count": 0},
+        {"accepted_count": 0},
+        {"accepted_sha256": "0" * 64},
+        {"stage": "wrong-stage"},
     ),
 )
 def test_commit_rejects_incoherent_pre_state_before_journal_and_recovery_is_noop(
     tmp_path: Path,
     mutation: dict,
-    match: str,
 ) -> None:
     config = make_config(tmp_path)
     store = TeacherStateStore(config.output_dir)
@@ -1988,13 +2014,14 @@ def test_commit_rejects_incoherent_pre_state_before_journal_and_recovery_is_noop
         rejected=[],
     )
     old_accepted_bytes = store.accepted_path.read_bytes()
-    damaged_manifest = {**old_manifest, **mutation}
+    damaged_manifest = json.loads(json.dumps(old_manifest))
+    damaged_manifest["stage_metadata"]["teacher_state"].update(mutation)
     store.manifest_path.write_text(
         json.dumps(damaged_manifest) + "\n",
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(ValueError, match="artifact_id"):
         commit_rows(
             store,
             config,

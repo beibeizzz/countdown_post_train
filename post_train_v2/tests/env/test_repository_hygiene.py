@@ -15,6 +15,13 @@ REQUIRED_IGNORE_RULES = {
     ".pytest_cache/",
     ".pytest_tmp/",
 }
+DOCUMENTED_PREFIXES = (
+    "post_train_v2/configs",
+    "post_train_v2/scripts",
+    "post_train_v2/src",
+    "post_train_v2/tests",
+    "post_train_v2/verl",
+)
 
 
 def test_generated_python_and_pytest_artifacts_are_not_tracked() -> None:
@@ -47,3 +54,30 @@ def test_repository_gitignore_blocks_generated_test_artifacts() -> None:
         )
 
     assert REQUIRED_IGNORE_RULES <= rules
+
+
+def test_functional_tracked_directories_have_readmes() -> None:
+    result = subprocess.run(
+        ["git", "ls-files", "post_train_v2"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    directories = {
+        str((REPO_ROOT / path).parent.relative_to(REPO_ROOT)).replace("\\", "/")
+        for path in result.stdout.splitlines()
+        if any(path.startswith(prefix + "/") for prefix in DOCUMENTED_PREFIXES)
+    }
+    required = {
+        directory
+        for directory in directories
+        if not directory.endswith("/__pycache__")
+    }
+    missing = sorted(
+        directory
+        for directory in required
+        if not (REPO_ROOT / directory / "README.md").is_file()
+    )
+
+    assert missing == []

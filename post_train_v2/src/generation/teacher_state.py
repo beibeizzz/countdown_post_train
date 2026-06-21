@@ -11,8 +11,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from post_train.src.countdown.io import read_jsonl
-from post_train.src.countdown.validation import validate_countdown_response
+from post_train_v2.src.artifacts.manifest import (
+    ArtifactFile,
+    ManifestV2,
+    ParentArtifact,
+    load_manifest,
+)
+from post_train_v2.src.artifacts.hashing import sha256_file as sha256_artifact_file
+from post_train_v2.src.countdown.validation import validate_countdown_response
 
 
 ACCEPTED_FILENAME = "teacher_accepted_20k.jsonl"
@@ -20,6 +26,18 @@ REJECTED_FILENAME = "teacher_rejected.jsonl"
 MANIFEST_FILENAME = "manifest.json"
 TRANSACTION_FILENAME = ".teacher_pool.transaction.json"
 STAGE = "teacher_accepted_pool"
+SFT_FIELD_SCHEMA = {
+    "id": "string",
+    "source_index": "integer",
+    "numbers": "array[integer]",
+    "target": "integer",
+    "gold_expr": "string",
+    "prompt": "string",
+    "bucket": "object",
+    "response": "string",
+    "validation": "object",
+    "provenance": "object",
+}
 TRANSACTION_SCHEMA_VERSION = 1
 CONTRACT_KEYS = {
     "schema_version",
@@ -210,6 +228,26 @@ def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"{path}:{line_number}: invalid JSON"
+                ) from error
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"{path}:{line_number}: JSONL row must be an object"
+                )
+            rows.append(row)
+    return rows
+
+
 def build_generation_contract(
     config: TeacherGenerationConfig,
     *,
@@ -350,6 +388,104 @@ def build_manifest(
         "created_at": created_at,
         "updated_at": updated_at,
     }
+
+
+def _build_published_manifest(
+    operational: dict[str, Any],
+    *,
+    accepted_bytes: bytes,
+    rejected_bytes: bytes,
+) -> dict[str, Any]:
+    completed = operational["completed"]
+    artifact_type = (
+        "teacher_accepted_pool" if completed else "partial_teacher_pool"
+    )
+    files = (
+        ArtifactFile(
+            relative_path=ACCEPTED_FILENAME,
+            sha256=_sha256_bytes(accepted_bytes),
+            byte_size=len(accepted_bytes),
+            row_count=operational["accepted_count"],
+            field_schema=SFT_FIELD_SCHEMA,
+        ),
+        ArtifactFile(
+            relative_path=REJECTED_FILENAME,
+            sha256=_sha256_bytes(rejected_bytes),
+            byte_size=len(rejected_bytes),
+            row_count=operational["rejected_count"],
+            field_schema={"record_type": "countdown_teacher_rejection"},
+        ),
+    )
+    validation_manifest_path = (
+        Path(operational["source_path"]).parent / "validation_manifest.json"
+    )
+    if validation_manifest_path.is_file():
+        validation_manifest = load_manifest(validation_manifest_path)
+        parents = (
+            ParentArtifact(
+                artifact_id=validation_manifest.artifact_id,
+                sha256=sha256_artifact_file(validation_manifest_path),
+            ),
+        )
+    else:
+        parents = (
+            ParentArtifact(
+                artifact_id=operational["source_sha256"],
+                sha256=operational["source_sha256"],
+            ),
+        )
+    stage_metadata = {
+        "completed": completed,
+        "processed_count": operational["processed_count"],
+        "accepted_count": operational["accepted_count"],
+        "rejected_count": operational["rejected_count"],
+        "target_accepted_count": operational["target_accepted_count"],
+        "teacher_state": operational,
+    }
+    manifest = ManifestV2.build(
+        artifact_type=artifact_type,
+        stage=STAGE,
+        files=files,
+        parents=parents,
+        config=operational["generation_contract"],
+        model_path=operational["model_path"],
+        model_fingerprint=None,
+        global_seed=operational["seed"],
+        seed_derivation_version="sha256-v1",
+        created_at=operational["created_at"],
+        stage_metadata=stage_metadata,
+    )
+    return manifest.to_dict()
+
+
+def _published_operational_manifest(value: dict[str, Any]) -> dict[str, Any]:
+    parsed = ManifestV2.parse(value)
+    if parsed.stage != STAGE:
+        raise ValueError(f"manifest stage must be {STAGE}")
+    operational = parsed.stage_metadata.get("teacher_state")
+    if not isinstance(operational, dict):
+        raise ValueError("Manifest V2 teacher_state metadata is missing")
+    _validate_manifest_self_consistency(
+        operational,
+        expected_devices=None,
+    )
+    expected_type = (
+        "teacher_accepted_pool"
+        if operational["completed"]
+        else "partial_teacher_pool"
+    )
+    if parsed.artifact_type != expected_type:
+        raise ValueError("Manifest V2 artifact_type is incoherent")
+    return operational
+
+
+def _is_published_manifest_v2(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("schema_version") == 2
+        and "artifact_id" in value
+        and "stage_metadata" in value
+    )
 
 
 def _utc_now() -> str:
@@ -799,10 +935,10 @@ class TeacherStateStore:
             return False
         try:
             manifest = _read_json(self.manifest_path)
+            _published_operational_manifest(manifest)
         except ValueError:
             return False
-        fingerprint = manifest.get("generation_contract_fingerprint")
-        return isinstance(fingerprint, str) and bool(fingerprint.strip())
+        return True
 
     def load_resume_state(
         self,
@@ -823,7 +959,19 @@ class TeacherStateStore:
         self.recover_transaction()
         accepted = read_jsonl(self.accepted_path) if self.accepted_path.exists() else []
         rejected = read_jsonl(self.rejected_path) if self.rejected_path.exists() else []
-        manifest = _read_json(self.manifest_path) if self.manifest_path.exists() else None
+        published_manifest = (
+            _read_json(self.manifest_path)
+            if self.manifest_path.exists()
+            else None
+        )
+        manifest = None
+        if published_manifest is not None:
+            if _is_published_manifest_v2(published_manifest):
+                manifest = _published_operational_manifest(
+                    published_manifest
+                )
+            else:
+                manifest = published_manifest
         has_rows = bool(accepted or rejected)
         is_v2 = bool(
             manifest
@@ -987,9 +1135,15 @@ class TeacherStateStore:
 
         accepted_pre = self._snapshot(self.accepted_path)
         rejected_pre = self._snapshot(self.rejected_path)
-        manifest_pre = (
+        manifest_pre_published = (
             _read_json(self.manifest_path) if self.manifest_path.exists() else None
         )
+        manifest_pre = manifest_pre_published
+        if manifest_pre_published is not None:
+            if _is_published_manifest_v2(manifest_pre_published):
+                manifest_pre = _published_operational_manifest(
+                    manifest_pre_published
+                )
         snapshots_exist = accepted_pre["existed"] or rejected_pre["existed"]
         prior_is_v2 = False
         if manifest_pre is None:
@@ -1068,7 +1222,14 @@ class TeacherStateStore:
         if (
             prior_is_v2
             and "created_at" in manifest_pre
-            and manifest["created_at"] != manifest_pre["created_at"]
+            and _parse_utc_timestamp(
+                "created_at",
+                manifest["created_at"],
+            )
+            != _parse_utc_timestamp(
+                "created_at",
+                manifest_pre["created_at"],
+            )
         ):
             raise ValueError("manifest created_at must be preserved")
         if prior_is_v2:
@@ -1101,7 +1262,12 @@ class TeacherStateStore:
         committed_manifest = dict(manifest)
         committed_manifest["accepted_sha256"] = _sha256_bytes(accepted_bytes)
         committed_manifest["rejected_sha256"] = _sha256_bytes(rejected_bytes)
-        manifest_bytes = _json_bytes(committed_manifest)
+        published_manifest = _build_published_manifest(
+            committed_manifest,
+            accepted_bytes=accepted_bytes,
+            rejected_bytes=rejected_bytes,
+        )
+        manifest_bytes = _json_bytes(published_manifest)
         journal = {
             "schema_version": TRANSACTION_SCHEMA_VERSION,
             "batch_id": batch_id,
@@ -1118,8 +1284,8 @@ class TeacherStateStore:
                 "sha256": rejected_pre["sha256"],
             },
             "manifest": {
-                "existed": manifest_pre is not None,
-                "payload": manifest_pre,
+                "existed": manifest_pre_published is not None,
+                "payload": manifest_pre_published,
             },
         }
         journal_bytes = _json_bytes(journal)
@@ -1210,6 +1376,8 @@ class TeacherStateStore:
                     rejected_count=journal["rejected"]["row_count"],
                 )
             except ValueError:
+                if _is_published_manifest_v2(payload):
+                    _published_operational_manifest(payload)
                 manifest_restore = _json_bytes(payload)
             else:
                 manifest_restore = _legacy_manifest_bytes(payload)
@@ -1623,7 +1791,12 @@ class TeacherStateStore:
                 "transaction journal submitted_start does not match pre-state counts"
             )
         if manifest["existed"]:
-            payload = manifest["payload"]
+            published_payload = manifest["payload"]
+            payload = published_payload
+            if _is_published_manifest_v2(published_payload):
+                payload = _published_operational_manifest(
+                    published_payload
+                )
             try:
                 _validate_legacy_manifest(
                     payload,

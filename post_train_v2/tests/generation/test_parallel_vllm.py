@@ -23,6 +23,7 @@ from post_train_v2.src.generation.parallel_vllm import (
     split_contiguous,
     worker_main,
 )
+from post_train_v2.src.generation.vllm_client import GenerationRequest
 
 
 def prompts(count: int, start: int = 0) -> list[PositionedPrompt]:
@@ -341,15 +342,21 @@ class RecordingGenerator:
     def __init__(self, responses: list[str] | None = None, error: Exception | None = None):
         self.responses = responses
         self.error = error
-        self.calls: list[tuple[list[str], object]] = []
+        self.calls: list[tuple[list[GenerationRequest], object]] = []
 
-    def generate(self, prompt_texts: list[str], config: object) -> list[str]:
-        self.calls.append((prompt_texts, config))
+    def generate(
+        self,
+        generation_requests: list[GenerationRequest],
+        config: object,
+    ) -> list[str]:
+        self.calls.append((generation_requests, config))
         if self.error is not None:
             raise self.error
         if self.responses is not None:
             return self.responses
-        return [f"response:{prompt}" for prompt in prompt_texts]
+        return [
+            f"response:{request.prompt}" for request in generation_requests
+        ]
 
 
 def run_worker(
@@ -416,7 +423,13 @@ def test_worker_sets_environment_creates_distinct_cache_and_uses_runtime_kwargs(
         worker_index=worker_index,
         device=device,
         requests=[
-            WorkerRequest(4, tuple(prompts(2))),
+            WorkerRequest(
+                4,
+                (
+                    PositionedPrompt(0, "prompt-0", seed=101),
+                    PositionedPrompt(1, "prompt-1", seed=202),
+                ),
+            ),
             _STOP,
         ],
         generator=generator,
@@ -446,8 +459,11 @@ def test_worker_sets_environment_creates_distinct_cache_and_uses_runtime_kwargs(
         (1, "response:prompt-1"),
     )
     assert messages[1].latency_seconds >= 0.0
-    prompt_texts, config = generator.calls[0]
-    assert prompt_texts == ["prompt-0", "prompt-1"]
+    generation_requests, config = generator.calls[0]
+    assert generation_requests == [
+        GenerationRequest(prompt="prompt-0", seed=101),
+        GenerationRequest(prompt="prompt-1", seed=202),
+    ]
     assert vars(config) == {
         "max_new_tokens": 64,
         "temperature": 0.2,

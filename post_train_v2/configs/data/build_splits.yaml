@@ -1,0 +1,10 @@
+seed: 42
+source_data: post_train_v2/data/processed/solvable_train.jsonl
+source_manifest: post_train_v2/data/processed/manifest.json
+teacher_accepted: post_train_v2/data/teacher_rollouts/teacher_accepted_20k.jsonl
+teacher_manifest: post_train_v2/data/teacher_rollouts/manifest.json
+output_dir: post_train_v2/data/processed
+val_size: 200
+eval_size: 50
+sft_size: 8000
+grpo_size: 4000

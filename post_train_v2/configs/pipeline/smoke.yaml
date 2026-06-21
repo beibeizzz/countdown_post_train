@@ -1,0 +1,74 @@
+events_path: post_train_v2/outputs/pipeline/smoke/pipeline_events.jsonl
+require_runtime_gate: false
+runtime_acceptance_file:
+stages:
+  - name: build_source
+    command: [python, post_train_v2/scripts/data/build_source.py, --limit, "20"]
+    dependencies: []
+    manifest_path: post_train_v2/data/processed/source_manifest.json
+    resources: cpu
+  - name: validation_split
+    command: [python, post_train_v2/scripts/data/build_splits.py, --config, post_train_v2/configs/data/build_splits.yaml, validation]
+    dependencies: [build_source]
+    manifest_path: post_train_v2/data/processed/validation_manifest.json
+    resources: cpu
+  - name: teacher_pool
+    command: [python, post_train_v2/scripts/generation/build_teacher_pool.py, --config, post_train_v2/configs/generation/teacher_rollout_2gpu.yaml]
+    dependencies: [validation_split]
+    manifest_path: post_train_v2/data/processed/teacher_manifest.json
+    resources: gpu2_vllm
+  - name: accepted_splits
+    command: [python, post_train_v2/scripts/data/build_splits.py, --config, post_train_v2/configs/data/build_splits.yaml, accepted]
+    dependencies: [teacher_pool]
+    manifest_path: post_train_v2/data/processed/accepted_splits_manifest.json
+    resources: cpu
+  - name: full_sft
+    command: [torchrun, --standalone, --nproc_per_node=2, post_train_v2/scripts/sft/train_full.py, --config, post_train_v2/configs/sft/full.yaml]
+    dependencies: [accepted_splits]
+    manifest_path: post_train_v2/outputs/sft/full/export_manifest.json
+    resources: gpu2_ddp
+  - name: lora_sft
+    command: [torchrun, --standalone, --nproc_per_node=2, post_train_v2/scripts/sft/train_lora.py, --config, post_train_v2/configs/sft/lora.yaml]
+    dependencies: [accepted_splits]
+    manifest_path: post_train_v2/outputs/sft/lora/export_manifest.json
+    resources: gpu2_ddp
+  - name: rft_data
+    command: [python, post_train_v2/scripts/sft/build_rft_data.py, --config, post_train_v2/configs/sft/rft_rollout.yaml]
+    dependencies: [full_sft]
+    manifest_path: post_train_v2/data/processed/rft_manifest.json
+    resources: gpu2_vllm
+  - name: rft_train
+    command: [torchrun, --standalone, --nproc_per_node=2, post_train_v2/scripts/sft/train_rft.py, --config, post_train_v2/configs/sft/rft_train.yaml]
+    dependencies: [rft_data]
+    manifest_path: post_train_v2/outputs/sft/rft/export_manifest.json
+    resources: gpu2_ddp
+  - name: dpo_data
+    command: [python, post_train_v2/scripts/dpo/build_dpo_data.py, --config, post_train_v2/configs/dpo/build.yaml]
+    dependencies: [full_sft]
+    manifest_path: post_train_v2/data/processed/dpo_manifest.json
+    resources: gpu2_vllm
+  - name: dpo_train
+    command: [torchrun, --standalone, --nproc_per_node=2, post_train_v2/scripts/dpo/train_dpo.py, --config, post_train_v2/configs/dpo/train.yaml]
+    dependencies: [dpo_data]
+    manifest_path: post_train_v2/outputs/dpo/export_manifest.json
+    resources: gpu2_ddp
+  - name: grpo_convert
+    command: [python, post_train_v2/scripts/grpo/convert_to_parquet.py, --train-jsonl, post_train_v2/data/processed/grpo_train_4k.jsonl, --val-jsonl, post_train_v2/data/processed/eval_50.jsonl, --output-dir, post_train_v2/data/verl]
+    dependencies: [full_sft]
+    manifest_path: post_train_v2/data/verl/train_manifest.json
+    resources: cpu
+  - name: grpo_train
+    command: [python, post_train_v2/scripts/grpo/train_grpo.py, --config, post_train_v2/verl/configs/grpo_smoke.yaml, --max-steps, "1"]
+    dependencies: [grpo_convert]
+    manifest_path: post_train_v2/outputs/grpo/smoke/export/selection.json
+    resources: gpu2_verl
+  - name: grpo_export
+    command: [python, post_train_v2/scripts/grpo/export_grpo.py, --run-dir, post_train_v2/outputs/grpo/smoke]
+    dependencies: [grpo_train]
+    manifest_path: post_train_v2/outputs/grpo/smoke/export/export_summary.json
+    resources: cpu
+  - name: final_eval
+    command: [python, post_train_v2/scripts/eval/evaluate_matrix.py, --config, post_train_v2/configs/eval/final_matrix.yaml]
+    dependencies: [full_sft, lora_sft, rft_train, dpo_train, grpo_export]
+    manifest_path: post_train_v2/outputs/eval/final_matrix/summary.json
+    resources: cpu

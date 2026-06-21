@@ -24,12 +24,12 @@ REPO_ROOT = _find_repo_root(Path(__file__))
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from post_train.src.countdown.config import load_yaml_config, resolve_path
-from post_train.src.countdown.output_lock import OutputLock
-from post_train.src.countdown.validation import (
-    extract_answer_text,
+from post_train_v2.src.config.loading import load_yaml
+from post_train_v2.src.countdown.validation import (
+    serialize_fraction,
     validate_countdown_response,
 )
+from post_train_v2.src.generation.output_lock import OutputLock
 from post_train_v2.src.generation.parallel_vllm import (
     ParallelVLLMEngine,
     PositionedPrompt,
@@ -37,6 +37,7 @@ from post_train_v2.src.generation.parallel_vllm import (
     WorkerSpec,
     split_contiguous,
 )
+from post_train_v2.src.generation.seeding import derive_request_seed
 from post_train_v2.src.generation.teacher_state import (
     TeacherGenerationConfig,
     TeacherStateStore,
@@ -88,8 +89,8 @@ def load_teacher_config(
     *,
     repo_root: Path = REPO_ROOT,
 ) -> TeacherGenerationConfig:
-    path = resolve_path(config_path, repo_root).resolve()
-    raw = load_yaml_config(path)
+    path = _resolve_path(config_path, repo_root)
+    raw = load_yaml(path)
     missing = sorted(CONFIG_FIELDS - set(raw))
     extra = sorted(set(raw) - CONFIG_FIELDS)
     if missing or extra:
@@ -108,9 +109,9 @@ def load_teacher_config(
         raise ValueError("devices must be a list")
 
     config = TeacherGenerationConfig(
-        model_path=resolve_path(raw["model_path"], repo_root),
-        input_path=resolve_path(raw["input_path"], repo_root),
-        output_dir=resolve_path(raw["output_dir"], repo_root),
+        model_path=_resolve_path(raw["model_path"], repo_root),
+        input_path=_resolve_path(raw["input_path"], repo_root),
+        output_dir=_resolve_path(raw["output_dir"], repo_root),
         devices=tuple(devices),
         topology=raw["topology"],
         batch_size=raw["batch_size"],
@@ -128,6 +129,13 @@ def load_teacher_config(
     ).resolved()
     config.validate()
     return config
+
+
+def _resolve_path(value: str | Path, repo_root: Path) -> Path:
+    candidate = Path(value).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (repo_root / candidate).resolve()
 
 
 def validate_cuda_visibility(
@@ -242,11 +250,17 @@ def build_teacher_payload(
     return {
         **row,
         "response": text,
-        "teacher_expr": extract_answer_text(text),
         "validation": {
             "ok": result.ok,
             "error": result.error,
-            "value": result.value,
+            "value": serialize_fraction(result.value),
+            "used_numbers": result.used_numbers,
+            "expression": result.expression,
+        },
+        "provenance": {
+            "generator": "qwen3-8b-teacher",
+            "stage": "teacher",
+            "rollout_index": 0,
         },
     }
 
@@ -542,7 +556,16 @@ def _execute_locked(
             submitted_start : submitted_start + config.batch_size
         ]
         prompts = tuple(
-            PositionedPrompt(submitted_start + offset, row["prompt"])
+            PositionedPrompt(
+                submitted_start + offset,
+                row["prompt"],
+                seed=derive_request_seed(
+                    config.seed,
+                    "teacher",
+                    str(row["id"]),
+                    0,
+                ),
+            )
             for offset, row in enumerate(batch_rows)
         )
         LOGGER.info(
@@ -698,7 +721,7 @@ def run(
     now: Callable[[], datetime | str] = _default_now,
     cuda_visible_devices: str | None = None,
 ) -> int:
-    resolved_config_path = resolve_path(config_path, REPO_ROOT).resolve()
+    resolved_config_path = _resolve_path(config_path, REPO_ROOT)
     config = load_teacher_config(resolved_config_path)
     validate_cuda_visibility(config, cuda_visible_devices)
 

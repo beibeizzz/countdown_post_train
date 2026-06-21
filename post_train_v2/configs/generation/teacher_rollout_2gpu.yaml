@@ -1,6 +1,6 @@
 model_path: post_train/model/qwen/qwen3-8b
-input_path: post_train/data/processed/train_pool.jsonl
-output_dir: post_train/data/teacher_rollouts
+input_path: post_train_v2/data/processed/train_candidates.jsonl
+output_dir: post_train_v2/data/teacher_rollouts
 devices: [0, 1]
 topology: dual_tp1
 batch_size: 64
@@ -14,4 +14,4 @@ seed: 0
 enable_thinking: false
 stop_after_accepted: 20000
 cache_root: /tmp/countdown_teacher_vllm
-schema_version: 1
+schema_version: 2
