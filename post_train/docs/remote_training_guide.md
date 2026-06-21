@@ -652,3 +652,74 @@ ps -ef | grep build_teacher_pool.py | grep -v grep || true
 - DPO：pair/category 数量满足配置约束。
 - GRPO：`metrics.jsonl` 持续写入，checkpoint 和 `final/` 存在。
 - 所有模型：必须通过第 18 节的独立评估，而不是只看训练 loss。
+
+## 18. 独立评估矩阵
+
+`evaluate_model.py` 对完整模型和 LoRA adapter 使用相同的固定数据、chat
+template、256-token 上限和 solver 判定。每个模型必须使用独立输出目录。
+
+### 18.1 Base 与完整模型
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/eval/evaluate_model.py \
+  --config post_train/configs/eval.yaml \
+  --model-path post_train/model/qwen/qwen3-0.6b \
+  --output-dir post_train/data/eval/base_0_6b
+
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/eval/evaluate_model.py \
+  --config post_train/configs/eval.yaml \
+  --model-path post_train/outputs/sft/full/final \
+  --output-dir post_train/data/eval/sft_full
+
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/eval/evaluate_model.py \
+  --config post_train/configs/eval.yaml \
+  --model-path post_train/outputs/sft/rft/final \
+  --output-dir post_train/data/eval/rft
+
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/eval/evaluate_model.py \
+  --config post_train/configs/eval.yaml \
+  --model-path post_train/outputs/dpo/final \
+  --output-dir post_train/data/eval/dpo
+
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/eval/evaluate_model.py \
+  --config post_train/configs/eval.yaml \
+  --model-path post_train/outputs/grpo/final \
+  --output-dir post_train/data/eval/grpo
+```
+
+如果某个可选阶段尚未生成 `final/`，跳过该命令并在实验记录中标记为未训练，
+不要把缺失模型记录为 accuracy 0。
+
+### 18.2 LoRA adapter
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/eval/evaluate_model.py \
+  --config post_train/configs/eval.yaml \
+  --model-path post_train/outputs/sft/lora/final \
+  --base-model-path post_train/model/qwen/qwen3-0.6b \
+  --output-dir post_train/data/eval/sft_lora
+```
+
+评估器通过 `adapter_config.json` 自动识别 LoRA。如果 adapter metadata 中没有
+可用 base model 路径，必须显式传入 `--base-model-path`。
+
+### 18.3 快速 smoke 与输出解释
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/eval/evaluate_model.py \
+  --config post_train/configs/eval.yaml \
+  --model-path post_train/outputs/sft/full/final \
+  --output-dir /tmp/post_train_smoke/eval/sft_full \
+  --limit 10
+```
+
+每个输出目录包含：
+
+- `eval_samples.jsonl`：prompt、完整 response、提取表达式、格式、correctness、
+  token 数和截断状态；
+- `eval_metrics.json`：`accuracy`、`format_rate`、
+  `valid_expression_rate`、`avg_generated_tokens`、
+  `max_generated_tokens` 和 `truncated_count`。
+
+比较模型时优先看 accuracy，其次看 format rate、截断数量和平均输出长度。不能
+只比较 Trainer loss。
