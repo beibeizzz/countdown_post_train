@@ -1,0 +1,1 @@
+{"id": "a", "prompt": "Use 1 and 2 to make 3.", "numbers": [1, 2], "target": 3, "source_index": 7, "gold_expr": "1+2", "bucket": "hard", "response": "<answer>1+2</answer>"}

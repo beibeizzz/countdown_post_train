@@ -1,0 +1,119 @@
+{
+  "schema_version": 2,
+  "artifact_type": "partial_teacher_pool",
+  "stage": "teacher_accepted_pool",
+  "artifact_id": "d923443bf74f3c82f17441a093e6cfab81b35a0703dc212a4660610bfc04e29a",
+  "created_at": "2026-06-21T12:07:21.878634Z",
+  "files": [
+    {
+      "relative_path": "teacher_accepted_20k.jsonl",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "byte_size": 0,
+      "row_count": 0,
+      "field_schema": {
+        "bucket": "object",
+        "gold_expr": "string",
+        "id": "string",
+        "numbers": "array[integer]",
+        "prompt": "string",
+        "provenance": "object",
+        "response": "string",
+        "source_index": "integer",
+        "target": "integer",
+        "validation": "object"
+      }
+    },
+    {
+      "relative_path": "teacher_rejected.jsonl",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "byte_size": 0,
+      "row_count": 0,
+      "field_schema": {
+        "record_type": "countdown_teacher_rejection"
+      }
+    }
+  ],
+  "parents": [
+    {
+      "artifact_id": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "config": {
+    "batch_size": 64,
+    "enable_thinking": false,
+    "max_model_len": 512,
+    "max_new_tokens": 256,
+    "model_path": "C:\\Users\\north\\Desktop\\post_train\\.pytest_tmp_postmerge_v2_elevated_20260621\\test_preexisting_empty_snapsho0\\model",
+    "schema_version": 1,
+    "seed": 0,
+    "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "temperature": 0.2,
+    "top_p": 0.95,
+    "topology": "dual_tp1"
+  },
+  "config_sha256": "a21f82855d141bb3e305d7eea2c6c56baa4b4cd6b4f2c8062392fc5148cb1dcb",
+  "model_path": "C:\\Users\\north\\Desktop\\post_train\\.pytest_tmp_postmerge_v2_elevated_20260621\\test_preexisting_empty_snapsho0\\model",
+  "model_fingerprint": null,
+  "global_seed": 0,
+  "seed_derivation_version": "sha256-v1",
+  "git_revision": "42922c037fb8908fab0ed2b54af23216d1c6d452",
+  "runtime_versions": {},
+  "stage_metadata": {
+    "accepted_count": 0,
+    "completed": false,
+    "processed_count": 0,
+    "rejected_count": 0,
+    "target_accepted_count": 1,
+    "teacher_state": {
+      "accepted_count": 0,
+      "accepted_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "batch_size": 64,
+      "cache_roots": [
+        "C:\\Users\\north\\Desktop\\post_train\\.pytest_tmp_postmerge_v2_elevated_20260621\\test_preexisting_empty_snapsho0\\cache\\gpu0",
+        "C:\\Users\\north\\Desktop\\post_train\\.pytest_tmp_postmerge_v2_elevated_20260621\\test_preexisting_empty_snapsho0\\cache\\gpu1"
+      ],
+      "completed": false,
+      "created_at": "2026-06-21T12:07:21.878634+00:00",
+      "devices": [
+        0,
+        1
+      ],
+      "enable_thinking": false,
+      "generation_contract": {
+        "batch_size": 64,
+        "enable_thinking": false,
+        "max_model_len": 512,
+        "max_new_tokens": 256,
+        "model_path": "C:\\Users\\north\\Desktop\\post_train\\.pytest_tmp_postmerge_v2_elevated_20260621\\test_preexisting_empty_snapsho0\\model",
+        "schema_version": 1,
+        "seed": 0,
+        "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "temperature": 0.2,
+        "top_p": 0.95,
+        "topology": "dual_tp1"
+      },
+      "generation_contract_fingerprint": "a21f82855d141bb3e305d7eea2c6c56baa4b4cd6b4f2c8062392fc5148cb1dcb",
+      "gpu_memory_utilization": 0.8,
+      "last_committed_position": null,
+      "max_model_len": 512,
+      "max_new_tokens": 256,
+      "max_worker_batch_size": 32,
+      "model_path": "C:\\Users\\north\\Desktop\\post_train\\.pytest_tmp_postmerge_v2_elevated_20260621\\test_preexisting_empty_snapsho0\\model",
+      "processed_count": 0,
+      "rejected_count": 0,
+      "rejected_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "schema_version": 1,
+      "seed": 0,
+      "source_path": "C:\\Users\\north\\Desktop\\post_train\\.pytest_tmp_postmerge_v2_elevated_20260621\\test_preexisting_empty_snapsho0\\source.jsonl",
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stage": "teacher_accepted_pool",
+      "target_accepted_count": 1,
+      "temperature": 0.2,
+      "top_p": 0.95,
+      "topology": "dual_tp1",
+      "updated_at": "2026-06-21T12:07:21.878635+00:00",
+      "worker_timeout_seconds": 600.0
+    }
+  }
+}

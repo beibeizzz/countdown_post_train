@@ -1,0 +1,1 @@
+{"id": "row-0", "numbers": [1, 2], "target": 3, "prompt": "Solve it", "response": "", "validation": {"ok": false, "error": "missing_answer_tag", "value": null, "used_numbers": [], "expression": null}, "provenance": {"generator": "qwen3-8b-teacher", "stage": "teacher", "rollout_index": 0}}

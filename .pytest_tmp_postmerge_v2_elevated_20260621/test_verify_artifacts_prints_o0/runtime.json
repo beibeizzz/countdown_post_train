@@ -1,0 +1,1 @@
+{"artifacts": {"vllm": {"filename": "vllm.whl", "url": "https://example.invalid/test.whl", "sha256": "0e78bcf4caa0212b0112a5585a1855eb260a2020140df952814d6ecde95ebaf0"}, "flash-attn": {"filename": "flash_attn.whl", "url": "https://example.invalid/test.whl", "sha256": "56af835d4fea68b3832d8321b5a63bb671c71908dd132d849a8b0d9eb9ed8fdd"}}}

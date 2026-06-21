@@ -1,0 +1,1 @@
+{"schema_version": 1, "pid": 2222, "hostname": "local-host", "started_at": "2026-06-13T00:00:00+00:00", "config_path": "C:\\Users\\north\\Desktop\\post_train\\.pytest_tmp_postmerge_legacy_elevated_20260621\\test_acquire_refuses_structura12\\config.yaml", "output_dir": "", "topology": "dual_gpu_teacher", "owner_token": "other"}

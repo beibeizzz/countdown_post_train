@@ -1,0 +1,2 @@
+{"step": 100, "metrics": {"accuracy": 0.5, "format_rate": 0.9}}
+{"step": 200, "metrics": {"accuracy": 0.6, "format_rate": 0.8}}

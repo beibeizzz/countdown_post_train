@@ -1,0 +1,3 @@
+{"id": "b", "numbers": [2, 2], "target": 4, "response": "<answer>2-2</answer>"}
+{"id": "c", "numbers": [3, 2], "target": 5, "response": "<answer>3-2</answer>"}
+{"id": "d", "numbers": [4, 2], "target": 6, "response": "<answer>4-2</answer>"}

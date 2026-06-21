@@ -1,0 +1,1 @@
+{"correct":true,"error":null,"extracted_expr":"1+1","format_ok":true,"generated_tokens":3,"id":"row-1","prompt":"q","raw_generation":"<answer>1+1</answer>","truncated":false,"valid_expression":true,"value":"2"}

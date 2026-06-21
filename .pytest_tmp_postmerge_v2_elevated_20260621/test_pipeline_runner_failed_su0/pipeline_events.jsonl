@@ -1,0 +1,1 @@
+{"command":["python","fail.py"],"decision":"run","end_time":"2026-06-21T12:07:31.502856Z","exit_code":7,"input_manifest_hashes":[],"output_manifest_sha256":null,"reason":"manifest missing","resources":"cpu","stage":"build_source","start_time":"2026-06-21T12:07:31.502848Z"}
