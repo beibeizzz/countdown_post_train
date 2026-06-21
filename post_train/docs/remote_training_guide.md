@@ -262,3 +262,393 @@ PY
 - 套用 `post_train_v2/` 的固定版本锁；
 - 为了绕过 gate 而移除 Flash Attention 2；
 - 把双 GPU/NCCL 作为旧版项目的前置条件。
+
+## 7. 正式运行前检查
+
+### 7.1 模型和原始数据
+
+`post_train/configs/data_build.yaml` 的原始数据位于仓库根目录 `datasets/`，
+不是 `post_train/data/`：
+
+```bash
+test -f datasets/raw_train.parquet
+test -f datasets/raw_test.json
+test -f post_train/model/qwen/qwen3-0.6b/config.json
+test -f post_train/model/qwen/qwen3-8b/config.json
+
+du -sh datasets post_train/model/qwen/qwen3-0.6b post_train/model/qwen/qwen3-8b
+df -h .
+nvidia-smi
+ps -ef | grep -E 'python|vllm' | grep -v grep || true
+```
+
+任一 `test -f` 失败时先修复路径，不要启动训练。进入新阶段前确保没有上一个
+vLLM/Trainer 进程继续占用 GPU。
+
+### 7.2 配置快照
+
+```bash
+RUN_TAG=$(date +%Y%m%d-%H%M%S)
+mkdir -p post_train/outputs/run_configs/$RUN_TAG
+cp post_train/configs/*.yaml post_train/outputs/run_configs/$RUN_TAG/
+echo $RUN_TAG
+```
+
+重点检查：模型路径、训练数据、输出目录、`max_new_tokens`、batch size、
+gradient accumulation、W&B 开关以及所有 `enable_thinking: false`。
+
+## 8. 构造 solver-backed 基础数据
+
+### 8.1 隔离 smoke
+
+`build_source.py` 支持 `--limit`，并允许通过复制配置改变输出目录：
+
+```bash
+mkdir -p /tmp/post_train_smoke/configs /tmp/post_train_smoke/data/processed
+python - <<'PY'
+from pathlib import Path
+import yaml
+
+config = yaml.safe_load(Path(post_train/configs/data_build.yaml).read_text())
+config[output_dir] = /tmp/post_train_smoke/data/processed
+Path(/tmp/post_train_smoke/configs/data_build.yaml).write_text(
+    yaml.safe_dump(config, sort_keys=False)
+)
+PY
+python post_train/scripts/data/build_source.py \
+  --config /tmp/post_train_smoke/configs/data_build.yaml \
+  --limit 100
+wc -l /tmp/post_train_smoke/data/processed/*.jsonl
+python -m json.tool /tmp/post_train_smoke/data/processed/manifest.json | head -n 80
+```
+
+### 8.2 正式构造
+
+```bash
+python post_train/scripts/data/build_source.py \
+  --config post_train/configs/data_build.yaml
+```
+
+| 文件 | 用途 |
+| --- | --- |
+| `post_train/data/processed/source_all.jsonl` | 所有 solver-backed 规范样本 |
+| `train_pool.jsonl` | 排除固定验证集后的 Teacher 候选池 |
+| `val_200.jsonl` | 固定 200 条验证集 |
+| `val_eval_50.jsonl` | 每 100 optimizer steps 使用的固定 50 条 |
+| `test_with_solver_answers.jsonl` | solver 补全答案的测试集 |
+| `unsolved_train.jsonl` | solver 未找到答案的原始训练样本 |
+| `manifest.json` | 数据计数、配置和 schema 信息 |
+
+`train_source.jsonl`、`val.jsonl`、`eval_subset.jsonl` 和 `test.jsonl` 是兼容
+别名。
+
+```bash
+wc -l \
+  post_train/data/processed/train_pool.jsonl \
+  post_train/data/processed/val_200.jsonl \
+  post_train/data/processed/val_eval_50.jsonl \
+  post_train/data/processed/test_with_solver_answers.jsonl
+python -m json.tool post_train/data/processed/manifest.json | head -n 100
+```
+
+## 9. 构造 Teacher accepted pool
+
+这一阶段使用 Qwen3-8B、单个 TP=1 vLLM 引擎，按输入顺序 rollout 一次，直到
+累计 20,000 条正确样本。
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+python post_train/scripts/data/build_teacher_pool.py \
+  --config post_train/configs/teacher_rollout.yaml
+```
+
+输出固定在：
+
+- `post_train/data/teacher_rollouts/teacher_accepted_20k.jsonl`
+- `post_train/data/teacher_rollouts/teacher_rejected.jsonl`
+- `post_train/data/teacher_rollouts/manifest.json`
+
+脚本支持从 accepted/rejected 文件继续处理尚未出现的输入 ID，并使用
+`.teacher_pool.lock` 防止并发写入。只有确认锁对应进程已经不存在时才使用：
+
+```bash
+python post_train/scripts/data/build_teacher_pool.py \
+  --config post_train/configs/teacher_rollout.yaml \
+  --recover-stale-lock
+```
+
+不要把 `post_train_v2` Teacher 产物复制到该目录。旧版入口会拒绝 V2-owned
+manifest 或 transaction marker。Teacher 脚本没有 `--limit` 或可配置输出目录，
+因此不要用正式目录做短 smoke；使用第 5 节的 vLLM gate 代替。
+
+```bash
+wc -l post_train/data/teacher_rollouts/teacher_accepted_20k.jsonl
+python -m json.tool post_train/data/teacher_rollouts/manifest.json | head -n 120
+```
+
+## 10. 构造 SFT 8k 和 GRPO 4k
+
+前置条件是 accepted pool 至少包含 8,000 条样本：
+
+```bash
+python post_train/scripts/data/build_sft_splits.py \
+  --config post_train/configs/data_build.yaml
+```
+
+输出：
+
+- `post_train/data/sft/sft_train_8k.jsonl`
+- `post_train/data/grpo/grpo_train_4k.jsonl`
+- `post_train/data/sft/manifest.json`
+
+```bash
+wc -l \
+  post_train/data/sft/sft_train_8k.jsonl \
+  post_train/data/grpo/grpo_train_4k.jsonl
+python -m json.tool post_train/data/sft/manifest.json
+```
+
+该脚本的输出目录是代码常量，没有隔离 smoke 输出参数。不要使用小 accepted
+文件覆盖正式 split；先完成 accepted pool，再执行一次正式分层采样。
+
+## 11. Full SFT
+
+Full SFT 对 Qwen3-0.6B 做 response 全量监督，包括 Teacher response 中可能存在的
+有用推理。最大序列长度为 256，模型加载强制 Flash Attention 2 和 BF16。
+
+### 11.1 隔离两步 smoke
+
+```bash
+mkdir -p /tmp/post_train_smoke/configs /tmp/post_train_smoke/outputs/sft/full
+python - <<'PY'
+from pathlib import Path
+import yaml
+
+config = yaml.safe_load(Path(post_train/configs/sft_full.yaml).read_text())
+config[output_dir] = /tmp/post_train_smoke/outputs/sft/full
+config[report_to] = None
+Path(/tmp/post_train_smoke/configs/sft_full.yaml).write_text(
+    yaml.safe_dump(config, sort_keys=False)
+)
+PY
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/sft/train_full.py \
+  --config /tmp/post_train_smoke/configs/sft_full.yaml \
+  --max-steps 2
+```
+
+### 11.2 正式训练
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/sft/train_full.py \
+  --config post_train/configs/sft_full.yaml
+```
+
+主要产物：
+
+- `post_train/outputs/sft/full/checkpoint-*`
+- `post_train/outputs/sft/full/eval/step_*`
+- `post_train/outputs/sft/full/final/`
+
+`final/` 是可直接由 `AutoModelForCausalLM.from_pretrained()` 加载的完整模型。
+
+## 12. LoRA SFT
+
+```bash
+mkdir -p /tmp/post_train_smoke/configs /tmp/post_train_smoke/outputs/sft/lora
+python - <<'PY'
+from pathlib import Path
+import yaml
+
+config = yaml.safe_load(Path(post_train/configs/sft_lora.yaml).read_text())
+config[output_dir] = /tmp/post_train_smoke/outputs/sft/lora
+config[report_to] = None
+Path(/tmp/post_train_smoke/configs/sft_lora.yaml).write_text(
+    yaml.safe_dump(config, sort_keys=False)
+)
+PY
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/sft/train_lora.py \
+  --config /tmp/post_train_smoke/configs/sft_lora.yaml \
+  --max-steps 2
+
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/sft/train_lora.py \
+  --config post_train/configs/sft_lora.yaml
+```
+
+LoRA 的 `final/` 是 adapter，不是独立完整模型。评估时需要 adapter config 中的
+base model 路径，或显式传 `--base-model-path`。
+
+## 13. RFT
+
+RFT 分两步：先多次 rollout 并保留正确 response，再复用 Full SFT trainer 训练。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/sft/build_rft_data.py \
+  --config post_train/configs/rft.yaml
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/sft/train_rft.py \
+  --config post_train/configs/rft.yaml
+```
+
+当前 `rft.yaml` 的 `base_model_path` 是本地 Qwen3-8B。运行前必须确认这符合当前
+实验意图；如果目标是用 Full SFT 0.6B 做拒绝采样，应复制配置后显式改为
+`post_train/outputs/sft/full/final`。本文不静默修改默认 YAML。
+
+安全 smoke 必须同时改写 `accepted_output` 和 `output_dir`：
+
+```bash
+mkdir -p /tmp/post_train_smoke/data /tmp/post_train_smoke/outputs/sft/rft
+python - <<'PY'
+from pathlib import Path
+import yaml
+
+config = yaml.safe_load(Path(post_train/configs/rft.yaml).read_text())
+config[accepted_output] = /tmp/post_train_smoke/data/rft_accepted.jsonl
+config[output_dir] = /tmp/post_train_smoke/outputs/sft/rft
+config[train][report_to] = None
+Path(/tmp/post_train_smoke/configs/rft.yaml).write_text(
+    yaml.safe_dump(config, sort_keys=False)
+)
+PY
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/sft/build_rft_data.py \
+  --config /tmp/post_train_smoke/configs/rft.yaml \
+  --limit 8
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/sft/train_rft.py \
+  --config /tmp/post_train_smoke/configs/rft.yaml \
+  --max-steps 2
+```
+
+## 14. DPO
+
+DPO 数据构造使用 Qwen3-8B，为 SFT chosen response 生成 forced-wrong 和高温
+rollout rejected，并按五类错误过滤，目标约 6,000 对。
+
+### 14.1 隔离 smoke
+
+```bash
+mkdir -p /tmp/post_train_smoke/data/dpo /tmp/post_train_smoke/outputs/dpo
+python - <<'PY'
+from pathlib import Path
+import yaml
+
+data = yaml.safe_load(Path(post_train/configs/dpo_data.yaml).read_text())
+data[output_dir] = /tmp/post_train_smoke/data/dpo
+Path(/tmp/post_train_smoke/configs/dpo_data.yaml).write_text(
+    yaml.safe_dump(data, sort_keys=False)
+)
+
+train = yaml.safe_load(Path(post_train/configs/dpo_train.yaml).read_text())
+train[train_data] = /tmp/post_train_smoke/data/dpo/dpo_train.jsonl
+train[output_dir] = /tmp/post_train_smoke/outputs/dpo
+train[report_to] = None
+Path(/tmp/post_train_smoke/configs/dpo_train.yaml).write_text(
+    yaml.safe_dump(train, sort_keys=False)
+)
+PY
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/dpo/build_dpo_data.py \
+  --config /tmp/post_train_smoke/configs/dpo_data.yaml \
+  --limit 8
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/dpo/train_dpo.py \
+  --config /tmp/post_train_smoke/configs/dpo_train.yaml \
+  --max-steps 2
+```
+
+如果 8 条 chosen 无法产生可训练 pair，应增大 `--limit`，不要降低 correctness
+过滤标准。
+
+### 14.2 正式 DPO
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/dpo/build_dpo_data.py \
+  --config post_train/configs/dpo_data.yaml
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/dpo/train_dpo.py \
+  --config post_train/configs/dpo_train.yaml
+```
+
+数据输出位于 `post_train/data/dpo/`，模型输出位于
+`post_train/outputs/dpo/`。
+
+## 15. Legacy GRPO
+
+当前 GRPO 不是 verl/FSDP 实现。它在同一 Python 进程中加载一个可训练的
+Qwen3-0.6B Transformers 模型和一个 `tensor_parallel_size=1` 的 vLLM rollout
+模型。两者共享唯一可见 GPU，因此运行前必须清空残留进程并检查显存。
+
+默认 `kl_coeff=0.0`、每个 prompt rollout 4 条、每次 rollout 更新 policy 两次、
+每 20 步同步/保存、每 100 步固定评估。
+
+### 15.1 隔离两步 smoke
+
+```bash
+python - <<'PY'
+from pathlib import Path
+import yaml
+
+config = yaml.safe_load(Path(post_train/configs/grpo.yaml).read_text())
+config[output_dir] = /tmp/post_train_smoke/outputs/grpo
+config[report_to] = None
+Path(/tmp/post_train_smoke/configs/grpo.yaml).write_text(
+    yaml.safe_dump(config, sort_keys=False)
+)
+PY
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/grpo/train_grpo.py \
+  --config /tmp/post_train_smoke/configs/grpo.yaml \
+  --max-steps 2
+```
+
+### 15.2 正式训练
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python post_train/scripts/grpo/train_grpo.py \
+  --config post_train/configs/grpo.yaml
+```
+
+```bash
+tail -n 5 post_train/outputs/grpo/metrics.jsonl
+find post_train/outputs/grpo -maxdepth 2 -type d -name 'checkpoint-*'
+test -d post_train/outputs/grpo/final
+```
+
+指标包括 reward、accuracy、format、loss、KL、response length、截断数和 group
+reward 标准差。`compute_entropy: false` 时不会计算 entropy。
+
+## 16. W&B 监控
+
+默认 `report_to: null`，不会创建 W&B run。需要启用时：
+
+```bash
+python -c "import wandb; print(wandb.__version__)"
+wandb login
+```
+
+在对应配置中设置 `report_to: wandb`、项目、分组、run name 和
+`logging_steps`。Full/LoRA/RFT/DPO 使用 Trainer 集成；legacy GRPO 每步保留
+本地 `metrics.jsonl`，并在启用时同步到 W&B。离线 evaluator 不上传 W&B。
+
+## 17. 恢复和阶段验收
+
+### 17.1 Trainer checkpoint
+
+```bash
+find post_train/outputs -maxdepth 4 -type d -name 'checkpoint-*' | sort
+```
+
+当前训练 CLI 没有公开 `--resume-from-checkpoint` 参数。不要假定 Trainer 会自动
+选择 checkpoint；恢复正式训练前先核对脚本行为和目标输出目录，避免覆盖已有
+结果。
+
+### 17.2 Teacher lock
+
+```bash
+ls -la post_train/data/teacher_rollouts
+ps -ef | grep build_teacher_pool.py | grep -v grep || true
+```
+
+只有锁对应进程不存在时才使用 `--recover-stale-lock`。
+
+### 17.3 每阶段完成条件
+
+- 数据阶段：目标 JSONL 行数合理，manifest 可解析。
+- Teacher：accepted 达到 20,000，manifest 记录 completed 状态。
+- Trainer：`final/config.json` 或 adapter config 存在，固定评估目录可读。
+- DPO：pair/category 数量满足配置约束。
+- GRPO：`metrics.jsonl` 持续写入，checkpoint 和 `final/` 存在。
+- 所有模型：必须通过第 18 节的独立评估，而不是只看训练 loss。
