@@ -19,6 +19,11 @@ SFT_OUTPUT_DIR = "post_train/data/sft"
 GRPO_OUTPUT_DIR = "post_train/data/grpo"
 SFT_FILENAME = "sft_train_8k.jsonl"
 GRPO_FILENAME = "grpo_train_4k.jsonl"
+# Smaller SFT split used as the prompt source for RFT rollout generation
+# (post_train/scripts/sft/build_rft_data.py). RFT samples 4 rollouts per
+# prompt, so a 2000-prompt subset yields ~8000 rollouts instead of 32k.
+RFT_FILENAME = "sft_train_2k.jsonl"
+RFT_PROMPTS_TARGET = 2000
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +63,11 @@ def main() -> None:
 
     write_jsonl(sft_output_dir / SFT_FILENAME, sft_rows)
     write_jsonl(grpo_output_dir / GRPO_FILENAME, grpo_rows)
+
+    rft_target = int(cfg.get("rft_prompts_target", RFT_PROMPTS_TARGET))
+    require_pool_size(len(accepted_rows), rft_target, "RFT prompt split")
+    rft_rows = stratified_sample(accepted_rows, size=rft_target, seed=seed + 30)
+    write_jsonl(sft_output_dir / RFT_FILENAME, rft_rows)
     write_manifest(
         sft_output_dir / "manifest.json",
         {
@@ -65,6 +75,7 @@ def main() -> None:
             "num_accepted_pool": len(accepted_rows),
             "num_sft": len(sft_rows),
             "num_grpo": len(grpo_rows),
+            "num_rft_prompts": len(rft_rows),
             "seed": seed,
         },
     )

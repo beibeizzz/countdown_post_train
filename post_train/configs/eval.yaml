@@ -1,8 +1,11 @@
 val_data: post_train/data/processed/val_200.jsonl
 eval_subset: post_train/data/processed/val_eval_50.jsonl
 test_data: post_train/data/processed/test_with_solver_answers.jsonl
-max_new_tokens: 256
+max_new_tokens: 1024
 temperature: 0.0
 top_p: 1.0
-batch_size: 32
+# Inference batch size consumed by evaluate_model.py's batched generate path.
+# 32 fits comfortably on a 4090 for a 0.6B model at max_new_tokens=512; the prior
+# value of 128 was a dead config (never read) when eval ran serially.
+batch_size: 256
 enable_thinking: false

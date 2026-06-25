@@ -1,0 +1,8 @@
+{
+  "accuracy": 0.246,
+  "format_rate": 0.474,
+  "valid_expression_rate": 0.246,
+  "avg_generated_tokens": 653.9,
+  "max_generated_tokens": 1024,
+  "truncated_count": 263
+}

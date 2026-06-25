@@ -1,0 +1,12 @@
+{
+  "manifest_version": 1,
+  "schema": "countdown.post_train.manifest.v1",
+  "name": "sft_and_grpo_splits",
+  "stage": "sft_and_grpo_splits",
+  "created_at": "2026-06-25T07:42:12.229348+00:00",
+  "num_accepted_pool": 20000,
+  "num_sft": 8000,
+  "num_grpo": 4000,
+  "num_rft_prompts": 2000,
+  "seed": 42
+}

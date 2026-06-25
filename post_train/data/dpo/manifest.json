@@ -1,0 +1,45 @@
+{
+  "manifest_version": 1,
+  "schema": "countdown.post_train.manifest.v1",
+  "name": "dpo_data",
+  "stage": "dpo_data",
+  "created_at": "2026-06-25T10:02:39.599861+00:00",
+  "category_counts": {
+    "invalid_expression": 816,
+    "number_mismatch": 83,
+    "truncated": 645,
+    "unexpected_correct": 9050,
+    "wrong_value": 1406
+  },
+  "route_counts": {
+    "forced_wrong": 6000,
+    "high_temp": 6000
+  },
+  "eligible_category_counts": {
+    "invalid_expression": 816,
+    "number_mismatch": 83,
+    "truncated": 645,
+    "wrong_value": 1406
+  },
+  "pair_category_counts": {
+    "invalid_expression": 400,
+    "number_mismatch": 83,
+    "wrong_value": 1406
+  },
+  "num_chosen_input": 8000,
+  "num_candidates": 12000,
+  "num_eligible_candidates": 2950,
+  "num_pairs": 1889,
+  "target_pairs": 4000,
+  "pair_shortfall": 2111,
+  "malformed_fraction": 0.21175224986765484,
+  "wrong_value_fraction": 0.7443091582848068,
+  "wrong_value_min_satisfied": true,
+  "wrong_value_shortfall": 0,
+  "preferred_wrong_value_min_fraction": 0.7,
+  "malformed_cap_fraction": 0.1,
+  "candidate_oversample_factor": 3.0,
+  "model": "/root/autodl-tmp/post_train/countdown_post_train/post_train/model/qwen/qwen3-8b",
+  "max_new_tokens": 1024,
+  "enable_thinking": false
+}

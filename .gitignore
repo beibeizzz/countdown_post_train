@@ -1,4 +1,45 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.pytest_tmp/
+.pytest_tmp_
+
+# Base model weights (symlinks point outside the repo; never commit).
+post_train/model/
+
+# Trained model weights / checkpoints (GB-scale safetensors). Keep eval
+# results, metrics, and READMEs under outputs/ but drop weight artifacts.
+post_train/outputs/**/final/
+post_train/outputs/**/checkpoint-*/
+post_train/outputs/**/rollout_sync/
+*.safetensors
+*.bin
+*.pt
+*.gguf
+
+# Teacher/RFT/DPO rollout data files are large generated artifacts; keep
+# manifests and processed splits but not the raw multi-GB rollout dumps.
+post_train/data/teacher_rollouts/teacher_accepted_20k.jsonl
+post_train/data/teacher_rollouts/teacher_rejected.jsonl
+post_train/data/teacher_rollouts/.teacher_pool.lock.guard
+post_train/data/teacher_rollouts_256/teacher_accepted_20k.jsonl
+post_train/data/teacher_rollouts_256/teacher_rejected.jsonl
+post_train/data/teacher_rollouts_256/.teacher_pool.lock.guard
+post_train/data/sft/rft_accepted.jsonl
+post_train/data/sft/rft_rejected.jsonl
+post_train/data/dpo/dpo_train.jsonl
+post_train/data/dpo/dpo_rejected_candidates.jsonl
+
+# Large intermediate source pools regenerated from datasets/ by build_source.py.
+# Keep the small val/test/eval splits and manifests; drop the multi-MB pools.
+post_train/data/processed/source_all.jsonl
+post_train/data/processed/train_pool.jsonl
+post_train/data/processed/train_source.jsonl
+post_train/data/processed/unsolved_train.jsonl
+post_train/data/sft/sft_train_8k.jsonl
+
+# Local env
+.venv/
+.env
+
+# Jupyter temp checkpoints
+.ipynb_checkpoints/

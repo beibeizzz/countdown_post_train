@@ -165,11 +165,18 @@ def build_eval_callback(
 ):
     from transformers import TrainerCallback
 
-    from post_train.scripts.eval.evaluate_model import evaluate_rows
+    from post_train.scripts.eval.evaluate_model import evaluate_rows_batched
     from post_train.src.countdown.eval import aggregate_eval_rows
 
     eval_subset_path = resolve_path(eval_cfg["eval_subset"], REPO_ROOT)
     eval_rows = read_jsonl(eval_subset_path)
+
+    # Use the batched generate path: same scoring as evaluate_rows (left-padded
+    # so each prompt's continuation starts at the right column) but many prompts
+    # per forward pass. The serial evaluate_rows was the bottleneck that made
+    # periodic in-training eval slow. Batch size falls back to cfg["batch_size"]
+    # (eval.yaml) then 32.
+    eval_batch_size = int(eval_cfg.get("batch_size", 32))
 
     class CountdownEvalCallback(TrainerCallback):
         def on_step_end(self, args, state, control, **kwargs):
@@ -185,7 +192,7 @@ def build_eval_callback(
             was_training = model.training
             model.eval()
 
-            scored_rows = evaluate_rows(eval_rows, tokenizer, model, eval_cfg)
+            scored_rows = evaluate_rows_batched(eval_rows, tokenizer, model, eval_cfg, batch_size=eval_batch_size)
             metrics = aggregate_eval_rows(scored_rows)
 
             step_dir = output_dir / "eval" / f"step_{state.global_step}"

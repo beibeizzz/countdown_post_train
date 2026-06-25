@@ -38,20 +38,62 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def length_penalty_value(
+    token_count: int | None,
+    max_new_tokens: int,
+    penalty_start: int,
+    penalty_max: float,
+) -> float:
+    """Linear length soft penalty in [0, penalty_max] (penalty_max < 0).
+
+    Ramp starts at penalty_start tokens and reaches penalty_max exactly at the
+    max_new_tokens hard cap. Below penalty_start the penalty is 0; above the cap
+    (truncated sequences whose token_count is at/over max_new_tokens) it is
+    clamped to penalty_max. Returns 0.0 when token_count is unavailable so a
+    missing metadata field cannot silently turn the penalty into an error.
+    """
+    if penalty_max >= 0:
+        return 0.0
+    if token_count is None:
+        return 0.0
+    if penalty_start >= max_new_tokens:
+        return 0.0
+    if token_count <= penalty_start:
+        return 0.0
+    if token_count >= max_new_tokens:
+        return penalty_max
+    progress = (token_count - penalty_start) / (max_new_tokens - penalty_start)
+    return penalty_max * progress
+
+
 def compute_rewards(
     rows: list[dict],
     completions: list[str],
     format_reward: float,
     answer_reward: float,
+    token_counts: list[int | None],
+    max_new_tokens: int,
+    length_penalty_start: float,
+    length_penalty_max: float,
 ) -> list[dict]:
     if len(rows) != len(completions):
         raise ValueError("rows and completions must have the same length")
+    if len(token_counts) != len(completions):
+        raise ValueError("token_counts and completions must have the same length")
 
     rewarded_rows: list[dict] = []
-    for row, completion in zip(rows, completions, strict=True):
+    for row, completion, token_count in zip(rows, completions, token_counts, strict=True):
         result = validate_countdown_response(completion, row["numbers"], int(row["target"]))
         has_format = extract_answer_text(completion) is not None
         reward = (format_reward if has_format else 0.0) + (answer_reward if result.ok else 0.0)
+        # Length soft penalty: linear ramp from length_penalty_start to max_new_tokens.
+        # Applied to every rollout so conciseness is rewarded before the hard cap.
+        reward += length_penalty_value(
+            token_count,
+            max_new_tokens,
+            int(length_penalty_start),
+            float(length_penalty_max),
+        )
         rewarded_rows.append(
             {
                 **row,
@@ -194,11 +236,17 @@ def rollout_batch(
         generation_config,
     )
     completions = [str(metadata.get("text", "")).strip() for metadata in metadata_rows]
+    token_counts = [metadata.get("token_count") for metadata in metadata_rows]
+    max_new_tokens = int(cfg["max_new_tokens"])
     rewarded_rows = compute_rewards(
         rollout_rows,
         completions,
         format_reward=float(cfg["format_reward"]),
         answer_reward=float(cfg["answer_reward"]),
+        token_counts=token_counts,
+        max_new_tokens=max_new_tokens,
+        length_penalty_start=float(cfg["length_penalty_start"]),
+        length_penalty_max=float(cfg["length_penalty_max"]),
     )
 
     for rewarded_row, metadata in zip(rewarded_rows, metadata_rows, strict=True):
@@ -270,11 +318,17 @@ def sequence_policy_loss(model, batch: dict[str, Any], advantages, compute_entro
 
     log_probs = F.log_softmax(logits, dim=-1)
     token_log_probs = log_probs.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
-    response_token_counts = response_mask.sum(dim=1).clamp_min(1)
-    sequence_log_probs = (token_log_probs * response_mask).sum(dim=1) / response_token_counts
+    # Sequence log-prob = SUM over response tokens (not per-seq mean): the GRPO
+    # advantage is sequence-level, so it multiplies the whole-trajectory log-prob.
+    sequence_log_probs = (token_log_probs * response_mask).sum(dim=1)
 
     advantage_tensor = torch.tensor(advantages, dtype=sequence_log_probs.dtype, device=sequence_log_probs.device)
-    loss = -(sequence_log_probs * advantage_tensor).mean()
+    # Global normalization by the total number of response tokens in the batch:
+    # keeps the sum semantics (length-correct credit assignment) while making the
+    # loss scale length-neutral (per-token magnitude) and numerically stable under
+    # bf16, instead of letting long sequences dominate via larger raw sums.
+    total_response_tokens = response_mask.sum().clamp_min(1).to(sequence_log_probs.dtype)
+    loss = -((sequence_log_probs * advantage_tensor).sum() / total_response_tokens)
 
     entropy = None
     if compute_entropy:
@@ -292,6 +346,33 @@ def save_checkpoint(model, tokenizer, output_dir: Path, step: int) -> Path:
     return checkpoint_dir
 
 
+def destroy_rollout_generator(generator: VLLMGenerator) -> None:
+    """Explicitly tear down a vLLM engine and reclaim its GPU memory.
+
+    vLLM spawns an EngineCore subprocess that holds its own CUDA context; the
+    main process GC never reaches it, so without an explicit teardown the old
+    engine's ~20GB stays pinned and the next engine fails its startup memory
+    check ("Free memory on device ... less than desired GPU memory utilization").
+    """
+    if generator is None:
+        return
+    llm = getattr(generator, "llm", None)
+    if llm is None:
+        return
+    try:
+        import gc
+
+        import torch
+
+        del llm
+        generator.llm = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def sync_rollout_model(
     generator: VLLMGenerator,
     model,
@@ -299,17 +380,29 @@ def sync_rollout_model(
     output_dir: Path,
     step: int,
     tensor_parallel_size: int = 1,
+    gpu_memory_utilization: float | None = None,
+    max_model_len: int | None = None,
 ) -> VLLMGenerator:
     checkpoint_dir = save_checkpoint(model, tokenizer, output_dir / "rollout_sync", step)
     note_path = checkpoint_dir / "README.txt"
     note_path.write_text(
         "This checkpoint was written for rollout synchronization. "
-        "Live vLLM weight sync is environment-dependent; this script attempts a reload "
-        "from the saved checkpoint path when practical.\n",
+        "Live vLLM weight sync is environment-dependent; this script reloads "
+        "from the saved checkpoint path after explicitly tearing down the prior "
+        "vLLM engine so its GPU memory is reclaimed.\n",
         encoding="utf-8",
     )
+    # Tear down the old engine BEFORE constructing a new one, otherwise the new
+    # engine's startup memory check fails because the old engine's memory is
+    # still pinned by its spawned EngineCore subprocess.
+    destroy_rollout_generator(generator)
     try:
-        reloaded_generator = VLLMGenerator(str(checkpoint_dir), tensor_parallel_size=tensor_parallel_size)
+        reloaded_generator = VLLMGenerator(
+            str(checkpoint_dir),
+            tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+        )
     except Exception:
         return generator
     return reloaded_generator
@@ -341,12 +434,15 @@ def run_fixed_eval(
     eval_cfg: dict[str, Any],
     wandb_run=None,
 ) -> None:
-    from post_train.scripts.eval.evaluate_model import evaluate_rows
+    from post_train.scripts.eval.evaluate_model import evaluate_rows_batched
     from post_train.src.countdown.eval import aggregate_eval_rows
 
+    # Batched generate path: same scoring as evaluate_rows but many prompts per
+    # forward pass -- the serial path was the bottleneck for periodic eval.
+    eval_batch_size = int(eval_cfg.get("batch_size", 32))
     was_training = model.training
     model.eval()
-    scored_rows = evaluate_rows(eval_rows, tokenizer, model, eval_cfg)
+    scored_rows = evaluate_rows_batched(eval_rows, tokenizer, model, eval_cfg, batch_size=eval_batch_size)
     metrics = aggregate_eval_rows(scored_rows)
     step_dir = output_dir / "eval" / f"step_{step}"
     write_jsonl(step_dir / "eval_samples.jsonl", scored_rows)
@@ -390,9 +486,21 @@ def train_grpo(cfg: dict[str, Any], max_steps: int, model_path: Path, output_dir
         model = model.cuda()
     model.train()
 
+    rollout_gpu_memory_utilization = cfg.get("rollout_gpu_memory_utilization")
+    rollout_max_model_len = cfg.get("rollout_max_model_len")
     rollout_generator = VLLMGenerator(
         str(model_path),
         tensor_parallel_size=int(cfg.get("tensor_parallel_size", 1)),
+        gpu_memory_utilization=(
+            float(rollout_gpu_memory_utilization)
+            if rollout_gpu_memory_utilization is not None
+            else None
+        ),
+        max_model_len=(
+            int(rollout_max_model_len)
+            if rollout_max_model_len is not None
+            else None
+        ),
     )
     optimizer, scheduler = build_optimizer_and_scheduler(model, cfg, max_steps)
     generation_config = build_generation_config(cfg)
@@ -500,6 +608,16 @@ def train_grpo(cfg: dict[str, Any], max_steps: int, model_path: Path, output_dir
                         output_dir,
                         global_step,
                         tensor_parallel_size=int(cfg.get("tensor_parallel_size", 1)),
+                        gpu_memory_utilization=(
+                            float(cfg["rollout_gpu_memory_utilization"])
+                            if cfg.get("rollout_gpu_memory_utilization") is not None
+                            else None
+                        ),
+                        max_model_len=(
+                            int(cfg["rollout_max_model_len"])
+                            if cfg.get("rollout_max_model_len") is not None
+                            else None
+                        ),
                     )
 
         final_dir = output_dir / "final"

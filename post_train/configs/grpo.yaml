@@ -3,27 +3,40 @@ train_data: post_train/data/grpo/grpo_train_4k.jsonl
 val_data: post_train/data/processed/val_200.jsonl
 output_dir: post_train/outputs/grpo
 max_prompt_len: 256
-max_new_tokens: 256
+max_new_tokens: 1024
 batch_size: 4
-group_size: 4
-policy_updates_per_rollout: 2
-sync_every_steps: 20
-learning_rate: 3.0e-7
+group_size: 5
+policy_updates_per_rollout: 1
+sync_every_steps: 25
+learning_rate: 5e-6
 weight_decay: 0.0
 warmup_ratio: 0.03
 scheduler: cosine
 max_steps: 500
 clip_eps: 0.2
 kl_coeff: 0.0
-format_reward: 0.2
+format_reward: 0.5
 answer_reward: 1.0
-temperature: 1.0
+# Length soft penalty: linear ramp starting at length_penalty_start tokens,
+# reaching length_penalty_max (= -0.2) at max_new_tokens. Applied to every
+# rollout (even non-truncated) so the model is nudged toward concise answers
+# before the hard cap bites. 0 between 0..start, then linear to max at cap.
+length_penalty_start: 800
+length_penalty_max: -0.5
+temperature: 1.2
 top_p: 0.95
+# Rollout vLLM engine shares the single visible GPU with the policy model.
+# Cap its memory so policy + optimizer have room (default vLLM 0.9 OOMs on 48GB).
+# Lowered from 0.45 to 0.35: policy+optimizer sit at ~17GB, and each weight-sync
+# reloads a fresh vLLM engine; 0.45*47.4=21.3GB plus 17GB left too little headroom
+# for the new engine's KV cache + CUDA graphs at sync time.
+rollout_gpu_memory_utilization: 0.35
+rollout_max_model_len: 1024
 bf16: true
 gradient_checkpointing: true
 compute_entropy: false
-eval_every_steps: 100
-save_every_steps: 20
+eval_every_steps: 250
+save_every_steps: 500
 report_to: null
 wandb_project: countdown-post-train
 wandb_entity: null

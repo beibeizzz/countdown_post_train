@@ -1,14 +1,22 @@
 model_path: post_train/model/qwen/qwen3-8b
 chosen_data: post_train/data/sft/sft_train_8k.jsonl
 output_dir: post_train/data/dpo
-target_pairs: 6000
+target_pairs: 4000
 forced_wrong_fraction: 0.5
 high_temp_fraction: 0.5
-max_new_tokens: 256
+max_new_tokens: 1024
 forced_wrong_temperature: 0.3
 high_temp_temperature: 1.0
 top_p: 0.95
-batch_size: 64
+batch_size: 8000
 enable_thinking: false
 malformed_cap_fraction: 0.10
 preferred_wrong_value_min_fraction: 0.70
+# Generate the full oversample budget (min(target_pairs*factor, rows*routes)).
+# At target_pairs=4000, factor=3.0 -> ceil(12000) but capped at 8000*2=16000,
+# so candidate_budget=16000. Needed because qwen3-8b answers correctly ~63%
+# (unexpected_correct), so many candidates are ineligible; oversampling gives
+# enough eligible/wrong_value candidates to reach target_pairs without tripping
+# the wrong_value_min invariant. Capped by len(rows)*enabled_routes, so values
+# >3.0 have no effect here.
+candidate_oversample_factor: 3.0
