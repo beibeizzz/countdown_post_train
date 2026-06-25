@@ -1,2 +1,0 @@
-{"id": "train-000002", "source_index": 2, "numbers": [1, 2, 5], "target": 8, "gold_expr": "1+2+5", "prompt": "Using the numbers [1, 2, 5], create an equation that equals 8.\nUse each number exactly once. Only use +, -, *, / and parentheses.\nDo not use any other numbers. Keep the response concise.\nFinally return <answer> equation </answer>.", "bucket": {"num_count": 3, "expr_depth": 3, "expr_len": 5, "has_division": false, "has_subtraction": false, "score": 0, "complexity": "easy", "bucket_key": "3_easy"}}
-not-json

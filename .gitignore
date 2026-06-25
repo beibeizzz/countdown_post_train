@@ -1,7 +1,10 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.pytest_tmp_
+.pytest_tmp/
+
+# pytest acceptance/postmerge tmp run dirs (.pytest_tmp_<name>_<date>)
+.pytest_tmp_*/
 
 # Base model weights (symlinks point outside the repo; never commit).
 post_train/model/

@@ -1,1 +1,0 @@
-{"id": "a", "prompt": "poisoned prompt", "numbers": [1, 2], "target": 3, "source_index": 7, "gold_expr": "1+2", "bucket": "easy", "response": "<answer>1+2</answer>"}

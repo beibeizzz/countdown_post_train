@@ -1,1 +1,0 @@
-{"schema_version": 1, "pid": 2222, "hostname": "local-host", "started_at": "2026-06-13T00:00:00+00:00", "config_path": "C:\\Users\\north\\Desktop\\post_train\\.pytest_tmp_acceptance_20260621\\test_acquire_refuses_lock_with4\\config.yaml", "topology": "dual_gpu_teacher", "owner_token": "other"}

@@ -1,6 +1,0 @@
-eval_data: data/val_200.jsonl
-eval_manifest: data/validation_manifest.json
-output_dir: C:\Users\north\Desktop\post_train\.pytest_tmp_postmerge_v2_elevated_20260621\test_evaluation_matrix_records0\matrix\rft_best\val_200
-max_new_tokens: 256
-enable_thinking: false
-do_sample: false

@@ -1,4 +1,0 @@
-seed: 42
-train_input: C:\Users\north\Desktop\post_train\.pytest_tmp_postmerge_v2_elevated_20260621\test_manifest_identity_is_stab0\checkout-a\inputs\train.parquet
-test_input: C:\Users\north\Desktop\post_train\.pytest_tmp_postmerge_v2_elevated_20260621\test_manifest_identity_is_stab0\checkout-a\inputs\test.json
-output_dir: C:\Users\north\Desktop\post_train\.pytest_tmp_postmerge_v2_elevated_20260621\test_manifest_identity_is_stab0\checkout-a\outputs
