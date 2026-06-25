@@ -160,3 +160,64 @@ bash post_train/scripts/eval/run_all_evals.sh
 
 ---
 
+## 6. 环境与依赖
+
+Python 3.12,单卡 RTX 4090(48GB)/ CUDA 12.8。直接依赖与版本见 [`requirements.txt`](requirements.txt)。
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+
+# 1) 先装匹配 CUDA 的 torch
+pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+
+# 2) 再装其余依赖(flash-attn 需与 torch/CUDA 组合匹配,无预编译轮时从源码构建)
+pip install -r requirements.txt
+```
+
+关键版本(已在单卡验证):PyTorch 2.8.0+cu128 / Transformers 4.57.1 / TRL 1.5.1 / PEFT 0.19.1 / vLLM 0.10.2 / Flash-Attention 2.8.3。完整环境验收清单见 [`EXPERIMENT_RUNBOOK.md`](EXPERIMENT_RUNBOOK.md) §0.1。
+
+> 模型权重不随仓库分发。需自备 Qwen3-0.6B 与 Qwen3-8B,并在 `post_train/model/qwen/` 下建符号链接(或改配置里的路径)指向本地权重目录。
+
+---
+
+## 7. 数据来源
+
+原始任务数据位于 [`datasets/`](datasets/),格式:
+
+- **`raw_train.parquet`**:训练题库,字段 `id` / `nums`(可用数字)/ `target`(目标值)。
+- **`raw_test.json`**:500 题评估集,同 schema(已验证与所有训练集零 ID 重叠)。
+
+```
+{"id": 1, "target": 36, "nums": [79, 17, 60]}
+```
+
+原始数据**不直接用于训练**,而是经 `build_source.py` 加工为「带 solver 答案 + 分桶」的 source 池:
+
+```bash
+python post_train/scripts/data/build_source.py --config post_train/configs/data_build.yaml
+```
+
+该脚本用 `solve_countdown`(`post_train/src/countdown/solver.py`)枚举合法解,产出 `post_train/data/processed/` 下的 `train_pool.jsonl` / `val_200.jsonl` / `val_eval_50.jsonl` / `test_with_solver_answers.jsonl` 等(大文件见 `.gitignore`,需本地重新生成)。后续 teacher / SFT / GRPO / eval 均消费这些 processed 文件。
+
+> `train_pool.jsonl`(约 63MB)等大中间产物不随仓库分发,需由 `build_source.py` 从 `datasets/` 重新生成。
+
+---
+
+## 8. 测试
+
+`post_train/tests/` 下含核心模块的单元测试(validation / prompts / sampling / eval metrics / RFT-DPO 数据构建 / GRPO 指标等)。
+
+```bash
+# 全量
+pytest post_train/tests/ -v
+
+# 单个模块
+pytest post_train/tests/test_validation.py -v
+```
+
+---
+
+## License
+
+本项目采用 [MIT License](LICENSE) 授权。
+

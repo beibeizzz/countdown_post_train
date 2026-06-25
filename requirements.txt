@@ -1,0 +1,40 @@
+# Countdown Post-Training — direct runtime dependencies.
+# Pinned to the versions validated on RTX 4090 / CUDA 12.8.
+# Install torch build matching your CUDA first (the +cu128 wheel below is host-specific).
+#
+#   pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+#
+# then:
+#
+#   pip install -r requirements.txt
+#
+# Notes:
+# - flash-attn must match the torch/CUDA combo; build from source if no wheel fits.
+# - vllm pulls its own torch pin constraint; install order below is intentional.
+
+# Deep learning core
+torch==2.8.0
+transformers==4.57.1
+accelerate==1.13.0
+peft==0.19.1
+trl==1.5.1
+safetensors==0.7.0
+tokenizers==0.22.2
+huggingface_hub==0.36.2
+
+# Inference engine
+vllm==0.10.2
+flash-attn==2.8.3
+
+# Data / utils
+pandas==3.0.3
+pyarrow==24.0.0
+pyyaml==6.0.3
+tqdm==4.67.3
+numpy==2.2.6
+
+# Optional: experiment tracking (disabled by default, report_to: null)
+# wandb
+
+# Test
+pytest==9.1.1
