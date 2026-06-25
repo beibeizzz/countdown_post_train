@@ -81,15 +81,6 @@ post_train/
 - **`validation.py`**:基于 `ast` + `Fraction` 的硬规则验证器,贯穿数据过滤、奖励计算、eval 评分,保证「训练 reward」与「评测 accuracy」口径一致。
 - **`eval.py`**:`score_generation` / `aggregate_eval_rows`,产出 accuracy / format_rate / valid_expression_rate / token 数 / 截断数。
 
-### 4.3 本轮会话的工程改进
-
-| 文件 | 改进 | 动机 |
-|---|---|---|
-| `scripts/eval/evaluate_model.py` | 新增 `trim_generation_to_eos`,修 batched 路径 token 计数 bug | 左 padding 下 `full_ids[inlen:]` 是固定 max_new_tokens 长度,导致 `avg_generated_tokens` 恒为 1024、`truncated_count` 失真 |
-| `scripts/sft/train_full.py` 等 | 训练内 eval callback 改用 `evaluate_rows_batched` | 原 callback 串行 `evaluate_rows` 是周期 eval 的瓶颈 |
-| `scripts/grpo/train_grpo.py` | policy loss 改全局归一化(消除 length bias);新增线性长度软惩罚 | 平均 log-prob 偏向短序列;截断/超长无答案样本此前与正常无格式样本同分 |
-| `scripts/data/build_sft_splits.py` | 新增 `sft_train_2k.jsonl` RFT 专用 prompt 子集 | RFT 不必用全量 8k,2k×4 采样即可 |
-| `.gitignore` | 排除模型权重 / 训练产物 / 大数据 dump | 仓库不承载 GB 级权重 |
 
 ---
 
@@ -169,11 +160,3 @@ bash post_train/scripts/eval/run_all_evals.sh
 
 ---
 
-## 6. 分支说明
-
-| 分支 | 内容 |
-|---|---|
-| `main` | post_train v1 当前版本(含本轮数据构建 / eval 修复 / GRPO 改进) |
-| `0625abandoned` | 旧 main 归档(c938f3d,本轮改动前) |
-
-模型权重与大数据产物不在仓库内(见 `.gitignore`),需按 runbook 重新生成或另行准备。
