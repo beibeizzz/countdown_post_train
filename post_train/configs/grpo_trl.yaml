@@ -32,7 +32,10 @@ top_p: 0.95
 use_vllm: true
 vllm_mode: colocate
 rollout_gpu_memory_utilization: 0.35
-rollout_max_model_len: 1024
+# Must be >= max_prompt_len(256) + max_new_tokens(1024) = 1280, else vllm caps
+# completion at (max_model_len - prompt_len) and max_new_tokens/length_penalty
+# never reach their 1024 calibration. 1408 adds headroom for any prompt length.
+rollout_max_model_len: 1408
 tensor_parallel_size: 1
 
 bf16: true

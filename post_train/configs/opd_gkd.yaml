@@ -14,13 +14,18 @@ beta: 0.0
 seq_kd: false
 temperature: 0.9
 max_new_tokens: 1024
-max_seq_len: 1024
+# Cap the full sequence (prompt+completion). prompt(~74) + 1024 completion >
+# 1024, so 1024 would truncate the completion tail in the loss. 1280 keeps the
+# full 1024 completion trainable.
+max_seq_len: 1280
 
 learning_rate: 5e-6
 weight_decay: 0.0
 warmup_ratio: 0.03
 scheduler: cosine
-epochs: 1
+# 4k data / (batch 1 * grad_accum 16) = 250 steps/epoch. max_steps=500 = 2 epochs
+# (max_steps takes precedence over epochs); set epochs:2 to match intent.
+epochs: 2
 max_steps: 500
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 16
