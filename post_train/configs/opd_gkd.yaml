@@ -13,20 +13,24 @@ lmbda: 1.0
 beta: 0.0
 seq_kd: false
 temperature: 0.9
-max_new_tokens: 1024
-# Cap the full sequence (prompt+completion). prompt(~74) + 1024 completion >
-# 1024, so 1024 would truncate the completion tail in the loss. 1280 keeps the
-# full 1024 completion trainable.
-max_seq_len: 1280
+# Lowered from 1024 -> 512: countdown answers are short (most < 500 tokens),
+# and on-policy student generation (HF generate, no vllm) is the speed
+# bottleneck at ~10s/1024tok. 512 ~halves generation time.
+max_new_tokens: 512
+# Cap the full sequence (prompt+completion). prompt(~74) + 512 completion,
+# 640 keeps the full completion trainable without truncating the tail.
+max_seq_len: 640
 
 learning_rate: 5e-6
 weight_decay: 0.0
 warmup_ratio: 0.03
 scheduler: cosine
-# 4k data / (batch 1 * grad_accum 16) = 250 steps/epoch. max_steps=500 = 2 epochs
-# (max_steps takes precedence over epochs); set epochs:2 to match intent.
-epochs: 2
-max_steps: 500
+# 4k data / (batch 1 * grad_accum 16) = 250 steps/epoch. Lowered max_steps
+# 500 -> 200 (on-policy GKD generation is slow; 200 steps = 3200 samples is
+# enough to gauge distillation trend). epochs:1 caps at 250, so max_steps=200
+# runs in ~1 epoch.
+epochs: 1
+max_steps: 200
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 16
 
