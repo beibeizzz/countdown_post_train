@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 from post_train.scripts.dpo import train_dpo
-from post_train.scripts.grpo import train_grpo
+from post_train.scripts.grpo import train_grpo, train_grpo_trl
+from post_train.scripts.opd import train_opd_gkd
 from post_train.scripts.sft import train_full, train_lora, train_rft
 
 
@@ -54,6 +55,8 @@ def stop_at_shared_loader(*args, **kwargs):
         "sft/train_lora.py",
         "dpo/train_dpo.py",
         "grpo/train_grpo.py",
+        "grpo/train_grpo_trl.py",
+        "opd/train_opd_gkd.py",
     ),
 )
 def test_training_entrypoint_imports_and_calls_shared_model_loader(
@@ -178,6 +181,8 @@ def test_grpo_training_reaches_shared_model_loader(monkeypatch, tmp_path: Path) 
         "sft/train_rft.py",
         "dpo/train_dpo.py",
         "grpo/train_grpo.py",
+        "grpo/train_grpo_trl.py",
+        "opd/train_opd_gkd.py",
     ),
 )
 def test_training_entrypoint_does_not_load_auto_model_directly(

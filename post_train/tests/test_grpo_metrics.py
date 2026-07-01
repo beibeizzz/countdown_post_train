@@ -21,7 +21,16 @@ def test_compute_rewards_adds_format_and_answer_rewards_without_mutating_inputs(
         "<answer>1+2+3</answer>",
     ]
 
-    rewarded = compute_rewards(rows, completions, format_reward=0.2, answer_reward=1.0)
+    rewarded = compute_rewards(
+        rows,
+        completions,
+        format_reward=0.2,
+        answer_reward=1.0,
+        token_counts=[None, None, None],
+        max_new_tokens=1024,
+        length_penalty_start=800,
+        length_penalty_max=-0.5,
+    )
 
     assert [row["reward"] for row in rewarded] == [1.2, 0.0, 0.2]
     assert [row["format_ok"] for row in rewarded] == [True, False, True]
@@ -34,7 +43,16 @@ def test_compute_rewards_requires_matching_row_and_completion_counts():
     rows = [{"numbers": [1], "target": 1}]
 
     try:
-        compute_rewards(rows, [], format_reward=0.2, answer_reward=1.0)
+        compute_rewards(
+            rows,
+            [],
+            format_reward=0.2,
+            answer_reward=1.0,
+            token_counts=[],
+            max_new_tokens=1024,
+            length_penalty_start=800,
+            length_penalty_max=-0.5,
+        )
     except ValueError as exc:
         assert "same length" in str(exc)
     else:

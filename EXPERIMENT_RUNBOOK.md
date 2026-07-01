@@ -530,3 +530,136 @@ done
 # 逐条样本
 head -1 post_train/data/eval/sft_full/eval_samples.jsonl | python3 -m json.tool
 ```
+
+---
+
+## 附：TRL GRPO 实验流程（新增，不覆盖 Legacy GRPO）
+
+> 入口：`post_train/scripts/grpo/train_grpo_trl.py`
+> 配置：`post_train/configs/grpo_trl.yaml`
+> 数据：`post_train/data/grpo/grpo_train_4k.jsonl`
+> 输出：`post_train/outputs/grpo_trl/`
+
+TRL 版本用于对照 legacy `train_grpo.py`。这里的 `clip_eps` 映射到 TRL `GRPOConfig.epsilon`，语义是标准 policy-ratio clipping；旧脚本保持不动，仍保留原有 advantage clipping 行为用于历史实验对比。
+
+### 环境准备
+
+```bash
+source /root/autodl-tmp/.venv/bin/activate
+export OMP_NUM_THREADS=1
+cd /root/autodl-tmp/post_train/countdown_post_train
+export CUDA_VISIBLE_DEVICES=0
+```
+
+### 启动前检查
+
+```bash
+test -f post_train/data/grpo/grpo_train_4k.jsonl
+test -d post_train/outputs/sft/full/final
+test -f post_train/configs/grpo_trl.yaml
+ps -ef | grep -E 'vllm|EngineCore|train_grpo|train_grpo_trl' | grep -v grep || echo "clean"
+nvidia-smi
+```
+
+### Smoke run
+
+```bash
+python post_train/scripts/grpo/train_grpo_trl.py \
+  --config post_train/configs/grpo_trl.yaml \
+  --max-steps 2
+```
+
+### 正式训练
+
+```bash
+python post_train/scripts/grpo/train_grpo_trl.py \
+  --config post_train/configs/grpo_trl.yaml
+```
+
+### 验收
+
+```bash
+tail -n 5 post_train/outputs/grpo_trl/metrics.jsonl
+find post_train/outputs/grpo_trl -maxdepth 2 -type d -name 'checkpoint-*' | sort
+test -d post_train/outputs/grpo_trl/final
+nvidia-smi
+```
+
+### 独立评估
+
+```bash
+python post_train/scripts/eval/evaluate_model.py \
+  --config post_train/configs/eval.yaml \
+  --model-path post_train/outputs/grpo_trl/final \
+  --output-dir post_train/data/eval/grpo_trl
+
+cat post_train/data/eval/grpo_trl/eval_metrics.json
+```
+
+---
+
+## 附：OPD / TRL GKD 实验流程（第一版）
+
+> 入口：`post_train/scripts/opd/train_opd_gkd.py`
+> 配置：`post_train/configs/opd_gkd.yaml`
+> 学生模型：默认 `post_train/outputs/sft/full/final`
+> 教师模型：默认 `post_train/model/qwen/qwen3-8b`
+> 数据：默认复用 `post_train/data/grpo/grpo_train_4k.jsonl` 的 `prompt/response`
+> 输出：`post_train/outputs/opd/gkd/`
+
+第一版 OPD 直接使用 TRL experimental `GKDTrainer`：`lmbda: 1.0` 表示每个 batch 使用学生 on-policy 生成，`beta: 0.0` 对应 generalized JSD 的 forward-KL 侧，`seq_kd: false` 表示教师不生成序列，只对学生 rollout 进行打分。
+
+### 环境准备
+
+```bash
+source /root/autodl-tmp/.venv/bin/activate
+export OMP_NUM_THREADS=1
+cd /root/autodl-tmp/post_train/countdown_post_train
+export CUDA_VISIBLE_DEVICES=0
+```
+
+### 启动前检查
+
+```bash
+test -d post_train/outputs/sft/full/final
+test -d post_train/model/qwen/qwen3-8b
+test -f post_train/data/grpo/grpo_train_4k.jsonl
+test -f post_train/configs/opd_gkd.yaml
+ps -ef | grep -E 'vllm|EngineCore|train_opd_gkd|train_grpo|train_grpo_trl' | grep -v grep || echo "clean"
+nvidia-smi
+```
+
+### Smoke run
+
+```bash
+python post_train/scripts/opd/train_opd_gkd.py \
+  --config post_train/configs/opd_gkd.yaml \
+  --max-steps 2
+```
+
+### 正式训练
+
+```bash
+python post_train/scripts/opd/train_opd_gkd.py \
+  --config post_train/configs/opd_gkd.yaml
+```
+
+### 验收
+
+```bash
+find post_train/outputs/opd/gkd -maxdepth 2 -type d -name 'checkpoint-*' | sort
+test -d post_train/outputs/opd/gkd/final
+test -f post_train/outputs/opd/gkd/final/config.json
+nvidia-smi
+```
+
+### 独立评估
+
+```bash
+python post_train/scripts/eval/evaluate_model.py \
+  --config post_train/configs/eval.yaml \
+  --model-path post_train/outputs/opd/gkd/final \
+  --output-dir post_train/data/eval/opd_gkd
+
+cat post_train/data/eval/opd_gkd/eval_metrics.json
+```
