@@ -1,0 +1,1 @@
+{"accuracy": 0.65, "avg_gen_tokens": 524.6, "entropy": 0.21839318424463272, "format_rate": 0.75, "frac_reward_zero_std": 0.25, "group_reward_std": 0.5142117196042754, "max_gen_tokens": 952, "mean_reward": 0.92578125, "reward": 0.92578125, "reward_mean": 0.92578125, "reward_std": 0.7854967088535372, "rollout_count": 20, "step": 2, "truncated_count": 0, "truncated_rate": 0.0}

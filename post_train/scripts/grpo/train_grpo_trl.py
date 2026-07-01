@@ -204,9 +204,22 @@ def countdown_reward_func(
         row = build_legacy_metric_row(step=None, diagnostics=diagnostics, group_size=rollout_count)
         for key in ("reward_mean", "accuracy", "format_rate", "truncated_rate"):
             log_metric(f"countdown/{key}", row[key])
-    if callable(log_extra):
-        for diagnostic in diagnostics:
-            log_extra(diagnostic)
+    if callable(log_extra) and diagnostics:
+        # TRL >=1.6 signature: log_extra(column: str, values: list) -- one call
+        # per column, values batched across the whole rollout group. Earlier
+        # versions accepted a single diagnostic dict per call.
+        import inspect as _inspect
+
+        try:
+            _extra_params = _inspect.signature(log_extra).parameters
+        except (TypeError, ValueError):
+            _extra_params = {}
+        if "column" in _extra_params and "values" in _extra_params:
+            for column in ("reward", "format_ok", "correct", "token_count", "truncated", "error"):
+                log_extra(column, [d.get(column) for d in diagnostics])
+        else:
+            for diagnostic in diagnostics:
+                log_extra(diagnostic)
 
     return rewards
 

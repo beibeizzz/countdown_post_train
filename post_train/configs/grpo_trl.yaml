@@ -40,7 +40,7 @@ gradient_checkpointing: true
 enable_thinking: false
 
 eval_every_steps: 250
-save_every_steps: 500
+save_every_steps: 600
 logging_steps: 10
 report_to: null
 wandb_project: countdown-post-train
