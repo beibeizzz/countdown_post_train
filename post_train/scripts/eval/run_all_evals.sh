@@ -56,6 +56,8 @@ declare -a TARGETS=(
   "rft|post_train/outputs/sft/rft/final|"
   "dpo|post_train/outputs/dpo/final|"
   "grpo|post_train/outputs/grpo/final|"
+  "grpo_trl|post_train/outputs/grpo_trl/final|"
+  "opd_gkd|post_train/outputs/opd/gkd/final|"
 )
 
 if [[ -n "$ONLY_MODELS" ]]; then

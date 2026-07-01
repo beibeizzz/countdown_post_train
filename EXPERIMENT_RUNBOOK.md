@@ -385,6 +385,18 @@ python post_train/scripts/eval/evaluate_model.py \
   --config post_train/configs/eval.yaml \
   --model-path post_train/outputs/grpo/final \
   --output-dir post_train/data/eval/grpo
+
+# 8.7 TRL GRPO(对照 legacy 8.6,见附录「TRL GRPO 实验流程」)
+python post_train/scripts/eval/evaluate_model.py \
+  --config post_train/configs/eval.yaml \
+  --model-path post_train/outputs/grpo_trl/final \
+  --output-dir post_train/data/eval/grpo_trl
+
+# 8.8 OPD / GKD(见附录「OPD / TRL GKD 实验流程」)
+python post_train/scripts/eval/evaluate_model.py \
+  --config post_train/configs/eval.yaml \
+  --model-path post_train/outputs/opd/gkd/final \
+  --output-dir post_train/data/eval/opd_gkd
 ```
 
 **输出内容**(每个 output-dir):
@@ -403,12 +415,12 @@ python post_train/scripts/eval/evaluate_model.py \
 find post_train/outputs -maxdepth 4 -type d -name 'checkpoint-*' | sort
 
 # 各 final 存在性
-for d in sft/full sft/lora sft/rft dpo grpo; do
+for d in sft/full sft/lora sft/rft dpo grpo grpo_trl opd/gkd; do
   test -d post_train/outputs/$d/final && echo "OK: $d/final" || echo "MISSING: $d/final"
 done
 
 # eval 指标汇总
-for m in base_0_6b sft_full sft_lora rft dpo grpo; do
+for m in base_0_6b sft_full sft_lora rft dpo grpo grpo_trl opd_gkd; do
   echo "=== $m ==="
   cat post_train/data/eval/$m/eval_metrics.json 2>/dev/null || echo "(未评估)"
 done
@@ -440,9 +452,9 @@ done
 
 ---
 
-## 附:一键评估全部六个模型(`run_all_evals.sh`)
+## 附:一键评估全部模型(`run_all_evals.sh`)
 
-阶段 8 的六条 `evaluate_model.py` 命令已封装进串行脚本 `post_train/scripts/eval/run_all_evals.sh`,依次在 **500 行 held-out test** 上评估 base / SFT-full / SFT-LoRA / RFT / DPO / GRPO 六个模型,每个模型结果写到 `post_train/data/eval/<name>/eval_metrics.json`,全部跑完后汇总打印指标。
+阶段 8 的 `evaluate_model.py` 命令已封装进串行脚本 `post_train/scripts/eval/run_all_evals.sh`,依次在 **500 行 held-out test** 上评估 base / SFT-full / SFT-LoRA / RFT / DPO / GRPO / GRPO-TRL / OPD-GKD 各模型,每个模型结果写到 `post_train/data/eval/<name>/eval_metrics.json`,全部跑完后汇总打印指标。
 
 > 注意:`evaluate_model.py` 现版本读取 `eval.yaml` 的 `test_data`(500 行 test,已验证与所有训练集零 ID 重叠),**不再**用 `val_eval_50`(50 行验证子集,仅供训练期 callback 周期评估)。推理走批量化(`batch_size: 32`,左 padding),比原串行快约 9×;greedy + 左 padding 有少数样本文本分叉(accuracy 判定 0 翻转),需逐条可复现时加 `--no-batch`。
 
@@ -458,7 +470,7 @@ export CUDA_VISIBLE_DEVICES=0
 ### 用法
 
 ```bash
-# 跑全部六个模型(已评估的自动跳过,可安全重复执行)
+# 跑全部模型(已评估的自动跳过,可安全重复执行)
 bash post_train/scripts/eval/run_all_evals.sh
 
 # 冒烟:每个模型只评估前 50 行,几分钟内出结果
@@ -488,7 +500,7 @@ REEVAL=1 bash post_train/scripts/eval/run_all_evals.sh
 | `REEVAL=1` | 环境变量,跳过"已评估则 skip"逻辑,强制重跑 |
 | `-h` / `--help` | 打印用法 |
 
-### 六个模型与输出目录
+### 模型与输出目录
 
 | 名称 | 模型路径 | 输出目录 |
 |---|---|---|
@@ -498,17 +510,19 @@ REEVAL=1 bash post_train/scripts/eval/run_all_evals.sh
 | `rft` | `post_train/outputs/sft/rft/final` | `post_train/data/eval/rft` |
 | `dpo` | `post_train/outputs/dpo/final` | `post_train/data/eval/dpo` |
 | `grpo` | `post_train/outputs/grpo/final` | `post_train/data/eval/grpo` |
+| `grpo_trl` | `post_train/outputs/grpo_trl/final` | `post_train/data/eval/grpo_trl` |
+| `opd_gkd` | `post_train/outputs/opd/gkd/final` | `post_train/data/eval/opd_gkd` |
 
 ### 行为说明
 
-- **串行独占 GPU**:六模型依次跑,不并行;某模型失败不影响后续模型,退出码汇总(全部成功=0,有失败=1)。
+- **串行独占 GPU**:各模型依次跑,不并行;某模型失败不影响后续模型,退出码汇总(全部成功=0,有失败=1)。
 - **模型路径不存在则跳过**该模型并在汇总标记失败(例如 RFT 阶段未做时 `rft/final` 缺失)。
 - **LoRA** 显式传 `--base-model-path post_train/model/qwen/qwen3-0.6b`,避免 `adapter_config.json` 中绝对路径在符号链接/远程场景解析问题。
 - **汇总输出**:脚本末尾打印每个模型的 `eval_metrics.json`(accuracy / format_rate / valid_expression_rate / avg_generated_tokens / truncated_count)。
 
 ### 后台运行(推荐)
 
-六模型 × 500 行 batch 推理,单卡约 4–6 分钟;串行 `--no-batch` 约 30–40 分钟。长跑建议 `tmux`:
+八模型 × 500 行 batch 推理,单卡约 6–8 分钟;串行 `--no-batch` 约 40–55 分钟。长跑建议 `tmux`:
 
 ```bash
 tmux new -s eval
