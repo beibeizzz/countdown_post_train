@@ -31,8 +31,11 @@ scheduler: cosine
 # runs in ~1 epoch.
 epochs: 1
 max_steps: 200
-per_device_train_batch_size: 1
-gradient_accumulation_steps: 16
+# Batched on-policy generation is more efficient than batch=1 x many accum
+# steps. Raised 1 -> 2; halve grad_accum 16 -> 8 to keep effective batch 16
+# (2 x 8). Watch VRAM: teacher 8B + student 0.6B + 2x seq; revert to 1 if OOM.
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
 
 bf16: true
 gradient_checkpointing: true
